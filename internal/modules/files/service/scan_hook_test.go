@@ -34,7 +34,7 @@ func (f *fakeScanner) Scan(_ context.Context, r io.Reader, _ int64) (scan.Verdic
 }
 
 func scanService(repo *mockFileRepo, store *mockStorage, scanner scan.Scanner) UploadService {
-	return NewUploadService(repo, newFakeTx(repo), store, UploadOptions{Scanner: scanner})
+	return NewUploadService(repo, newFakeTx(repo), store, testAuthorizer(), UploadOptions{Scanner: scanner})
 }
 
 func requireFileCode(t *testing.T, err error, code apperror.Code, status int) {
@@ -43,8 +43,8 @@ func requireFileCode(t *testing.T, err error, code apperror.Code, status int) {
 	if !errors.As(err, &appErr) {
 		t.Fatalf("error = %v, want an apperror", err)
 	}
-	if appErr.Code != string(code) || appErr.Status != status {
-		t.Fatalf("error = %q/%d, want %q/%d", appErr.Code, appErr.Status, code, status)
+	if appErr.Code != string(code) || resolvedStatus(appErr) != status {
+		t.Fatalf("error = %q/%d, want %q/%d", appErr.Code, resolvedStatus(appErr), code, status)
 	}
 }
 
@@ -54,7 +54,7 @@ func TestUpload_ScanInfectedRejectsAndRemovesBlob(t *testing.T) {
 	scanner := &fakeScanner{verdict: scan.VerdictInfected}
 	svc := scanService(repo, store, scanner)
 
-	_, err := svc.Upload(systemCtx(), 10, "evil.bin", strings.NewReader("malware"), 7, "application/octet-stream")
+	_, err := svc.Upload(systemCtx(), testID(10), "evil.bin", strings.NewReader("malware"), 7, "application/octet-stream")
 	requireFileCode(t, err, catalog.CodeFileInfected, 422)
 	if scanner.calls != 1 {
 		t.Fatalf("scanner calls = %d, want 1", scanner.calls)
@@ -76,7 +76,7 @@ func TestUpload_ScanErrorFailsClosedAndRemovesBlob(t *testing.T) {
 	scanner := &fakeScanner{err: errors.New("clamd unavailable")}
 	svc := scanService(repo, store, scanner)
 
-	_, err := svc.Upload(systemCtx(), 10, "maybe.bin", strings.NewReader("data"), 4, "application/octet-stream")
+	_, err := svc.Upload(systemCtx(), testID(10), "maybe.bin", strings.NewReader("data"), 4, "application/octet-stream")
 	requireFileCode(t, err, catalog.CodeFileScanUnavailable, 503)
 	if len(repo.files) != 0 {
 		t.Fatal("a failed scan must not create metadata")
@@ -92,7 +92,7 @@ func TestUpload_ScanUnknownVerdictFailsClosed(t *testing.T) {
 	scanner := &fakeScanner{verdict: scan.Verdict(99)}
 	svc := scanService(repo, store, scanner)
 
-	_, err := svc.Upload(systemCtx(), 10, "odd.bin", strings.NewReader("data"), 4, "application/octet-stream")
+	_, err := svc.Upload(systemCtx(), testID(10), "odd.bin", strings.NewReader("data"), 4, "application/octet-stream")
 	requireFileCode(t, err, catalog.CodeFileScanUnavailable, 503)
 	if len(repo.files) != 0 || len(store.files) != 0 {
 		t.Fatal("an unknown verdict must not keep metadata or the blob")
@@ -105,7 +105,7 @@ func TestUpload_ScanReadFailureFailsClosed(t *testing.T) {
 	store.getErr = errors.New("storage unavailable")
 	svc := scanService(repo, store, &fakeScanner{verdict: scan.VerdictClean})
 
-	_, err := svc.Upload(systemCtx(), 10, "unreadable.bin", strings.NewReader("data"), 4, "application/octet-stream")
+	_, err := svc.Upload(systemCtx(), testID(10), "unreadable.bin", strings.NewReader("data"), 4, "application/octet-stream")
 	requireFileCode(t, err, catalog.CodeFileScanUnavailable, 503)
 	if len(repo.files) != 0 || len(store.files) != 0 {
 		t.Fatal("a scan read failure must not keep metadata or the blob")
@@ -123,7 +123,7 @@ func TestUpload_ScanRunsBeforeMetadataCommit(t *testing.T) {
 	}
 	svc := scanService(repo, store, scanner)
 
-	file, err := svc.Upload(systemCtx(), 10, "safe.bin", strings.NewReader("safe"), 4, "application/octet-stream")
+	file, err := svc.Upload(systemCtx(), testID(10), "safe.bin", strings.NewReader("safe"), 4, "application/octet-stream")
 	if err != nil {
 		t.Fatalf("upload: %v", err)
 	}

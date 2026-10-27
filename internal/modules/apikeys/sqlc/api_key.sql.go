@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -28,21 +29,21 @@ FROM key
 
 type CreateAPIKeyParams struct {
 	Scopes    []string           `json:"scopes"`
-	TenantID  int64              `json:"tenant_id"`
-	UserID    int64              `json:"user_id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	UserID    uuid.UUID          `json:"user_id"`
 	Name      string             `json:"name"`
 	Prefix    string             `json:"prefix"`
-	KeyHash   string             `json:"key_hash"`
+	KeyHash   []byte             `json:"key_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 
 type CreateAPIKeyRow struct {
-	ID                 int64              `json:"id"`
-	TenantID           int64              `json:"tenant_id"`
-	UserID             int64              `json:"user_id"`
+	ID                 uuid.UUID          `json:"id"`
+	TenantID           uuid.UUID          `json:"tenant_id"`
+	UserID             uuid.UUID          `json:"user_id"`
 	Name               string             `json:"name"`
 	Prefix             string             `json:"prefix"`
-	KeyHash            string             `json:"key_hash"`
+	KeyHash            []byte             `json:"key_hash"`
 	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
 	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
 	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
@@ -98,12 +99,12 @@ WHERE key_hash = $1
 `
 
 type GetAPIKeyByHashRow struct {
-	ID                 int64              `json:"id"`
-	TenantID           int64              `json:"tenant_id"`
-	UserID             int64              `json:"user_id"`
+	ID                 uuid.UUID          `json:"id"`
+	TenantID           uuid.UUID          `json:"tenant_id"`
+	UserID             uuid.UUID          `json:"user_id"`
 	Name               string             `json:"name"`
 	Prefix             string             `json:"prefix"`
-	KeyHash            string             `json:"key_hash"`
+	KeyHash            []byte             `json:"key_hash"`
 	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
 	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
 	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
@@ -117,7 +118,7 @@ type GetAPIKeyByHashRow struct {
 // The hash is globally unique. This lookup intentionally has no tenant
 // predicate because the verifier learns the key's tenant from the row before
 // the request can be scoped.
-func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error) {
+func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash []byte) (GetAPIKeyByHashRow, error) {
 	row := q.db.QueryRow(ctx, getAPIKeyByHash, keyHash)
 	var i GetAPIKeyByHashRow
 	err := row.Scan(
@@ -149,17 +150,17 @@ WHERE id = $1 AND tenant_id = $2
 `
 
 type GetAPIKeyByIDParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type GetAPIKeyByIDRow struct {
-	ID                 int64              `json:"id"`
-	TenantID           int64              `json:"tenant_id"`
-	UserID             int64              `json:"user_id"`
+	ID                 uuid.UUID          `json:"id"`
+	TenantID           uuid.UUID          `json:"tenant_id"`
+	UserID             uuid.UUID          `json:"user_id"`
 	Name               string             `json:"name"`
 	Prefix             string             `json:"prefix"`
-	KeyHash            string             `json:"key_hash"`
+	KeyHash            []byte             `json:"key_hash"`
 	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
 	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
 	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
@@ -192,32 +193,114 @@ func (q *Queries) GetAPIKeyByID(ctx context.Context, arg GetAPIKeyByIDParams) (G
 	return i, err
 }
 
+const listAPIKeysByUserCursor = `-- name: ListAPIKeysByUserCursor :many
+SELECT api_keys.id, api_keys.tenant_id, api_keys.user_id, api_keys.name, api_keys.prefix, api_keys.key_hash, api_keys.expires_at, api_keys.revoked_at, api_keys.rotated_at, api_keys.rotation_grace_until, api_keys.last_used_at, api_keys.created_at, api_keys.updated_at,
+       ARRAY(SELECT s.permission_key FROM api_key_scopes s
+             WHERE s.api_key_id = api_keys.id
+             ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
+FROM api_keys
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
+  AND (created_at, id) < ($3::timestamptz, $4::uuid)
+ORDER BY created_at DESC, id DESC
+LIMIT $5::int
+`
+
+type ListAPIKeysByUserCursorParams struct {
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
+	RowLimit        int32              `json:"row_limit"`
+}
+
+type ListAPIKeysByUserCursorRow struct {
+	ID                 uuid.UUID          `json:"id"`
+	TenantID           uuid.UUID          `json:"tenant_id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	Name               string             `json:"name"`
+	Prefix             string             `json:"prefix"`
+	KeyHash            []byte             `json:"key_hash"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
+	RotationGraceUntil pgtype.Timestamptz `json:"rotation_grace_until"`
+	LastUsedAt         pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Scopes             []string           `json:"scopes"`
+}
+
+// One member's keys for /me/api-keys and /members/{memberId}/api-keys. The
+// tenant predicate keeps RLS and the explicit scope aligned; user_id narrows
+// the page without ever exposing another member's rows.
+func (q *Queries) ListAPIKeysByUserCursor(ctx context.Context, arg ListAPIKeysByUserCursorParams) ([]ListAPIKeysByUserCursorRow, error) {
+	rows, err := q.db.Query(ctx, listAPIKeysByUserCursor,
+		arg.TenantID,
+		arg.UserID,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAPIKeysByUserCursorRow{}
+	for rows.Next() {
+		var i ListAPIKeysByUserCursorRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.UserID,
+			&i.Name,
+			&i.Prefix,
+			&i.KeyHash,
+			&i.ExpiresAt,
+			&i.RevokedAt,
+			&i.RotatedAt,
+			&i.RotationGraceUntil,
+			&i.LastUsedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Scopes,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAPIKeysCursor = `-- name: ListAPIKeysCursor :many
 SELECT api_keys.id, api_keys.tenant_id, api_keys.user_id, api_keys.name, api_keys.prefix, api_keys.key_hash, api_keys.expires_at, api_keys.revoked_at, api_keys.rotated_at, api_keys.rotation_grace_until, api_keys.last_used_at, api_keys.created_at, api_keys.updated_at,
        ARRAY(SELECT s.permission_key FROM api_key_scopes s
              WHERE s.api_key_id = api_keys.id
              ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
 FROM api_keys
-WHERE tenant_id = $1::bigint
-  AND (created_at, id) < ($2::timestamptz, $3::bigint)
+WHERE tenant_id = $1::uuid
+  AND (created_at, id) < ($2::timestamptz, $3::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT $4::int
 `
 
 type ListAPIKeysCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
 type ListAPIKeysCursorRow struct {
-	ID                 int64              `json:"id"`
-	TenantID           int64              `json:"tenant_id"`
-	UserID             int64              `json:"user_id"`
+	ID                 uuid.UUID          `json:"id"`
+	TenantID           uuid.UUID          `json:"tenant_id"`
+	UserID             uuid.UUID          `json:"user_id"`
 	Name               string             `json:"name"`
 	Prefix             string             `json:"prefix"`
-	KeyHash            string             `json:"key_hash"`
+	KeyHash            []byte             `json:"key_hash"`
 	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
 	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
 	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
@@ -273,8 +356,8 @@ UPDATE api_keys
 SET rotated_at = NOW(),
     rotation_grace_until = NOW() + make_interval(secs => $1::int),
     updated_at = NOW()
-WHERE id = $2::bigint
-  AND tenant_id = $3::bigint
+WHERE id = $2::uuid
+  AND tenant_id = $3::uuid
   AND revoked_at IS NULL
   AND rotated_at IS NULL
 RETURNING id, tenant_id, user_id, name, prefix, key_hash, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at,
@@ -284,18 +367,18 @@ RETURNING id, tenant_id, user_id, name, prefix, key_hash, expires_at, revoked_at
 `
 
 type MarkAPIKeyRotatedParams struct {
-	GraceSeconds int32 `json:"grace_seconds"`
-	ID           int64 `json:"id"`
-	TenantID     int64 `json:"tenant_id"`
+	GraceSeconds int32     `json:"grace_seconds"`
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
 }
 
 type MarkAPIKeyRotatedRow struct {
-	ID                 int64              `json:"id"`
-	TenantID           int64              `json:"tenant_id"`
-	UserID             int64              `json:"user_id"`
+	ID                 uuid.UUID          `json:"id"`
+	TenantID           uuid.UUID          `json:"tenant_id"`
+	UserID             uuid.UUID          `json:"user_id"`
 	Name               string             `json:"name"`
 	Prefix             string             `json:"prefix"`
-	KeyHash            string             `json:"key_hash"`
+	KeyHash            []byte             `json:"key_hash"`
 	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
 	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
 	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
@@ -340,17 +423,17 @@ RETURNING id, tenant_id, user_id, name, prefix, key_hash, expires_at, revoked_at
 `
 
 type RevokeAPIKeyParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type RevokeAPIKeyRow struct {
-	ID                 int64              `json:"id"`
-	TenantID           int64              `json:"tenant_id"`
-	UserID             int64              `json:"user_id"`
+	ID                 uuid.UUID          `json:"id"`
+	TenantID           uuid.UUID          `json:"tenant_id"`
+	UserID             uuid.UUID          `json:"user_id"`
 	Name               string             `json:"name"`
 	Prefix             string             `json:"prefix"`
-	KeyHash            string             `json:"key_hash"`
+	KeyHash            []byte             `json:"key_hash"`
 	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
 	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
 	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
@@ -390,7 +473,7 @@ WHERE id = $1
 `
 
 type TouchAPIKeyLastUsedParams struct {
-	ID         int64              `json:"id"`
+	ID         uuid.UUID          `json:"id"`
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 }
 
@@ -422,19 +505,19 @@ FROM key
 `
 
 type UpdateAPIKeyParams struct {
-	Scopes   []string `json:"scopes"`
-	Name     string   `json:"name"`
-	ID       int64    `json:"id"`
-	TenantID int64    `json:"tenant_id"`
+	Scopes   []string  `json:"scopes"`
+	Name     string    `json:"name"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type UpdateAPIKeyRow struct {
-	ID                 int64              `json:"id"`
-	TenantID           int64              `json:"tenant_id"`
-	UserID             int64              `json:"user_id"`
+	ID                 uuid.UUID          `json:"id"`
+	TenantID           uuid.UUID          `json:"tenant_id"`
+	UserID             uuid.UUID          `json:"user_id"`
 	Name               string             `json:"name"`
 	Prefix             string             `json:"prefix"`
-	KeyHash            string             `json:"key_hash"`
+	KeyHash            []byte             `json:"key_hash"`
 	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
 	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
 	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`

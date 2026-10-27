@@ -43,7 +43,16 @@ INSERT INTO user_passwords (user_id, password_hash)
 VALUES ($1, $2)
 ON CONFLICT (user_id) DO UPDATE
 SET password_hash = EXCLUDED.password_hash,
-    changed_at = NOW();
+    updated_at = NOW();
+
+-- name: RehashUserPassword :execrows
+-- A successful sign-in may upgrade a hash written under older cost parameters
+-- without a credential change (no token_version bump). It is conditional on
+-- the hash that verified, so a concurrent password change wins and the stale
+-- upgrade never overwrites the new credential.
+UPDATE user_passwords
+SET password_hash = sqlc.arg(new_hash)
+WHERE user_id = sqlc.arg(user_id) AND password_hash = sqlc.arg(current_hash);
 
 -- name: RecordUserCredentialChange :one
 -- A password set/reset ends every access token and session of the user in

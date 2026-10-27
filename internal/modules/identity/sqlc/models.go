@@ -7,13 +7,14 @@ package sqlc
 import (
 	"net/netip"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type DataExport struct {
-	ID          int64              `json:"id"`
-	TenantID    int64              `json:"tenant_id"`
-	UserID      int64              `json:"user_id"`
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	UserID      uuid.UUID          `json:"user_id"`
 	Status      string             `json:"status"`
 	StoragePath pgtype.Text        `json:"storage_path"`
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
@@ -22,35 +23,36 @@ type DataExport struct {
 }
 
 type EmailVerificationToken struct {
-	ID        int64              `json:"id"`
-	UserID    int64              `json:"user_id"`
+	ID        uuid.UUID          `json:"id"`
+	UserID    uuid.UUID          `json:"user_id"`
 	Email     string             `json:"email"`
-	TokenHash string             `json:"token_hash"`
+	TokenHash []byte             `json:"token_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type Invitation struct {
-	ID              int64              `json:"id"`
-	TenantID        int64              `json:"tenant_id"`
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	EmailNormalized string             `json:"email_normalized"`
-	Role            string             `json:"role"`
-	TokenHash       string             `json:"token_hash"`
-	InvitedBy       int64              `json:"invited_by"`
+	RoleID          uuid.UUID          `json:"role_id"`
+	TokenHash       []byte             `json:"token_hash"`
+	InvitedBy       uuid.UUID          `json:"invited_by"`
 	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
 	AcceptedAt      pgtype.Timestamptz `json:"accepted_at"`
-	AcceptedBy      pgtype.Int8        `json:"accepted_by"`
+	AcceptedBy      uuid.NullUUID      `json:"accepted_by"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Membership struct {
-	ID                   int64              `json:"id"`
-	TenantID             int64              `json:"tenant_id"`
-	UserID               int64              `json:"user_id"`
+	ID                   uuid.UUID          `json:"id"`
+	TenantID             uuid.UUID          `json:"tenant_id"`
+	UserID               uuid.UUID          `json:"user_id"`
 	Status               string             `json:"status"`
 	BannedAt             pgtype.Timestamptz `json:"banned_at"`
-	BannedEmailHash      pgtype.Text        `json:"banned_email_hash"`
+	BannedEmailHash      []byte             `json:"banned_email_hash"`
+	BannedEmailHashKid   pgtype.Text        `json:"banned_email_hash_kid"`
 	ErasureRequestedAt   pgtype.Timestamptz `json:"erasure_requested_at"`
 	RemovedAt            pgtype.Timestamptz `json:"removed_at"`
 	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
@@ -59,8 +61,8 @@ type Membership struct {
 }
 
 type MfaFactor struct {
-	ID               int64              `json:"id"`
-	UserID           int64              `json:"user_id"`
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
 	Type             string             `json:"type"`
 	SecretCiphertext string             `json:"secret_ciphertext"`
 	ConfirmedAt      pgtype.Timestamptz `json:"confirmed_at"`
@@ -70,26 +72,26 @@ type MfaFactor struct {
 }
 
 type PasswordResetToken struct {
-	ID        int64              `json:"id"`
-	UserID    int64              `json:"user_id"`
-	TokenHash string             `json:"token_hash"`
+	ID        uuid.UUID          `json:"id"`
+	UserID    uuid.UUID          `json:"user_id"`
+	TokenHash []byte             `json:"token_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type RefreshToken struct {
-	ID        int64              `json:"id"`
-	TenantID  int64              `json:"tenant_id"`
-	SessionID int64              `json:"session_id"`
-	TokenHash string             `json:"token_hash"`
+	ID        uuid.UUID          `json:"id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	SessionID uuid.UUID          `json:"session_id"`
+	TokenHash []byte             `json:"token_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	UsedAt    pgtype.Timestamptz `json:"used_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type Role struct {
-	ID        int64              `json:"id"`
-	TenantID  pgtype.Int8        `json:"tenant_id"`
+	ID        uuid.UUID          `json:"id"`
+	TenantID  uuid.NullUUID      `json:"tenant_id"`
 	Scope     string             `json:"scope"`
 	Key       string             `json:"key"`
 	Name      string             `json:"name"`
@@ -98,9 +100,9 @@ type Role struct {
 }
 
 type Session struct {
-	ID            int64              `json:"id"`
-	TenantID      int64              `json:"tenant_id"`
-	UserID        int64              `json:"user_id"`
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	UserID        uuid.UUID          `json:"user_id"`
 	TokenVersion  int32              `json:"token_version"`
 	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
 	UserAgent     pgtype.Text        `json:"user_agent"`
@@ -115,7 +117,7 @@ type Session struct {
 }
 
 type Tenant struct {
-	ID                  int64              `json:"id"`
+	ID                  uuid.UUID          `json:"id"`
 	Slug                string             `json:"slug"`
 	Name                string             `json:"name"`
 	Status              string             `json:"status"`
@@ -123,14 +125,14 @@ type Tenant struct {
 	TrialEndsAt         pgtype.Timestamptz `json:"trial_ends_at"`
 	DeletionScheduledAt pgtype.Timestamptz `json:"deletion_scheduled_at"`
 	PurgedAt            pgtype.Timestamptz `json:"purged_at"`
-	PurgeCursor         int64              `json:"purge_cursor"`
+	PurgeCursor         uuid.UUID          `json:"purge_cursor"`
 	PurgeProgressAt     pgtype.Timestamptz `json:"purge_progress_at"`
 	CreatedAt           pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
 }
 
 type TenantSetting struct {
-	TenantID  int64              `json:"tenant_id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
 	Locale    string             `json:"locale"`
 	Timezone  string             `json:"timezone"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
@@ -138,7 +140,7 @@ type TenantSetting struct {
 }
 
 type User struct {
-	ID                   int64              `json:"id"`
+	ID                   uuid.UUID          `json:"id"`
 	Email                string             `json:"email"`
 	Name                 string             `json:"name"`
 	EmailVerifiedAt      pgtype.Timestamptz `json:"email_verified_at"`
@@ -148,4 +150,20 @@ type User struct {
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
+}
+
+type WebauthnCredential struct {
+	ID             uuid.UUID          `json:"id"`
+	UserID         uuid.UUID          `json:"user_id"`
+	CredentialID   []byte             `json:"credential_id"`
+	PublicKey      []byte             `json:"public_key"`
+	SignCount      int64              `json:"sign_count"`
+	Aaguid         uuid.NullUUID      `json:"aaguid"`
+	Transports     []string           `json:"transports"`
+	BackupEligible bool               `json:"backup_eligible"`
+	BackupState    bool               `json:"backup_state"`
+	Name           string             `json:"name"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	LastUsedAt     pgtype.Timestamptz `json:"last_used_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }

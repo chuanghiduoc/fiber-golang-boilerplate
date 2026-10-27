@@ -10,8 +10,8 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
 
 // fixedClock returns a clock the test moves by hand, so window boundaries are

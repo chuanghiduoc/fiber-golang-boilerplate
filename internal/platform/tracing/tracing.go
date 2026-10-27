@@ -1,8 +1,14 @@
 // Package tracing configures the OpenTelemetry SDK used by the API. Tracing is
 // disabled by default: the application then uses a no-op provider and never
-// opens a network connection. When enabled, spans are batched in memory and
-// exported over OTLP/gRPC. An unreachable collector only drops spans; it never
+// opens a network connection. When enabled, spans are batched by the SDK and
+// exported over OTLP. An unreachable collector only drops spans; it never
 // fails startup or readiness.
+//
+// The SDK owns its standard environment variables: OTEL_EXPORTER_OTLP_*
+// (endpoint URL, protocol, TLS/insecure, headers, timeout), OTEL_SERVICE_NAME,
+// OTEL_RESOURCE_ATTRIBUTES, OTEL_TRACES_SAMPLER/ARG, and OTEL_BSP_*. This
+// package only chooses the OTLP transport (http/protobuf by default, gRPC when
+// requested) and adds the build version as service.version.
 package tracing
 
 import (
@@ -11,11 +17,9 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
@@ -32,86 +36,184 @@ const maxErrorTypeLength = 64
 // Provider owns the tracer provider lifecycle. A nil *Provider is valid and
 // behaves like a disabled provider, so callers do not need nil checks.
 type Provider struct {
-	enabled bool
-	tp      trace.TracerProvider
-	sdk     *sdktrace.TracerProvider
-	sampler string
+	enabled  bool
+	tp       trace.TracerProvider
+	sdk      *sdktrace.TracerProvider
+	exporter string
+	sampler  string
+	resource *resource.Resource
 
 	shutdownOnce sync.Once
 	shutdownErr  error
 }
 
-// New builds a tracer provider from cfg. It validates the configuration again
-// because callers may construct a Provider directly (tests, tools) without
-// going through config.Load. The OTLP exporter connects lazily, so an
+type options struct {
+	serviceVersion string
+	exporter       sdktrace.SpanExporter
+}
+
+// Option configures New.
+type Option func(*options)
+
+// WithServiceVersion adds the build version as resource service.version. It
+// overrides a service.version supplied through OTEL_RESOURCE_ATTRIBUTES.
+func WithServiceVersion(version string) Option {
+	return func(o *options) { o.serviceVersion = version }
+}
+
+// withSpanExporter replaces the OTLP exporter with an in-memory one. It exists
+// for tests and is not part of the deployment surface.
+func withSpanExporter(exporter sdktrace.SpanExporter) Option {
+	return func(o *options) { o.exporter = exporter }
+}
+
+// New builds a tracer provider from cfg. It validates the application switches
+// again because callers may construct a Provider directly (tests, tools)
+// without going through config.Load. The OTLP exporter connects lazily, so an
 // unreachable collector does not fail here.
-func New(ctx context.Context, cfg config.TracingConfig) (*Provider, error) {
+func New(ctx context.Context, cfg config.TracingConfig, opts ...Option) (*Provider, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if !cfg.Enabled {
-		return &Provider{tp: noop.NewTracerProvider(), sampler: "disabled"}, nil
+	var options options
+	for _, opt := range opts {
+		opt(&options)
 	}
 
-	sampler, samplerName, err := newSampler(cfg.Sampler, cfg.SamplerArg)
+	res, err := newResource(options.serviceVersion)
 	if err != nil {
 		return nil, err
 	}
 
-	opts := []sdktrace.TracerProviderOption{
-		sdktrace.WithSampler(sampler),
-		sdktrace.WithResource(newResource(cfg)),
+	if !cfg.Enabled {
+		return &Provider{
+			tp:       noop.NewTracerProvider(),
+			sampler:  "disabled",
+			exporter: "none",
+			resource: res,
+		}, nil
 	}
 
-	switch strings.ToLower(strings.TrimSpace(cfg.Exporter)) {
-	case "otlp":
-		exporter, err := newOTLPExporter(ctx, cfg)
+	exporterName, err := tracesExporter()
+	if err != nil {
+		return nil, err
+	}
+
+	providerOpts := []sdktrace.TracerProviderOption{sdktrace.WithResource(res)}
+	switch {
+	case options.exporter != nil:
+		// In-memory exporters must export synchronously so a test can read the
+		// recorded spans without a batch delay.
+		providerOpts = append(providerOpts, sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(options.exporter)))
+	case exporterName == "none":
+		// Sampling and propagation still work, but spans are never exported.
+		// This is useful for local debugging without a collector.
+	case exporterName == "otlp":
+		exporter, err := newOTLPExporter(ctx)
 		if err != nil {
 			return nil, err
 		}
-		opts = append(opts, sdktrace.WithBatcher(exporter,
-			sdktrace.WithBatchTimeout(time.Duration(cfg.BatchTimeout)*time.Second),
-			sdktrace.WithExportTimeout(time.Duration(cfg.ExportTimeout)*time.Second),
-			sdktrace.WithMaxQueueSize(cfg.MaxQueueSize),
-			sdktrace.WithMaxExportBatchSize(cfg.MaxExportBatchSize),
-		))
-	case "none":
-		// Sampling and propagation still work, but spans are never exported.
-		// This is useful for local debugging without a collector.
-	default:
-		return nil, fmt.Errorf("tracing: unsupported exporter %q", cfg.Exporter)
+		// No batch options: the SDK reads OTEL_BSP_* itself.
+		providerOpts = append(providerOpts, sdktrace.WithBatcher(exporter))
 	}
 
-	sdkProvider := sdktrace.NewTracerProvider(opts...)
+	sdkProvider := sdktrace.NewTracerProvider(providerOpts...)
 	return &Provider{
-		enabled: true,
-		tp:      sdkProvider,
-		sdk:     sdkProvider,
-		sampler: samplerName,
+		enabled:  true,
+		tp:       sdkProvider,
+		sdk:      sdkProvider,
+		exporter: exporterName,
+		sampler:  samplerName(),
+		resource: res,
 	}, nil
 }
 
-func newOTLPExporter(ctx context.Context, cfg config.TracingConfig) (*otlptrace.Exporter, error) {
+// newOTLPExporter selects the OTLP transport from the standard
+// OTEL_EXPORTER_OTLP_TRACES_PROTOCOL / OTEL_EXPORTER_OTLP_PROTOCOL variables.
+// Endpoint, TLS, headers, compression, and timeouts are left to the exporter's
+// own environment handling.
+func newOTLPExporter(ctx context.Context) (sdktrace.SpanExporter, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	opts := []otlptracegrpc.Option{
-		otlptracegrpc.WithEndpoint(strings.TrimSpace(cfg.Endpoint)),
-		otlptracegrpc.WithTimeout(time.Duration(cfg.ExportTimeout) * time.Second),
-	}
-	if cfg.Insecure {
-		opts = append(opts, otlptracegrpc.WithInsecure())
-	}
-	exporter, err := otlptracegrpc.New(ctx, opts...)
+	protocol, err := otlpProtocol("TRACES")
 	if err != nil {
-		return nil, fmt.Errorf("tracing: create OTLP/gRPC exporter: %w", err)
+		return nil, err
 	}
-	return exporter, nil
+	switch protocol {
+	case "http/protobuf":
+		exporter, err := otlptracehttp.New(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("tracing: create OTLP/HTTP exporter: %w", err)
+		}
+		return exporter, nil
+	case "grpc":
+		exporter, err := otlptracegrpc.New(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("tracing: create OTLP/gRPC exporter: %w", err)
+		}
+		return exporter, nil
+	default:
+		return nil, fmt.Errorf("tracing: unsupported OTLP protocol %q", protocol)
+	}
+}
+
+func tracesExporter() (string, error) {
+	switch value := strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_TRACES_EXPORTER"))); value {
+	case "", "otlp":
+		return "otlp", nil
+	case "none":
+		return "none", nil
+	default:
+		return "", fmt.Errorf("tracing: OTEL_TRACES_EXPORTER must be otlp or none (got %q)", value)
+	}
+}
+
+// otlpProtocol resolves the signal-specific protocol before the common one,
+// defaulting to http/protobuf as the OTel specification requires.
+func otlpProtocol(signal string) (string, error) {
+	keys := []string{
+		"OTEL_EXPORTER_OTLP_" + signal + "_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_PROTOCOL",
+	}
+	for _, key := range keys {
+		value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+		if value == "" {
+			continue
+		}
+		switch value {
+		case "http/protobuf", "grpc":
+			return value, nil
+		default:
+			return "", fmt.Errorf("tracing: %s must be http/protobuf or grpc (got %q)", key, value)
+		}
+	}
+	return "http/protobuf", nil
+}
+
+// samplerName mirrors the SDK's environment sampler for a startup log line.
+func samplerName() string {
+	name := strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_TRACES_SAMPLER")))
+	if name == "" {
+		return "parentbased_always_on"
+	}
+	if arg := strings.TrimSpace(os.Getenv("OTEL_TRACES_SAMPLER_ARG")); arg != "" {
+		return name + "(" + arg + ")"
+	}
+	return name
 }
 
 // Enabled reports whether spans are being generated and exported.
 func (p *Provider) Enabled() bool {
 	return p != nil && p.enabled
+}
+
+// Exporter describes the configured exporter for a startup log line.
+func (p *Provider) Exporter() string {
+	if p == nil {
+		return "none"
+	}
+	return p.exporter
 }
 
 // Sampler describes the active sampler for a startup log line.
@@ -120,6 +222,14 @@ func (p *Provider) Sampler() string {
 		return "disabled"
 	}
 	return p.sampler
+}
+
+// Resource returns the SDK resource reported on every span.
+func (p *Provider) Resource() *resource.Resource {
+	if p == nil {
+		return resource.Empty()
+	}
+	return p.resource
 }
 
 // TracerProvider returns the SDK provider, or a no-op provider when tracing is
@@ -154,48 +264,18 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 	return p.shutdownErr
 }
 
-func newResource(cfg config.TracingConfig) *resource.Resource {
-	attrs := []attribute.KeyValue{
-		semconv.ServiceName(strings.TrimSpace(cfg.ServiceName)),
-		semconv.DeploymentEnvironmentName(strings.TrimSpace(cfg.DeploymentEnvironment)),
+// newResource merges the SDK default resource (which reads OTEL_SERVICE_NAME
+// and OTEL_RESOURCE_ATTRIBUTES) with the build version. The build version wins
+// so an image labels its spans correctly even when the environment is stale.
+func newResource(version string) (*resource.Resource, error) {
+	defaults := resource.Default()
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return defaults, nil
 	}
-	if version := strings.TrimSpace(cfg.ServiceVersion); version != "" {
-		attrs = append(attrs, semconv.ServiceVersion(version))
+	merged, err := resource.Merge(defaults, resource.NewSchemaless(semconv.ServiceVersion(version)))
+	if err != nil {
+		return nil, fmt.Errorf("tracing: merge resource: %w", err)
 	}
-	if namespace := strings.TrimSpace(cfg.ServiceNamespace); namespace != "" {
-		attrs = append(attrs, semconv.ServiceNamespace(namespace))
-	}
-
-	instance := strings.TrimSpace(cfg.InstanceID)
-	if instance == "" {
-		hostname, err := os.Hostname()
-		if err != nil || strings.TrimSpace(hostname) == "" {
-			instance = "unknown"
-		} else {
-			instance = hostname
-		}
-	}
-	attrs = append(attrs, semconv.ServiceInstanceID(instance))
-
-	return resource.NewWithAttributes(semconv.SchemaURL, attrs...)
-}
-
-func newSampler(name string, arg float64) (sdktrace.Sampler, string, error) {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "parentbased_traceidratio":
-		return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(arg)),
-			fmt.Sprintf("parentbased_traceidratio(%g)", arg), nil
-	case "parentbased_always_on":
-		return sdktrace.ParentBased(sdktrace.AlwaysSample()), "parentbased_always_on", nil
-	case "parentbased_always_off":
-		return sdktrace.ParentBased(sdktrace.NeverSample()), "parentbased_always_off", nil
-	case "traceidratio":
-		return sdktrace.TraceIDRatioBased(arg), fmt.Sprintf("traceidratio(%g)", arg), nil
-	case "always_on":
-		return sdktrace.AlwaysSample(), "always_on", nil
-	case "always_off":
-		return sdktrace.NeverSample(), "always_off", nil
-	default:
-		return nil, "", fmt.Errorf("tracing: unsupported sampler %q", name)
-	}
+	return merged, nil
 }

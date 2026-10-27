@@ -11,7 +11,7 @@ import (
 
 const (
 	// RetentionPurgeJobKind is the durable job that deletes notifications
-	// read more than NOTIFICATIONS_RETENTION_DAYS ago. Unread notifications
+	// read more than NOTIFICATIONS_RETENTION ago. Unread notifications
 	// are kept regardless of age: the user has not seen them yet. The
 	// scheduler enqueues it every RetentionPurgeInterval (SCHEDULER_ENABLED
 	// must be true).
@@ -33,7 +33,7 @@ type RetentionPurger struct {
 }
 
 // NewRetentionPurger builds the purger. retentionDays is validated by config
-// (NOTIFICATIONS_RETENTION_DAYS, 1..3650).
+// (NOTIFICATIONS_RETENTION, 1..3650).
 func NewRetentionPurger(repo RetentionRepository, retentionDays int32) *RetentionPurger {
 	return &RetentionPurger{repo: repo, retentionDays: retentionDays}
 }

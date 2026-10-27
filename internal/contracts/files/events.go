@@ -1,6 +1,10 @@
 package files
 
-import "time"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // Domain events published by the files module. The envelope (id,
 // type, dataVersion, occurredAt, tenantId, actor) is
@@ -28,8 +32,8 @@ const (
 
 // FileUploaded is the data of file.uploaded, version 1.
 type FileUploaded struct {
-	FileID       int64     `json:"fileId"`
-	OwnerID      int64     `json:"ownerId"`
+	FileID       uuid.UUID `json:"fileId"`
+	OwnerID      uuid.UUID `json:"ownerId"`
 	OriginalName string    `json:"originalName"`
 	MimeType     string    `json:"mimeType"`
 	Size         int64     `json:"size"`
@@ -38,15 +42,15 @@ type FileUploaded struct {
 
 // FileDeleted is the data of file.deleted, version 1.
 type FileDeleted struct {
-	FileID       int64     `json:"fileId"`
-	OwnerID      int64     `json:"ownerId"`
+	FileID       uuid.UUID `json:"fileId"`
+	OwnerID      uuid.UUID `json:"ownerId"`
 	OriginalName string    `json:"originalName"`
 	DeletedAt    time.Time `json:"deletedAt"`
 }
 
 // FileRestored is the data of file.restored, version 1.
 type FileRestored struct {
-	FileID       int64  `json:"fileId"`
-	OwnerID      int64  `json:"ownerId"`
-	OriginalName string `json:"originalName"`
+	FileID       uuid.UUID `json:"fileId"`
+	OwnerID      uuid.UUID `json:"ownerId"`
+	OriginalName string    `json:"originalName"`
 }

@@ -7,7 +7,7 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -166,7 +166,7 @@ func marshalLocale(values map[string]string) ([]byte, error) {
 	for key := range values {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	var b bytes.Buffer
 	b.WriteString("{\n")
 	for i, key := range keys {

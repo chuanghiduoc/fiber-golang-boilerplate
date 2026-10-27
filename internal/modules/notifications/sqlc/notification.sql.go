@@ -8,19 +8,20 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const countUnreadNotifications = `-- name: CountUnreadNotifications :one
 SELECT count(*) FROM notifications
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
   AND read_at IS NULL
 `
 
 type CountUnreadNotificationsParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) CountUnreadNotifications(ctx context.Context, arg CountUnreadNotificationsParams) (int64, error) {
@@ -32,17 +33,17 @@ func (q *Queries) CountUnreadNotifications(ctx context.Context, arg CountUnreadN
 
 const createNotification = `-- name: CreateNotification :one
 INSERT INTO notifications (tenant_id, user_id, type, title, body, data)
-VALUES ($1::bigint, $2::bigint, $3::varchar, $4::varchar, $5::text, $6::jsonb)
+VALUES ($1::uuid, $2::uuid, $3::text, $4::text, $5::text, $6::jsonb)
 RETURNING id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at
 `
 
 type CreateNotificationParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   int64  `json:"user_id"`
-	Type     string `json:"type"`
-	Title    string `json:"title"`
-	Body     string `json:"body"`
-	Data     []byte `json:"data"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	Type     string    `json:"type"`
+	Title    string    `json:"title"`
+	Body     string    `json:"body"`
+	Data     []byte    `json:"data"`
 }
 
 func (q *Queries) CreateNotification(ctx context.Context, arg CreateNotificationParams) (Notification, error) {
@@ -72,15 +73,15 @@ func (q *Queries) CreateNotification(ctx context.Context, arg CreateNotification
 
 const getNotificationByID = `-- name: GetNotificationByID :one
 SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at FROM notifications
-WHERE id = $1::bigint
-  AND tenant_id = $2::bigint
-  AND user_id = $3::bigint
+WHERE id = $1::uuid
+  AND tenant_id = $2::uuid
+  AND user_id = $3::uuid
 `
 
 type GetNotificationByIDParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) GetNotificationByID(ctx context.Context, arg GetNotificationByIDParams) (Notification, error) {
@@ -102,18 +103,18 @@ func (q *Queries) GetNotificationByID(ctx context.Context, arg GetNotificationBy
 }
 
 const getNotificationPreference = `-- name: GetNotificationPreference :one
-SELECT id, tenant_id, user_id, type, channel, enabled, created_at, updated_at FROM notification_preferences
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
-  AND type = $3::varchar
-  AND channel = $4::varchar
+SELECT tenant_id, user_id, type, channel, enabled, created_at, updated_at FROM notification_preferences
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
+  AND type = $3::text
+  AND channel = $4::text
 `
 
 type GetNotificationPreferenceParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   int64  `json:"user_id"`
-	Type     string `json:"type"`
-	Channel  string `json:"channel"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	Type     string    `json:"type"`
+	Channel  string    `json:"channel"`
 }
 
 func (q *Queries) GetNotificationPreference(ctx context.Context, arg GetNotificationPreferenceParams) (NotificationPreference, error) {
@@ -125,7 +126,6 @@ func (q *Queries) GetNotificationPreference(ctx context.Context, arg GetNotifica
 	)
 	var i NotificationPreference
 	err := row.Scan(
-		&i.ID,
 		&i.TenantID,
 		&i.UserID,
 		&i.Type,
@@ -138,15 +138,15 @@ func (q *Queries) GetNotificationPreference(ctx context.Context, arg GetNotifica
 }
 
 const listNotificationPreferences = `-- name: ListNotificationPreferences :many
-SELECT id, tenant_id, user_id, type, channel, enabled, created_at, updated_at FROM notification_preferences
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
+SELECT tenant_id, user_id, type, channel, enabled, created_at, updated_at FROM notification_preferences
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
 ORDER BY type ASC, channel ASC
 `
 
 type ListNotificationPreferencesParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) ListNotificationPreferences(ctx context.Context, arg ListNotificationPreferencesParams) ([]NotificationPreference, error) {
@@ -159,7 +159,6 @@ func (q *Queries) ListNotificationPreferences(ctx context.Context, arg ListNotif
 	for rows.Next() {
 		var i NotificationPreference
 		if err := rows.Scan(
-			&i.ID,
 			&i.TenantID,
 			&i.UserID,
 			&i.Type,
@@ -180,18 +179,18 @@ func (q *Queries) ListNotificationPreferences(ctx context.Context, arg ListNotif
 
 const listNotificationsCursor = `-- name: ListNotificationsCursor :many
 SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at FROM notifications
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
-  AND (created_at, id) < ($3::timestamptz, $4::bigint)
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
+  AND (created_at, id) < ($3::timestamptz, $4::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT $5::int
 `
 
 type ListNotificationsCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
-	UserID          int64              `json:"user_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	UserID          uuid.UUID          `json:"user_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -234,19 +233,19 @@ func (q *Queries) ListNotificationsCursor(ctx context.Context, arg ListNotificat
 
 const listUnreadNotificationsCursor = `-- name: ListUnreadNotificationsCursor :many
 SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at FROM notifications
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
   AND read_at IS NULL
-  AND (created_at, id) < ($3::timestamptz, $4::bigint)
+  AND (created_at, id) < ($3::timestamptz, $4::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT $5::int
 `
 
 type ListUnreadNotificationsCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
-	UserID          int64              `json:"user_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	UserID          uuid.UUID          `json:"user_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -293,14 +292,14 @@ func (q *Queries) ListUnreadNotificationsCursor(ctx context.Context, arg ListUnr
 const markAllNotificationsRead = `-- name: MarkAllNotificationsRead :execrows
 UPDATE notifications
 SET read_at = NOW()
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
   AND read_at IS NULL
 `
 
 type MarkAllNotificationsReadParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) MarkAllNotificationsRead(ctx context.Context, arg MarkAllNotificationsReadParams) (int64, error) {
@@ -314,16 +313,16 @@ func (q *Queries) MarkAllNotificationsRead(ctx context.Context, arg MarkAllNotif
 const markNotificationRead = `-- name: MarkNotificationRead :one
 UPDATE notifications
 SET read_at = COALESCE(read_at, NOW())
-WHERE id = $1::bigint
-  AND tenant_id = $2::bigint
-  AND user_id = $3::bigint
+WHERE id = $1::uuid
+  AND tenant_id = $2::uuid
+  AND user_id = $3::uuid
 RETURNING id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at
 `
 
 type MarkNotificationReadParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) MarkNotificationRead(ctx context.Context, arg MarkNotificationReadParams) (Notification, error) {
@@ -344,20 +343,53 @@ func (q *Queries) MarkNotificationRead(ctx context.Context, arg MarkNotification
 	return i, err
 }
 
+const markNotificationUnread = `-- name: MarkNotificationUnread :one
+UPDATE notifications
+SET read_at = NULL
+WHERE id = $1::uuid
+  AND tenant_id = $2::uuid
+  AND user_id = $3::uuid
+RETURNING id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at
+`
+
+type MarkNotificationUnreadParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) MarkNotificationUnread(ctx context.Context, arg MarkNotificationUnreadParams) (Notification, error) {
+	row := q.db.QueryRow(ctx, markNotificationUnread, arg.ID, arg.TenantID, arg.UserID)
+	var i Notification
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.UserID,
+		&i.Type,
+		&i.Title,
+		&i.Body,
+		&i.Data,
+		&i.ReadAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const upsertNotificationPreference = `-- name: UpsertNotificationPreference :one
 INSERT INTO notification_preferences (tenant_id, user_id, type, channel, enabled)
-VALUES ($1::bigint, $2::bigint, $3::varchar, $4::varchar, $5::boolean)
+VALUES ($1::uuid, $2::uuid, $3::text, $4::text, $5::boolean)
 ON CONFLICT (tenant_id, user_id, type, channel)
 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
-RETURNING id, tenant_id, user_id, type, channel, enabled, created_at, updated_at
+RETURNING tenant_id, user_id, type, channel, enabled, created_at, updated_at
 `
 
 type UpsertNotificationPreferenceParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   int64  `json:"user_id"`
-	Type     string `json:"type"`
-	Channel  string `json:"channel"`
-	Enabled  bool   `json:"enabled"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	Type     string    `json:"type"`
+	Channel  string    `json:"channel"`
+	Enabled  bool      `json:"enabled"`
 }
 
 func (q *Queries) UpsertNotificationPreference(ctx context.Context, arg UpsertNotificationPreferenceParams) (NotificationPreference, error) {
@@ -370,7 +402,6 @@ func (q *Queries) UpsertNotificationPreference(ctx context.Context, arg UpsertNo
 	)
 	var i NotificationPreference
 	err := row.Scan(
-		&i.ID,
 		&i.TenantID,
 		&i.UserID,
 		&i.Type,

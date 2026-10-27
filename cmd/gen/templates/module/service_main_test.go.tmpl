@@ -7,10 +7,20 @@ import (
 	"os"
 	"testing"
 
+	"github.com/google/uuid"
+
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
 	"{{.M.ModulePath}}/internal/platform/authz"
 	"{{.M.ModulePath}}/internal/platform/tenant"
 	"{{.M.ModulePath}}/pkg/apperror"
+)
+
+var (
+	// testTenant is the seeded default tenant; otherTenant is a second tenant
+	// used to prove isolation.
+	testTenant  = tenant.DefaultID
+	otherTenant = uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000002")
+	testUserID  = uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000c1")
 )
 
 // TestMain registers the module catalog: these tests do not build the app,
@@ -24,15 +34,19 @@ func TestMain(m *testing.M) {
 }
 
 // adminContext is a request context for an administrator of tenantID.
-func adminContext(tenantID int64) context.Context {
+func adminContext(tenantID uuid.UUID) context.Context {
 	ctx := tenant.WithID(context.Background(), tenantID)
-	return authz.WithSubject(ctx, authz.NewSubject(1, tenantID, authz.RoleAdmin))
+	permissions := make([]authz.Permission, 0, len({{.M.Ident}}catalog.Permissions()))
+	for _, grant := range {{.M.Ident}}catalog.Permissions() {
+		permissions = append(permissions, grant.Permission)
+	}
+	return authz.WithSubject(ctx, authz.NewSubjectWithPermissions(testUserID, tenantID, authz.RoleAdmin, permissions...))
 }
 
 // userContext is a request context for a plain user of tenantID.
-func userContext(tenantID int64) context.Context {
+func userContext(tenantID uuid.UUID) context.Context {
 	ctx := tenant.WithID(context.Background(), tenantID)
-	return authz.WithSubject(ctx, authz.NewSubject(2, tenantID, authz.RoleMember))
+	return authz.WithSubject(ctx, authz.NewSubject(uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000c2"), tenantID, authz.RoleMember))
 }
 
 // requireCode fails unless err is an *apperror.AppError with code want.

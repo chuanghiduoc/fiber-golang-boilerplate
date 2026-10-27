@@ -7,11 +7,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
+	"github.com/google/uuid"
 )
 
 // DataExportRepository implements service.DataExportRepository over sqlc.
@@ -32,15 +34,19 @@ func toDataExport(row identitysqlc.DataExport) identityservice.DataExport {
 		UserID:      row.UserID,
 		Status:      identityservice.DataExportStatus(row.Status),
 		StoragePath: row.StoragePath.String,
-		ExpiresAt:   timePtr(row.ExpiresAt),
+		ExpiresAt:   database.TimePtr(row.ExpiresAt),
 		CreatedAt:   row.CreatedAt.Time,
 		UpdatedAt:   row.UpdatedAt.Time,
 	}
 }
 
-func (r *DataExportRepository) Create(ctx context.Context, userID int64) (*identityservice.DataExport, error) {
+func (r *DataExportRepository) Create(ctx context.Context, userID uuid.UUID) (*identityservice.DataExport, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.CreateDataExport(ctx, identitysqlc.CreateDataExportParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	if err != nil {
@@ -53,10 +59,14 @@ func (r *DataExportRepository) Create(ctx context.Context, userID int64) (*ident
 	return &export, nil
 }
 
-func (r *DataExportRepository) Get(ctx context.Context, userID, id int64) (*identityservice.DataExport, error) {
+func (r *DataExportRepository) Get(ctx context.Context, userID, id uuid.UUID) (*identityservice.DataExport, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.GetDataExport(ctx, identitysqlc.GetDataExportParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	if err != nil {
@@ -66,9 +76,13 @@ func (r *DataExportRepository) Get(ctx context.Context, userID, id int64) (*iden
 	return &export, nil
 }
 
-func (r *DataExportRepository) ListForUser(ctx context.Context, userID int64) ([]identityservice.DataExport, error) {
+func (r *DataExportRepository) ListForUser(ctx context.Context, userID uuid.UUID) ([]identityservice.DataExport, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.q.ListDataExportsForUser(ctx, identitysqlc.ListDataExportsForUserParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	if err != nil {
@@ -81,9 +95,13 @@ func (r *DataExportRepository) ListForUser(ctx context.Context, userID int64) ([
 	return exports, nil
 }
 
-func (r *DataExportRepository) ListCursor(ctx context.Context, userID int64, cur pagination.DBCursor) ([]identityservice.DataExport, error) {
+func (r *DataExportRepository) ListCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]identityservice.DataExport, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.q.ListDataExportsCursor(ctx, identitysqlc.ListDataExportsCursorParams{
-		TenantID:        tenantID(ctx),
+		TenantID:        tenantID,
 		UserID:          userID,
 		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.IDParam(),
@@ -99,37 +117,53 @@ func (r *DataExportRepository) ListCursor(ctx context.Context, userID int64, cur
 	return exports, nil
 }
 
-func (r *DataExportRepository) MarkRunning(ctx context.Context, userID, id int64) (bool, error) {
+func (r *DataExportRepository) MarkRunning(ctx context.Context, userID, id uuid.UUID) (bool, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return false, err
+	}
 	n, err := r.q.MarkDataExportRunning(ctx, identitysqlc.MarkDataExportRunningParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	return n > 0, wrapErr(err)
 }
 
-func (r *DataExportRepository) MarkReady(ctx context.Context, userID, id int64, storagePath string, expiresAt time.Time) (bool, error) {
+func (r *DataExportRepository) MarkReady(ctx context.Context, userID, id uuid.UUID, storagePath string, expiresAt time.Time) (bool, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return false, err
+	}
 	n, err := r.q.MarkDataExportReady(ctx, identitysqlc.MarkDataExportReadyParams{
 		StoragePath: storagePath,
-		ExpiresAt:   timestamptz(expiresAt),
+		ExpiresAt:   database.Timestamptz(expiresAt),
 		ID:          id,
-		TenantID:    tenantID(ctx),
+		TenantID:    tenantID,
 		UserID:      userID,
 	})
 	return n > 0, wrapErr(err)
 }
 
-func (r *DataExportRepository) MarkFailed(ctx context.Context, userID, id int64) error {
+func (r *DataExportRepository) MarkFailed(ctx context.Context, userID, id uuid.UUID) error {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return err
+	}
 	return wrapErr(r.q.MarkDataExportFailed(ctx, identitysqlc.MarkDataExportFailedParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	}))
 }
 
-func (r *DataExportRepository) ExpireForUser(ctx context.Context, userID int64) ([]identityservice.DataExport, error) {
+func (r *DataExportRepository) ExpireForUser(ctx context.Context, userID uuid.UUID) ([]identityservice.DataExport, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.q.ExpireDataExportsForUser(ctx, identitysqlc.ExpireDataExportsForUserParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	if err != nil {
@@ -142,9 +176,13 @@ func (r *DataExportRepository) ExpireForUser(ctx context.Context, userID int64) 
 	return exports, nil
 }
 
-func (r *DataExportRepository) DeleteForUser(ctx context.Context, userID int64) error {
+func (r *DataExportRepository) DeleteForUser(ctx context.Context, userID uuid.UUID) error {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return err
+	}
 	return wrapErr(r.q.DeleteDataExportsForUser(ctx, identitysqlc.DeleteDataExportsForUserParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	}))
 }
@@ -162,14 +200,18 @@ func (r *DataExportRepository) Purgeable(ctx context.Context, limit int32) ([]id
 	return exports, nil
 }
 
-func (r *DataExportRepository) Delete(ctx context.Context, id int64) error {
+func (r *DataExportRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return wrapErr(r.q.DeleteDataExport(ctx, id))
 }
 
-func (r *DataExportRepository) ListSessions(ctx context.Context, userID int64) ([]identityservice.Session, error) {
+func (r *DataExportRepository) ListSessions(ctx context.Context, userID uuid.UUID) ([]identityservice.Session, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.q.ListUserSessionsForPrivacy(ctx, identitysqlc.ListUserSessionsForPrivacyParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	if err != nil {
@@ -182,7 +224,7 @@ func (r *DataExportRepository) ListSessions(ctx context.Context, userID int64) (
 	return sessions, nil
 }
 
-func (r *DataExportRepository) AnonymizeUser(ctx context.Context, userID int64, email string) (*identityservice.User, error) {
+func (r *DataExportRepository) AnonymizeUser(ctx context.Context, userID uuid.UUID, email string) (*identityservice.User, error) {
 	row, err := r.q.AnonymizeUser(ctx, identitysqlc.AnonymizeUserParams{Email: email, ID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -193,9 +235,13 @@ func (r *DataExportRepository) AnonymizeUser(ctx context.Context, userID int64, 
 	return toUser(row, false), nil
 }
 
-func (r *DataExportRepository) AnonymizeErasedUserInvitations(ctx context.Context, userID int64, replacement string) (int64, error) {
+func (r *DataExportRepository) AnonymizeErasedUserInvitations(ctx context.Context, userID uuid.UUID, replacement string) (int64, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return 0, err
+	}
 	rows, err := r.q.AnonymizeErasedUserInvitations(ctx, identitysqlc.AnonymizeErasedUserInvitationsParams{
-		Replacement: replacement, TenantID: tenantID(ctx), UserID: userID,
+		Replacement: replacement, TenantID: tenantID, UserID: userID,
 	})
 	if err != nil {
 		return 0, wrapErr(err)
@@ -206,7 +252,7 @@ func (r *DataExportRepository) AnonymizeErasedUserInvitations(ctx context.Contex
 // AnonymizeErasedUserInvitationsAllTenants sweeps every tenant; only the
 // global finalizer calls it, under the RLS bypass, so an address invited to a
 // tenant the user never joined is erased too.
-func (r *DataExportRepository) AnonymizeErasedUserInvitationsAllTenants(ctx context.Context, userID int64, replacement string) (int64, error) {
+func (r *DataExportRepository) AnonymizeErasedUserInvitationsAllTenants(ctx context.Context, userID uuid.UUID, replacement string) (int64, error) {
 	rows, err := r.q.AnonymizeErasedUserInvitationsAllTenants(ctx,
 		identitysqlc.AnonymizeErasedUserInvitationsAllTenantsParams{
 			Replacement: replacement, UserID: userID,
@@ -217,21 +263,25 @@ func (r *DataExportRepository) AnonymizeErasedUserInvitationsAllTenants(ctx cont
 	return rows, nil
 }
 
-func (r *DataExportRepository) DeleteCredentialsAndIdentities(ctx context.Context, userID int64) error {
+func (r *DataExportRepository) DeleteCredentialsAndIdentities(ctx context.Context, userID uuid.UUID) error {
 	if err := r.q.DeleteUserPasswords(ctx, userID); err != nil {
 		return wrapErr(err)
 	}
 	return wrapErr(r.q.DeleteUserIdentities(ctx, userID))
 }
 
-func (r *DataExportRepository) DeleteSessionsInTenant(ctx context.Context, userID int64) error {
+func (r *DataExportRepository) DeleteSessionsInTenant(ctx context.Context, userID uuid.UUID) error {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return err
+	}
 	return wrapErr(r.q.DeleteTenantUserSessions(ctx, identitysqlc.DeleteTenantUserSessionsParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	}))
 }
 
-func (r *DataExportRepository) DeleteSessionsForUser(ctx context.Context, userID int64) error {
+func (r *DataExportRepository) DeleteSessionsForUser(ctx context.Context, userID uuid.UUID) error {
 	ctx = database.WithRLSBypass(ctx) // The finalizer removes the user's sessions in every tenant.
 	return wrapErr(r.q.DeleteUserSessions(ctx, userID))
 }

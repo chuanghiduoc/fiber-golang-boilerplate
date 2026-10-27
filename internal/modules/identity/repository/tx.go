@@ -5,18 +5,20 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+	"github.com/google/uuid"
 )
 
-// NewStores binds every identity repository to db (the pool, or a pgx.Tx).
-func NewStores(db identitysqlc.DBTX) identityservice.Stores {
-	return identityservice.Stores{
+// NewStores binds every identity repository to db (the pool, or a pgx.Tx). A
+// ban hasher may be supplied; the ban paths fail loudly when one is missing.
+func NewStores(db identitysqlc.DBTX, bans ...identityservice.BanHasher) identityservice.Stores {
+	stores := identityservice.Stores{
 		Users:         NewUserRepository(db),
 		Memberships:   NewMembershipRepository(db),
 		Sessions:      NewSessionRepository(db),
@@ -26,9 +28,14 @@ func NewStores(db identitysqlc.DBTX) identityservice.Stores {
 		Invitations:   NewInvitationRepository(db),
 		Tenants:       NewTenantRepository(db),
 		MFA:           NewMFARepository(db),
+		Passkeys:      NewPasskeyRepository(db),
 		Privacy:       NewDataExportRepository(db),
 		Roles:         NewRoleRepository(db),
 	}
+	if len(bans) > 0 {
+		stores.Bans = bans[0]
+	}
+	return stores
 }
 
 // TxEmailSender enqueues an email on the caller's transaction.
@@ -46,30 +53,35 @@ type Transactor struct {
 	mail      TxEmailSender
 	bus       *events.Bus
 	queue     *jobs.Queue
+	bans      identityservice.BanHasher
 }
 
 var _ identityservice.Transactor = (*Transactor)(nil)
 
 // NewTransactor wires the transaction-bound collaborators without a job queue.
-func NewTransactor(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus) *Transactor {
-	return NewTransactorWithQueue(txManager, recorder, mail, bus, nil)
+func NewTransactor(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus, bans ...identityservice.BanHasher) *Transactor {
+	return NewTransactorWithQueue(txManager, recorder, mail, bus, nil, bans...)
 }
 
 // NewTransactorWithQueue also binds the job outbox, so privacy requests enqueue
-// their durable work in the same transaction. mail may be nil (TxRepos.Mail is
-// then nil and services send after commit). A nil bus publishes nothing.
-func NewTransactorWithQueue(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus, queue *jobs.Queue) *Transactor {
-	return &Transactor{txManager: txManager, audit: recorder, mail: mail, bus: bus, queue: queue}
+// their durable work in the same transaction. Production wiring always passes
+// the outbox sender; a nil mail is only a minimal test fixture. A nil bus
+// publishes nothing. The
+// ban hasher is propagated to every transaction's stores so a ban mutation can
+// compute its keyed marker on the same connection.
+func NewTransactorWithQueue(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus, queue *jobs.Queue, bans ...identityservice.BanHasher) *Transactor {
+	t := &Transactor{txManager: txManager, audit: recorder, mail: mail, bus: bus, queue: queue}
+	if len(bans) > 0 {
+		t.bans = bans[0]
+	}
+	return t
 }
-
-// MailTransactional reports whether TxRepos.Mail is set.
-func (t *Transactor) MailTransactional() bool { return t.mail != nil }
 
 func (t *Transactor) InTx(ctx context.Context, fn func(ctx context.Context, tx identityservice.TxRepos) error) error {
 	var afterCommit []func()
 	err := t.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 		repos := identityservice.TxRepos{
-			Stores: NewStores(tx),
+			Stores: NewStores(tx, t.bans),
 			Audit:  txAudit{recorder: t.audit, tx: tx},
 			Events: txEvents{bus: t.bus, tx: tx},
 			// The callback list only runs after WithTx commits, so a
@@ -123,7 +135,7 @@ func (e txEvents) Publish(ctx context.Context, event events.Event) error {
 	return e.bus.PublishTx(ctx, e.tx, event)
 }
 
-// txMail enqueues the email.send job through the open transaction.
+// txMail enqueues the email.send.encrypted job through the open transaction.
 type txMail struct {
 	sender TxEmailSender
 	tx     pgx.Tx
@@ -139,6 +151,6 @@ type txJobs struct {
 	tx    pgx.Tx
 }
 
-func (j txJobs) Enqueue(ctx context.Context, job jobs.Job) (int64, error) {
+func (j txJobs) Enqueue(ctx context.Context, job jobs.Job) (uuid.UUID, error) {
 	return j.queue.EnqueueTx(ctx, j.tx, job)
 }

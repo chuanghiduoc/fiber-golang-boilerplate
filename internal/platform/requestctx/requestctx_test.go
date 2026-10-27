@@ -16,11 +16,23 @@ func TestRequestAndActorValues(t *testing.T) {
 	assert.Equal(t, "req-1", RequestID(ctx))
 	assert.Zero(t, ActorID(ctx))
 
-	ctx = WithActorID(ctx, 42)
+	ctx = WithActorID(ctx, testID(42))
 	assert.Equal(t, "req-1", RequestID(ctx), "setting the actor must preserve the request id")
-	assert.Equal(t, int64(42), ActorID(ctx))
+	assert.Equal(t, testID(42), ActorID(ctx))
 
 	ctx = WithRequestID(ctx, "req-2")
 	assert.Equal(t, "req-2", RequestID(ctx), "setting the request id must preserve the actor")
-	assert.Equal(t, int64(42), ActorID(ctx))
+	assert.Equal(t, testID(42), ActorID(ctx))
+}
+
+func TestSessionID(t *testing.T) {
+	ctx := context.Background()
+	assert.Zero(t, SessionID(ctx))
+
+	sessionID := testID(9)
+	ctx = WithSessionID(ctx, sessionID)
+	assert.Equal(t, sessionID, SessionID(ctx))
+
+	ctx = WithRequestID(ctx, "req-1")
+	assert.Equal(t, sessionID, SessionID(ctx), "setting the request id must preserve the session id")
 }

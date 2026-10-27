@@ -8,23 +8,24 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const anonymizeErasedUserInvitations = `-- name: AnonymizeErasedUserInvitations :execrows
 UPDATE invitations
-SET email_normalized = $1::varchar,
+SET email_normalized = $1::text,
     updated_at = NOW()
-WHERE tenant_id = $2::bigint
-  AND (accepted_by = $3::bigint
-       OR email_normalized = (SELECT email FROM users WHERE id = $3::bigint))
-  AND email_normalized <> $1::varchar
+WHERE tenant_id = $2::uuid
+  AND (accepted_by = $3::uuid
+       OR email_normalized = (SELECT email FROM users WHERE id = $3::uuid))
+  AND email_normalized <> $1::text
 `
 
 type AnonymizeErasedUserInvitationsParams struct {
-	Replacement string `json:"replacement"`
-	TenantID    int64  `json:"tenant_id"`
-	UserID      int64  `json:"user_id"`
+	Replacement string    `json:"replacement"`
+	TenantID    uuid.UUID `json:"tenant_id"`
+	UserID      uuid.UUID `json:"user_id"`
 }
 
 // Erasure leaves no address in invitations the user accepted or that were
@@ -41,16 +42,16 @@ func (q *Queries) AnonymizeErasedUserInvitations(ctx context.Context, arg Anonym
 
 const anonymizeErasedUserInvitationsAllTenants = `-- name: AnonymizeErasedUserInvitationsAllTenants :execrows
 UPDATE invitations
-SET email_normalized = $1::varchar,
+SET email_normalized = $1::text,
     updated_at = NOW()
-WHERE (accepted_by = $2::bigint
-       OR email_normalized = (SELECT email FROM users WHERE id = $2::bigint))
-  AND email_normalized <> $1::varchar
+WHERE (accepted_by = $2::uuid
+       OR email_normalized = (SELECT email FROM users WHERE id = $2::uuid))
+  AND email_normalized <> $1::text
 `
 
 type AnonymizeErasedUserInvitationsAllTenantsParams struct {
-	Replacement string `json:"replacement"`
-	UserID      int64  `json:"user_id"`
+	Replacement string    `json:"replacement"`
+	UserID      uuid.UUID `json:"user_id"`
 }
 
 // The global finalizer runs under the RLS bypass after every membership is
@@ -67,22 +68,22 @@ func (q *Queries) AnonymizeErasedUserInvitationsAllTenants(ctx context.Context, 
 
 const anonymizeUser = `-- name: AnonymizeUser :one
 UPDATE users
-SET email = $1::varchar,
+SET email = $1::text,
     name = '',
     email_verified_at = NULL,
     status = 'deleted',
     deleted_at = COALESCE(deleted_at, NOW()),
     token_version = token_version + 1,
     credentials_changed_at = NOW()
-WHERE id = $2::bigint
-  AND (status <> 'deleted' OR email <> $1::varchar OR name <> ''
+WHERE id = $2::uuid
+  AND (status <> 'deleted' OR email <> $1::text OR name <> ''
        OR email_verified_at IS NOT NULL)
 RETURNING id, email, name, email_verified_at, status, token_version, credentials_changed_at, created_at, updated_at, deleted_at
 `
 
 type AnonymizeUserParams struct {
-	Email string `json:"email"`
-	ID    int64  `json:"id"`
+	Email string    `json:"email"`
+	ID    uuid.UUID `json:"id"`
 }
 
 // Also upgrades an account deleted by the older self-service path, which left
@@ -108,13 +109,13 @@ func (q *Queries) AnonymizeUser(ctx context.Context, arg AnonymizeUserParams) (U
 const createDataExport = `-- name: CreateDataExport :one
 
 INSERT INTO data_exports (tenant_id, user_id)
-VALUES ($1::bigint, $2::bigint)
+VALUES ($1::uuid, $2::uuid)
 RETURNING id, tenant_id, user_id, status, storage_path, expires_at, created_at, updated_at
 `
 
 type CreateDataExportParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 // Data exports and privacy erasure. Every export query is tenant/user scoped;
@@ -136,22 +137,22 @@ func (q *Queries) CreateDataExport(ctx context.Context, arg CreateDataExportPara
 }
 
 const deleteDataExport = `-- name: DeleteDataExport :exec
-DELETE FROM data_exports WHERE id = $1::bigint
+DELETE FROM data_exports WHERE id = $1::uuid
 `
 
-func (q *Queries) DeleteDataExport(ctx context.Context, id int64) error {
+func (q *Queries) DeleteDataExport(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteDataExport, id)
 	return err
 }
 
 const deleteDataExportsForUser = `-- name: DeleteDataExportsForUser :exec
 DELETE FROM data_exports
-WHERE tenant_id = $1::bigint AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid AND user_id = $2::uuid
 `
 
 type DeleteDataExportsForUserParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) DeleteDataExportsForUser(ctx context.Context, arg DeleteDataExportsForUserParams) error {
@@ -161,13 +162,13 @@ func (q *Queries) DeleteDataExportsForUser(ctx context.Context, arg DeleteDataEx
 
 const deleteTenantDataExportsForPurge = `-- name: DeleteTenantDataExportsForPurge :execrows
 DELETE FROM data_exports
-WHERE tenant_id = $1::bigint
-  AND id = ANY($2::bigint[])
+WHERE tenant_id = $1::uuid
+  AND id = ANY($2::uuid[])
 `
 
 type DeleteTenantDataExportsForPurgeParams struct {
-	TenantID int64   `json:"tenant_id"`
-	Ids      []int64 `json:"ids"`
+	TenantID uuid.UUID   `json:"tenant_id"`
+	Ids      []uuid.UUID `json:"ids"`
 }
 
 // Tenant purge: deletes exactly the page whose blobs the caller just removed.
@@ -181,12 +182,12 @@ func (q *Queries) DeleteTenantDataExportsForPurge(ctx context.Context, arg Delet
 
 const deleteTenantUserSessions = `-- name: DeleteTenantUserSessions :exec
 DELETE FROM sessions
-WHERE tenant_id = $1::bigint AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid AND user_id = $2::uuid
 `
 
 type DeleteTenantUserSessionsParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) DeleteTenantUserSessions(ctx context.Context, arg DeleteTenantUserSessionsParams) error {
@@ -195,28 +196,28 @@ func (q *Queries) DeleteTenantUserSessions(ctx context.Context, arg DeleteTenant
 }
 
 const deleteUserIdentities = `-- name: DeleteUserIdentities :exec
-DELETE FROM user_identities WHERE user_id = $1::bigint
+DELETE FROM user_identities WHERE user_id = $1::uuid
 `
 
-func (q *Queries) DeleteUserIdentities(ctx context.Context, userID int64) error {
+func (q *Queries) DeleteUserIdentities(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteUserIdentities, userID)
 	return err
 }
 
 const deleteUserPasswords = `-- name: DeleteUserPasswords :exec
-DELETE FROM user_passwords WHERE user_id = $1::bigint
+DELETE FROM user_passwords WHERE user_id = $1::uuid
 `
 
-func (q *Queries) DeleteUserPasswords(ctx context.Context, userID int64) error {
+func (q *Queries) DeleteUserPasswords(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteUserPasswords, userID)
 	return err
 }
 
 const deleteUserSessions = `-- name: DeleteUserSessions :exec
-DELETE FROM sessions WHERE user_id = $1::bigint
+DELETE FROM sessions WHERE user_id = $1::uuid
 `
 
-func (q *Queries) DeleteUserSessions(ctx context.Context, userID int64) error {
+func (q *Queries) DeleteUserSessions(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteUserSessions, userID)
 	return err
 }
@@ -224,15 +225,15 @@ func (q *Queries) DeleteUserSessions(ctx context.Context, userID int64) error {
 const expireDataExportsForUser = `-- name: ExpireDataExportsForUser :many
 UPDATE data_exports
 SET status = 'expired', expires_at = COALESCE(expires_at, NOW()), updated_at = NOW()
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
   AND status <> 'expired'
 RETURNING id, tenant_id, user_id, status, storage_path, expires_at, created_at, updated_at
 `
 
 type ExpireDataExportsForUserParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) ExpireDataExportsForUser(ctx context.Context, arg ExpireDataExportsForUserParams) ([]DataExport, error) {
@@ -266,15 +267,15 @@ func (q *Queries) ExpireDataExportsForUser(ctx context.Context, arg ExpireDataEx
 
 const getDataExport = `-- name: GetDataExport :one
 SELECT id, tenant_id, user_id, status, storage_path, expires_at, created_at, updated_at FROM data_exports
-WHERE id = $1::bigint
-  AND tenant_id = $2::bigint
-  AND user_id = $3::bigint
+WHERE id = $1::uuid
+  AND tenant_id = $2::uuid
+  AND user_id = $3::uuid
 `
 
 type GetDataExportParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) GetDataExport(ctx context.Context, arg GetDataExportParams) (DataExport, error) {
@@ -295,18 +296,18 @@ func (q *Queries) GetDataExport(ctx context.Context, arg GetDataExportParams) (D
 
 const listDataExportsCursor = `-- name: ListDataExportsCursor :many
 SELECT id, tenant_id, user_id, status, storage_path, expires_at, created_at, updated_at FROM data_exports
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
-  AND (created_at, id) < ($3::timestamptz, $4::bigint)
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
+  AND (created_at, id) < ($3::timestamptz, $4::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT $5::int
 `
 
 type ListDataExportsCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
-	UserID          int64              `json:"user_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	UserID          uuid.UUID          `json:"user_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -347,13 +348,13 @@ func (q *Queries) ListDataExportsCursor(ctx context.Context, arg ListDataExports
 
 const listDataExportsForUser = `-- name: ListDataExportsForUser :many
 SELECT id, tenant_id, user_id, status, storage_path, expires_at, created_at, updated_at FROM data_exports
-WHERE tenant_id = $1::bigint AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid AND user_id = $2::uuid
 ORDER BY id
 `
 
 type ListDataExportsForUserParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) ListDataExportsForUser(ctx context.Context, arg ListDataExportsForUserParams) ([]DataExport, error) {
@@ -428,18 +429,18 @@ func (q *Queries) ListPurgeableDataExports(ctx context.Context, batchSize int32)
 const listTenantDataExportsForPurge = `-- name: ListTenantDataExportsForPurge :many
 SELECT id, COALESCE(storage_path, '') AS storage_path
 FROM data_exports
-WHERE tenant_id = $1::bigint
+WHERE tenant_id = $1::uuid
 LIMIT $2::int
 `
 
 type ListTenantDataExportsForPurgeParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 type ListTenantDataExportsForPurgeRow struct {
-	ID          int64  `json:"id"`
-	StoragePath string `json:"storage_path"`
+	ID          uuid.UUID `json:"id"`
+	StoragePath string    `json:"storage_path"`
 }
 
 // Tenant purge: one bounded page of the tenant's exports (including rows of
@@ -479,7 +480,7 @@ type ListUserExternalIdentitiesRow struct {
 
 // Export: linked external accounts, without any token material (none is
 // stored). The subject identifies the account at the provider.
-func (q *Queries) ListUserExternalIdentities(ctx context.Context, userID int64) ([]ListUserExternalIdentitiesRow, error) {
+func (q *Queries) ListUserExternalIdentities(ctx context.Context, userID uuid.UUID) ([]ListUserExternalIdentitiesRow, error) {
 	rows, err := q.db.Query(ctx, listUserExternalIdentities, userID)
 	if err != nil {
 		return nil, err
@@ -500,27 +501,29 @@ func (q *Queries) ListUserExternalIdentities(ctx context.Context, userID int64) 
 }
 
 const listUserInvitationsReceived = `-- name: ListUserInvitationsReceived :many
-SELECT id, email_normalized, role, invited_by, expires_at, accepted_at, accepted_by, created_at
-FROM invitations
-WHERE tenant_id = $1::bigint
-  AND (accepted_by = $2::bigint OR email_normalized = $3::varchar)
-ORDER BY created_at DESC, id DESC
+SELECT i.id, i.email_normalized, r.key AS role, i.invited_by, i.expires_at, i.accepted_at,
+       i.accepted_by, i.created_at
+FROM invitations i
+JOIN roles r ON r.id = i.role_id
+WHERE i.tenant_id = $1::uuid
+  AND (i.accepted_by = $2::uuid OR i.email_normalized = $3::text)
+ORDER BY i.created_at DESC, i.id DESC
 `
 
 type ListUserInvitationsReceivedParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   int64  `json:"user_id"`
-	Email    string `json:"email"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	Email    string    `json:"email"`
 }
 
 type ListUserInvitationsReceivedRow struct {
-	ID              int64              `json:"id"`
+	ID              uuid.UUID          `json:"id"`
 	EmailNormalized string             `json:"email_normalized"`
 	Role            string             `json:"role"`
-	InvitedBy       int64              `json:"invited_by"`
+	InvitedBy       uuid.UUID          `json:"invited_by"`
 	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
 	AcceptedAt      pgtype.Timestamptz `json:"accepted_at"`
-	AcceptedBy      pgtype.Int8        `json:"accepted_by"`
+	AcceptedBy      uuid.NullUUID      `json:"accepted_by"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -556,25 +559,27 @@ func (q *Queries) ListUserInvitationsReceived(ctx context.Context, arg ListUserI
 }
 
 const listUserInvitationsSent = `-- name: ListUserInvitationsSent :many
-SELECT id, email_normalized, role, invited_by, expires_at, accepted_at, accepted_by, created_at
-FROM invitations
-WHERE tenant_id = $1::bigint AND invited_by = $2::bigint
-ORDER BY created_at DESC, id DESC
+SELECT i.id, i.email_normalized, r.key AS role, i.invited_by, i.expires_at, i.accepted_at,
+       i.accepted_by, i.created_at
+FROM invitations i
+JOIN roles r ON r.id = i.role_id
+WHERE i.tenant_id = $1::uuid AND i.invited_by = $2::uuid
+ORDER BY i.created_at DESC, i.id DESC
 `
 
 type ListUserInvitationsSentParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 type ListUserInvitationsSentRow struct {
-	ID              int64              `json:"id"`
+	ID              uuid.UUID          `json:"id"`
 	EmailNormalized string             `json:"email_normalized"`
 	Role            string             `json:"role"`
-	InvitedBy       int64              `json:"invited_by"`
+	InvitedBy       uuid.UUID          `json:"invited_by"`
 	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
 	AcceptedAt      pgtype.Timestamptz `json:"accepted_at"`
-	AcceptedBy      pgtype.Int8        `json:"accepted_by"`
+	AcceptedBy      uuid.NullUUID      `json:"accepted_by"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -610,13 +615,13 @@ func (q *Queries) ListUserInvitationsSent(ctx context.Context, arg ListUserInvit
 
 const listUserSessionsForPrivacy = `-- name: ListUserSessionsForPrivacy :many
 SELECT id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
-WHERE tenant_id = $1::bigint AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid AND user_id = $2::uuid
 ORDER BY created_at DESC, id DESC
 `
 
 type ListUserSessionsForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) ListUserSessionsForPrivacy(ctx context.Context, arg ListUserSessionsForPrivacyParams) ([]Session, error) {
@@ -657,16 +662,16 @@ func (q *Queries) ListUserSessionsForPrivacy(ctx context.Context, arg ListUserSe
 const markDataExportFailed = `-- name: MarkDataExportFailed :exec
 UPDATE data_exports
 SET status = 'failed', updated_at = NOW()
-WHERE id = $1::bigint
-  AND tenant_id = $2::bigint
-  AND user_id = $3::bigint
+WHERE id = $1::uuid
+  AND tenant_id = $2::uuid
+  AND user_id = $3::uuid
   AND status IN ('queued', 'running', 'failed')
 `
 
 type MarkDataExportFailedParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) MarkDataExportFailed(ctx context.Context, arg MarkDataExportFailedParams) error {
@@ -676,20 +681,20 @@ func (q *Queries) MarkDataExportFailed(ctx context.Context, arg MarkDataExportFa
 
 const markDataExportReady = `-- name: MarkDataExportReady :execrows
 UPDATE data_exports
-SET status = 'ready', storage_path = $1::varchar,
+SET status = 'ready', storage_path = $1::text,
     expires_at = $2::timestamptz, updated_at = NOW()
-WHERE id = $3::bigint
-  AND tenant_id = $4::bigint
-  AND user_id = $5::bigint
+WHERE id = $3::uuid
+  AND tenant_id = $4::uuid
+  AND user_id = $5::uuid
   AND status = 'running'
 `
 
 type MarkDataExportReadyParams struct {
 	StoragePath string             `json:"storage_path"`
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
-	ID          int64              `json:"id"`
-	TenantID    int64              `json:"tenant_id"`
-	UserID      int64              `json:"user_id"`
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	UserID      uuid.UUID          `json:"user_id"`
 }
 
 func (q *Queries) MarkDataExportReady(ctx context.Context, arg MarkDataExportReadyParams) (int64, error) {
@@ -709,16 +714,16 @@ func (q *Queries) MarkDataExportReady(ctx context.Context, arg MarkDataExportRea
 const markDataExportRunning = `-- name: MarkDataExportRunning :execrows
 UPDATE data_exports
 SET status = 'running', updated_at = NOW()
-WHERE id = $1::bigint
-  AND tenant_id = $2::bigint
-  AND user_id = $3::bigint
+WHERE id = $1::uuid
+  AND tenant_id = $2::uuid
+  AND user_id = $3::uuid
   AND status IN ('queued', 'failed', 'running')
 `
 
 type MarkDataExportRunningParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) MarkDataExportRunning(ctx context.Context, arg MarkDataExportRunningParams) (int64, error) {

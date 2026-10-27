@@ -18,14 +18,14 @@ import (
 // new dynamic call fails until it is converted to a constant or the site is
 // deliberately added here and maxDynamicSQLSites is raised.
 var dynamicSQLAllowlist = map[string]string{
-	"cmd/migrate/main.go:scanRows:Query:1":                        "shared schema-verification runner; each caller passes the literal query it verifies",
-	"pkg/database/scope.go:begin:Queue:1":                         "Scoped wraps arbitrary sqlc query constants and cannot make the caller's SQL constant",
-	"pkg/database/scope.go:Scan:Query:1":                          "scopedRow defers the caller's constant query until Scan so the RLS transaction wraps it",
-	"internal/testutil/pgtest/database.go:setupExternalDB:Exec:1": "throwaway per-test schema name is generated at runtime; never used against application data",
-	"internal/testutil/pgtest/database.go:setupExternalDB:Exec:2": "throwaway per-test schema name is generated at runtime; never used against application data",
-	"internal/testutil/pgtest/postgres.go:OpenAppPool:Exec:1":     "grants a generated test schema identifier to the test app role",
-	"internal/testutil/pgtest/postgres.go:ensureAppRole:Exec:1":   "test fixture creates the fixed app role; the identifier is sanitized with pgx.Identifier",
-	"internal/testutil/pgtest/postgres.go:ensureAppRole:Exec:2":   "test fixture configures the fixed app role; the identifier is sanitized with pgx.Identifier",
+	"internal/migrate/verify.go:scanRows:Query:1":               "shared schema-verification runner; each caller passes the literal query it verifies",
+	"internal/database/scope.go:begin:Queue:1":                  "Scoped wraps arbitrary sqlc query constants and cannot make the caller's SQL constant",
+	"internal/database/scope.go:Scan:Query:1":                   "scopedRow defers the caller's constant query until Scan so the RLS transaction wraps it",
+	"internal/testutil/pgtest/database.go:Close:Exec:1":         "throwaway per-test schema name is generated at runtime; never used against application data",
+	"internal/testutil/pgtest/database.go:New:Exec:1":           "throwaway per-test schema name is generated at runtime; never used against application data",
+	"internal/testutil/pgtest/postgres.go:OpenAppPool:Exec:1":   "grants a generated test schema identifier to the test app role",
+	"internal/testutil/pgtest/postgres.go:ensureAppRole:Exec:1": "test fixture creates the fixed app role; the identifier is sanitized with pgx.Identifier",
+	"internal/testutil/pgtest/postgres.go:ensureAppRole:Exec:2": "test fixture configures the fixed app role; the identifier is sanitized with pgx.Identifier",
 }
 
 // maxDynamicSQLSites is the reviewed size of dynamicSQLAllowlist. The list may

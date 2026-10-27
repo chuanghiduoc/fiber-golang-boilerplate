@@ -1,28 +1,27 @@
 package dto
 
-import "time"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // CreateTenantRequest creates a tenant from the platform surface.
 type CreateTenantRequest struct {
-	Slug        string     `json:"slug" validate:"required,min=2,max=63"`
-	Name        string     `json:"name" validate:"required,min=1,max=255,notblank"`
-	Status      string     `json:"status" validate:"omitempty,oneof=trialing active"`
-	TrialEndsAt *time.Time `json:"trialEndsAt"`
-	Locale      string     `json:"locale" validate:"omitempty,max=35"`
-	Timezone    string     `json:"timezone" validate:"omitempty,max=64"`
-}
-
-// UpdateTenantStatusRequest moves a tenant through its lifecycle.
-type UpdateTenantStatusRequest struct {
-	Status string `json:"status" validate:"required,oneof=trialing active suspended pending_deletion deleted"`
+	Slug        string     `json:"slug" required:"true" minLength:"2" maxLength:"63"`
+	Name        string     `json:"name" required:"true" minLength:"1" maxLength:"255"`
+	Status      string     `json:"status,omitempty" enum:"trialing,active"`
+	TrialEndsAt *time.Time `json:"trialEndsAt,omitempty"`
+	Locale      string     `json:"locale,omitempty" maxLength:"35"`
+	Timezone    string     `json:"timezone,omitempty" maxLength:"64"`
 }
 
 // TenantResponse is one tenant row.
 type TenantResponse struct {
-	ID                  int64      `json:"id"`
+	ID                  uuid.UUID  `json:"id"`
 	Slug                string     `json:"slug"`
 	Name                string     `json:"name"`
-	Status              string     `json:"status" enums:"trialing,active,suspended,pending_deletion,deleted"`
+	Status              string     `json:"status" enum:"trialing,active,suspended,pending_deletion,deleted"`
 	StatusChangedAt     time.Time  `json:"statusChangedAt"`
 	TrialEndsAt         *time.Time `json:"trialEndsAt,omitempty"`
 	DeletionScheduledAt *time.Time `json:"deletionScheduledAt,omitempty"`

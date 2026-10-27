@@ -7,14 +7,16 @@ import (
 	"context"
 	"io"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // File is the files module's cross-module view of stored metadata. Storage
 // paths stay private to the owning module.
 type File struct {
-	ID           int64
-	TenantID     int64
-	UserID       int64
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+	UserID       uuid.UUID
 	OriginalName string
 	MimeType     string
 	Size         int64
@@ -44,8 +46,8 @@ type FileDownload struct {
 // FilesAdmin is the back-office surface files exposes to admin.
 type FilesAdmin interface {
 	ListFiles(ctx context.Context, limit int, startingAfter string) (FilePage, error)
-	OpenFile(ctx context.Context, id int64) (FileDownload, error)
-	DeleteFile(ctx context.Context, id int64) error
-	RestoreFile(ctx context.Context, id int64) (File, error)
+	OpenFile(ctx context.Context, id uuid.UUID) (FileDownload, error)
+	DeleteFile(ctx context.Context, id uuid.UUID) error
+	RestoreFile(ctx context.Context, id uuid.UUID) (File, error)
 	GetFileStats(ctx context.Context) (FileStats, error)
 }

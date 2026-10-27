@@ -14,7 +14,32 @@ spec:
   # available. Do not lower an environment's HPA minimum below 2 without also
   # changing this PDB, or drains can deadlock.
   minAvailable: 1
+  # A pod that is already unhealthy must not block a drain. Without this,
+  # eviction waits for a crashing pod to become Ready, which may never happen.
+  unhealthyPodEvictionPolicy: AlwaysAllow
   selector:
     matchLabels:
       app.kubernetes.io/name: fiber-boilerplate
       app.kubernetes.io/instance: fiber-boilerplate
+      app.kubernetes.io/component: api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fiber-boilerplate-worker
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/instance: fiber-boilerplate-worker
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: worker
+spec:
+  # Two worker replicas make one voluntary disruption safe. The scheduler lease
+  # and job claims fail over to the remaining pod.
+  minAvailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fiber-boilerplate
+      app.kubernetes.io/instance: fiber-boilerplate-worker
+      app.kubernetes.io/component: worker

@@ -38,7 +38,7 @@ Each flag is enforced by its owning module with the request subject
 | --- | --- | --- | --- |
 | `user_registration` | `POST /auth/register` (handler) and new-account creation in `GET /auth/google/callback`; `POST /auth/invitations/signup` is deliberately not gated (the admin invited the address) | request tenant; callback: tenant in the signed `state` | `404 feature.disabled` |
 | `google_oauth` | `GET /auth/google` and `GET /auth/google/callback` (handler) | redirect: resolved tenant; callback: tenant in the signed `state` | `404 feature.disabled` |
-| `file_uploads` | `POST /files/upload` (route middleware after auth, before idempotency/audit) | request tenant + JWT user | `404 feature.disabled` |
+| `file_uploads` | `POST /files` (policy middleware after auth, before idempotency/audit) | request tenant + JWT user | `404 feature.disabled` |
 | `email_verification` | `POST /auth/login`, `POST /auth/refresh` | user's tenant + user | when **on**, unverified users get `403 auth.email_not_verified` |
 
 - `email_verification` is a requirement, not a route gate. It is OR-ed with
@@ -132,8 +132,8 @@ user, so the same user ID in another tenant does not inherit it.
 | --- | --- | --- |
 | `FEATURE_FLAGS` | empty | Comma-separated `key=true\|false` assignments; a bare key means true, e.g. `user_registration=false,file_uploads`. |
 | `FEATURE_FLAGS_FORCE_OFF` | empty | Comma-separated keys that always evaluate false. |
-| `FEATURE_FLAGS_CACHE_TTL_SECONDS` | `30` | How long a loaded database snapshot is fresh. |
-| `FEATURE_FLAGS_MAX_STALENESS_SECONDS` | `300` | Maximum age of the last good snapshot when the database is unavailable. Never below the TTL. |
+| `FEATURE_FLAGS_CACHE_TTL` | `30s` | How long a loaded database snapshot is fresh. |
+| `FEATURE_FLAGS_MAX_STALENESS` | `5m` | Maximum age of the last good snapshot when the database is unavailable. Never below the TTL. |
 
 Config validation rejects malformed assignments, duplicate keys, unknown
 catalog keys, negative timings, and `MAX_STALENESS < CACHE_TTL`. Zero timings
@@ -191,8 +191,8 @@ flowchart TD
 
 | Behavior | Detail |
 | --- | --- |
-| Fresh | A snapshot younger than `FEATURE_FLAGS_CACHE_TTL_SECONDS` is served without a query. |
-| Stale-while-revalidate | An expired snapshot still within `FEATURE_FLAGS_MAX_STALENESS_SECONDS` is served immediately while one background reload runs, so a slow database never stalls requests. |
+| Fresh | A snapshot younger than `FEATURE_FLAGS_CACHE_TTL` is served without a query. |
+| Stale-while-revalidate | An expired snapshot still within `FEATURE_FLAGS_MAX_STALENESS` is served immediately while one background reload runs, so a slow database never stalls requests. |
 | Blocking reload | Only with no usable snapshot (cold start, older than max staleness) or after `Invalidate`. Concurrent blocked callers serialize behind the refresh lock and reuse the fresh result. |
 | Detached loads | Loads use `context.WithoutCancel` plus a 5s timeout, so a client disconnect cannot fail a load for everyone. A load that still returns `context.Canceled` is not a database failure and does not throttle the next reload. |
 | Failed reload | The last good snapshot is served while no older than max staleness; after that, targets and database defaults fall back to force-off/environment/compiled defaults, while the last snapshot's kill switches remain in force. Failed reloads are throttled for one TTL so an outage does not query on every request. |
@@ -201,51 +201,54 @@ flowchart TD
 
 ## Admin API
 
-All routes require a JWT and are mounted under `/api/v1/admin/features`.
-`admin:features:read` guards reads; `admin:features:write` guards mutations.
-Mutating routes accept `Idempotency-Key` through the normal middleware and then
-run behind a required `audithttp.Guard` (fail-closed: an unavailable audit store
-returns `503 system.audit_unavailable` before the write). `PUT`/`DELETE
-/flags/{key}` also accept the platform permission `platform:features:write`, so
-the whole route requires an MFA session (`amr` with `otp` or `rc`, otherwise
-`403 auth.mfa_required`) before the permission check: `test/arch` requires that
-every route accepting a platform permission run `authzhttp.RequireMFA()`. The
-tenant-only target routes do not accept a platform permission and need no
-second factor.
+Process-wide flag rows live under `/api/v1/platform/feature-flags`;
+`platform:features:read` guards reads and `platform:features:write` guards
+mutations. Both permissions are platform-only and therefore imply an MFA
+session (`amr` with `otp`/`rc`, checked by the operation policy). Tenant admins
+manage their own targets under `/api/v1/feature-flags` with
+`admin:features:read`/`admin:features:write` and do not need a second factor.
+Mutations accept `Idempotency-Key`; the platform flag routes honour
+`ETag`/`If-Match` (`412 resource.precondition_failed` on a stale validator).
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/flags` | List every catalog flag with database default, kill switch, configured state, and the caller's effective value/source. |
-| GET | `/flags/{key}` | Flag plus tenant targets. |
-| PUT | `/flags/{key}` | Platform tenant only. Upsert the database default, kill switch, and description (description defaults to the existing value or catalog description). Omitting `enabled` stores NULL (no database default). |
-| DELETE | `/flags/{key}` | Platform tenant only. Delete the database row; the flag reverts to env/compiled defaults. Idempotent for a valid catalog key; `409` while targets exist in any tenant. |
-| GET | `/flags/{key}/targets` | List tenant-wide and user targets in the request tenant. |
-| PUT | `/flags/{key}/targets` | Upsert a target. Omit `userId` for a tenant-wide target; include it for a user target. The tenant always comes from context, never the body. |
-| DELETE | `/flags/{key}/targets/{id}` | Delete a target by ID, scoped to the request tenant and flag key. |
+| GET | `/platform/feature-flags` | List every catalog flag with database default, kill switch, configured state, and the caller's effective value/source. |
+| GET | `/platform/feature-flags/{key}` | One flag with its current state; returns an `ETag`. |
+| POST | `/platform/feature-flags` | Create the process-wide row from `{key,enabled?,killSwitch,description}`; `409` when a row already exists. |
+| PATCH | `/platform/feature-flags/{key}` | RFC 7396 merge patch on `enabled`, `killSwitch`, and `description`. A `null` enabled clears the database default (NULL), a `null` kill switch clears it to false, and a `null` description restores the catalog text. An empty patch is a no-op. |
+| DELETE | `/platform/feature-flags/{key}` | Delete the database row; the flag reverts to env/compiled defaults. `409` while targets exist in any tenant; honours `If-Match`. |
+| GET | `/platform/feature-flags/{key}/targets` | List every tenant's targets for the flag (the platform view). |
+| PUT | `/platform/feature-flags/{key}/targets/{targetId}` | Upsert at the item URI. `targetId` is `tenant:{tenantId}` for a tenant-wide target or `user:{tenantId}:{userId}` for a user target. |
+| DELETE | `/platform/feature-flags/{key}/targets/{targetId}` | Delete the addressed target. |
+| GET | `/feature-flags` | Effective values for the request tenant (`EvaluatedFlagResponse`). |
+| GET | `/feature-flags/{key}/targets` | The request tenant's targets only. |
+| PUT | `/feature-flags/{key}/targets/{targetId}` | Upsert a target in the request tenant. `targetId` is `tenant` or `user:{userId}`. |
+| DELETE | `/feature-flags/{key}/targets/{targetId}` | Delete a target in the request tenant. |
 
-`killSwitch` is required on `PUT /flags/{key}`; `enabled` is required on
-`PUT .../targets`. Requests reject unknown JSON fields. A user target whose
-user is not in the request tenant returns `400` (composite FK); a target upsert
-that races a concurrent flag delete returns `409`.
+`killSwitch` is required when creating a flag; `enabled` is required on a
+target upsert. Requests reject unknown JSON fields. A target whose user or
+tenant is outside the addressed scope is treated as not found (`404`); a target
+upsert that races a concurrent flag delete returns `409`.
 
-Flag rows are process-wide; targets are tenant-scoped. `PUT`/`DELETE
-/flags/{key}` change behavior for every tenant, so they are allowed only for
-administrators of the platform tenant (the compatibility tenant, id 1, read
-strictly from the request context without the `EffectiveID` fallback). Any
-other tenant's admin gets `403 permission.denied` and keeps read access and
-management of its own tenant/user targets. `DELETE /flags/{key}` relies on the
+Flag rows are process-wide; targets are tenant-scoped. Flag-row writes change
+behavior for every tenant, so they require a platform `platform_admin`
+assignment, not a tenant role. A tenant admin without the assignment gets
+`403 permission.denied` but keeps read access through
+`platform:features:read`. `DELETE /platform/feature-flags/{key}` relies on the
 RESTRICT foreign key (not a count-then-delete check), so a target created
 concurrently in any tenant still blocks it; the `409` never names the tenants
 that own targets. Use tenant/user targets for per-tenant rollout.
 
-Audit: each mutation writes a required Guard intent row
-(`admin.feature_flag.updated`, `admin.feature_flag.deleted`,
-`admin.feature_flag_target.updated`, `admin.feature_flag_target.deleted`) and
-completes it with the outcome. After a successful write the service records a
-domain event with the same action, linked to the intent, carrying non-secret
-metadata: `feature`, `enabled` (omitted when NULL), `killSwitch`, `source`,
-and, for targets, `targetId`, `enabled`, and `userId`. The resource ID is the
-flag key or the target ID.
+Audit: `POST` and `PATCH` are Tier 1 — the service records
+`admin.feature_flag.updated` through `RecordInTx` in the mutation transaction,
+so an unavailable audit store rolls the flag write back (`503
+system.audit_unavailable`). `DELETE` and every target mutation are Guarded
+(fail-closed intent row): `admin.feature_flag.deleted`,
+`admin.feature_flag_target.updated`, `admin.feature_flag_target.deleted`.
+Target mutations also record a post-commit domain event linked to the intent
+with non-secret metadata: `feature`, `targetId`, `tenantId`, `enabled`, and,
+for user targets, `userId`. The resource ID is the flag key or the canonical
+target id.
 
 ## Metrics
 

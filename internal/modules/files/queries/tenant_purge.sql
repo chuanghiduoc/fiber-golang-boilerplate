@@ -3,10 +3,10 @@
 
 -- name: ListTenantFilesForPurge :many
 SELECT id, storage_path FROM files
-WHERE tenant_id = @tenant_id::bigint
+WHERE tenant_id = @tenant_id::uuid
 LIMIT @batch_size::int;
 
 -- name: DeleteTenantFilesForPurge :execrows
 DELETE FROM files
-WHERE tenant_id = @tenant_id::bigint
-  AND id = ANY(@ids::bigint[]);
+WHERE tenant_id = @tenant_id::uuid
+  AND id = ANY(@ids::uuid[]);

@@ -3,6 +3,8 @@ package authz
 import (
 	"context"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -45,8 +47,8 @@ func (d Decision) String() string {
 // only facts the built-in policies need; modules may use additional subject
 // attributes for their own policies.
 type Resource struct {
-	TenantID int64
-	OwnerID  int64
+	TenantID uuid.UUID
+	OwnerID  uuid.UUID
 }
 
 // Policy evaluates a subject against a resource.
@@ -127,6 +129,30 @@ func (OwnerPolicy) Evaluate(subject Subject, resource Resource) Decision {
 	return Conceal
 }
 
+// Authorizer is the single service-level authorization path, bound to the
+// injected permission catalog. Services receive it in their dependencies;
+// there is no package-level authorization entry point.
+type Authorizer struct {
+	catalog *Catalog
+}
+
+// NewAuthorizer binds the authorizer to a catalog. A nil catalog fails closed
+// for subject-bearing contexts (unknown permission) and still allows system
+// contexts.
+func NewAuthorizer(catalog *Catalog) Authorizer {
+	return Authorizer{catalog: catalog}
+}
+
+// Has reports whether role is granted permission p in the bound catalog.
+func (a Authorizer) Has(role string, permission Permission) bool {
+	return a.catalog != nil && a.catalog.Has(role, permission)
+}
+
+// IsKnownPermission reports whether permission is part of the bound catalog.
+func (a Authorizer) IsKnownPermission(permission Permission) bool {
+	return a.catalog != nil && a.catalog.IsKnownPermission(permission)
+}
+
 // Authorize is the single service-level authorization path. With a subject in
 // ctx (installed by JWTAuth or the API-key middleware through WithSubject) it
 // performs an RBAC pre-check followed by policy evaluation: Deny maps to 403
@@ -134,9 +160,9 @@ func (OwnerPolicy) Evaluate(subject Subject, resource Resource) Decision {
 // the system marker, so a request context can never escalate by also carrying
 // it. Without a subject, a context marked by SystemContext is allowed; any
 // other context fails closed with 403.
-func Authorize(ctx context.Context, permission Permission, resource Resource, policies ...Policy) error {
+func (a Authorizer) Authorize(ctx context.Context, permission Permission, resource Resource, policies ...Policy) error {
 	if subject, ok := SubjectFromContext(ctx); ok {
-		return AuthorizeSubject(subject, permission, resource, policies...)
+		return a.AuthorizeSubject(subject, permission, resource, policies...)
 	}
 	if IsSystemContext(ctx) {
 		return nil
@@ -144,9 +170,11 @@ func Authorize(ctx context.Context, permission Permission, resource Resource, po
 	return permissionDenied()
 }
 
-// AuthorizeSubject is Authorize for callers that already hold a Subject.
-func AuthorizeSubject(subject Subject, permission Permission, resource Resource, policies ...Policy) error {
-	if !subject.Has(permission) {
+// AuthorizeSubject is Authorize for callers that already hold a Subject. A
+// permission outside the injected catalog is denied (a typo must never grant
+// access), mirroring the fail-closed route middleware.
+func (a Authorizer) AuthorizeSubject(subject Subject, permission Permission, resource Resource, policies ...Policy) error {
+	if !a.IsKnownPermission(permission) || !subject.Has(permission) {
 		return permissionDenied()
 	}
 	switch PolicySet(policies).Evaluate(subject, resource) {

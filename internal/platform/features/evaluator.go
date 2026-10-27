@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
@@ -45,17 +47,17 @@ type Result struct {
 }
 
 // Subject identifies the caller whose overrides should apply. A zero TenantID
-// resolves from the context (falling back to the compatibility tenant), and a
-// zero UserID skips user-target lookup.
+// resolves from the context (and matches no tenant target when the context has
+// none), and a zero UserID skips user-target lookup.
 type Subject struct {
-	TenantID int64
-	UserID   int64
+	TenantID uuid.UUID
+	UserID   uuid.UUID
 }
 
 // SubjectFromContext builds a subject from the request tenant and an
 // authenticated user ID.
-func SubjectFromContext(ctx context.Context, userID int64) Subject {
-	return Subject{TenantID: tenant.EffectiveID(ctx), UserID: userID}
+func SubjectFromContext(ctx context.Context, userID uuid.UUID) Subject {
+	return Subject{TenantID: tenant.IDFromContext(ctx), UserID: userID}
 }
 
 // FlagState is the database-level state for one flag. A nil Enabled means the
@@ -69,15 +71,15 @@ type FlagState struct {
 
 // UserTargetKey identifies a user override inside one tenant.
 type UserTargetKey struct {
-	TenantID int64
-	UserID   int64
+	TenantID uuid.UUID
+	UserID   uuid.UUID
 }
 
 // Snapshot is the complete flag state loaded from the optional database
 // store. A zero LoadedAt is filled in by the evaluator.
 type Snapshot struct {
 	Flags         map[Key]FlagState
-	TenantTargets map[Key]map[int64]bool
+	TenantTargets map[Key]map[uuid.UUID]bool
 	UserTargets   map[Key]map[UserTargetKey]bool
 	LoadedAt      time.Time
 }
@@ -110,9 +112,11 @@ type Evaluator interface {
 }
 
 // Options configures a CachedEvaluator. Store may be nil, in which case only
-// force-off, environment, and compiled defaults apply.
+// force-off, environment, and compiled defaults apply. Catalog is the injected
+// flag catalog; nil yields an empty catalog (every flag disabled).
 type Options struct {
 	Store        Store
+	Catalog      *Catalog
 	Env          map[Key]bool
 	ForceOff     map[Key]struct{}
 	CacheTTL     time.Duration
@@ -127,6 +131,7 @@ type Options struct {
 // MaxStaleness is served while a single background load refreshes it.
 type CachedEvaluator struct {
 	store        Store
+	catalog      *Catalog
 	env          map[Key]bool
 	forceOff     map[Key]struct{}
 	cacheTTL     time.Duration
@@ -172,9 +177,14 @@ func NewEvaluator(opts Options) Evaluator {
 	if now == nil {
 		now = time.Now
 	}
+	catalog := opts.Catalog
+	if catalog == nil {
+		catalog = EmptyCatalog()
+	}
 
 	return &CachedEvaluator{
 		store:        opts.Store,
+		catalog:      catalog,
 		env:          env,
 		forceOff:     forceOff,
 		cacheTTL:     ttl,
@@ -219,11 +229,11 @@ func (e *CachedEvaluator) lastSnapshot() *Snapshot {
 }
 
 func normalizeSubject(ctx context.Context, subject Subject) Subject {
-	if subject.TenantID == 0 {
-		subject.TenantID = tenant.EffectiveID(ctx)
+	if subject.TenantID == uuid.Nil {
+		subject.TenantID = tenant.IDFromContext(ctx)
 	}
-	if subject.UserID < 0 {
-		subject.UserID = 0
+	if subject.UserID == uuid.Nil {
+		subject.UserID = uuid.Nil
 	}
 	return subject
 }
@@ -238,7 +248,7 @@ func (e *CachedEvaluator) resolve(key Key, subject Subject, snapshot, killSnapsh
 	}
 	if snapshot != nil {
 		flag, hasRow := snapshot.Flags[key]
-		if subject.UserID != 0 {
+		if subject.UserID != uuid.Nil {
 			if targets := snapshot.UserTargets[key]; targets != nil {
 				if enabled, ok := targets[UserTargetKey(subject)]; ok {
 					return enabled, SourceUserTarget
@@ -258,7 +268,7 @@ func (e *CachedEvaluator) resolve(key Key, subject Subject, snapshot, killSnapsh
 	if enabled, ok := e.env[key]; ok {
 		return enabled, SourceEnvironment
 	}
-	return CompiledDefault(key), SourceCompiledDefault
+	return e.catalog.CompiledDefault(key), SourceCompiledDefault
 }
 
 // snapshotFor returns a usable snapshot or nil when the database has never

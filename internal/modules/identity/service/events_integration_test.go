@@ -5,12 +5,12 @@ package service_test
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
@@ -19,7 +19,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/google/uuid"
 )
 
 const probeHandler = "probe"
@@ -38,16 +38,16 @@ func TestRegister_PublishesUserRegisteredInTransaction(t *testing.T) {
 	ctx := context.Background()
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
 
-	bus := events.New(jobs.NewQueue(testutil.Scoped(e.pool)))
+	bus := events.New(jobs.NewQueue(e.fx.Scoped()))
 	subscribeProbe(t, bus)
-	tx := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), audit.NewPostgresRecorder(testutil.Scoped(e.pool)), nil, bus)
+	tx := identityrepo.NewTransactor(e.fx.Tx(), audit.NewPostgresRecorder(e.fx.Scoped()), nil, bus, testutil.BanHasher(t))
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
 
 	user, err := users.Register(tenant.WithID(ctx, acmeID), service.RegisterInput{Email: "event@example.com", Password: testPassphrase, Name: "Event"})
 	require.NoError(t, err)
 
 	var (
-		jobTenant int64
+		jobTenant uuid.UUID
 		payload   []byte
 	)
 	require.NoError(t, e.pool.QueryRow(ctx,
@@ -65,7 +65,7 @@ func TestRegister_PublishesUserRegisteredInTransaction(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, user.User.ID, data.UserID)
 	assert.Equal(t, "event@example.com", data.Email)
-	assert.Equal(t, strconv.FormatInt(user.User.ID, 10), envelope.Actor.ID)
+	assert.Equal(t, user.User.ID.String(), envelope.Actor.ID)
 }
 
 // A publish failure (here a durable subscriber with no queue) fails the
@@ -76,7 +76,7 @@ func TestRegister_RollsBackWhenPublishFails(t *testing.T) {
 
 	bus := events.New(nil) // durable publish fails with events.ErrNoQueue
 	subscribeProbe(t, bus)
-	tx := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), audit.NewPostgresRecorder(testutil.Scoped(e.pool)), nil, bus)
+	tx := identityrepo.NewTransactor(e.fx.Tx(), audit.NewPostgresRecorder(e.fx.Scoped()), nil, bus, testutil.BanHasher(t))
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
 
 	_, err := users.Register(ctx, service.RegisterInput{Email: "rollback@example.com", Password: testPassphrase, Name: "Rollback"})

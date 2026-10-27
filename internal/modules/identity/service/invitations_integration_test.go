@@ -15,11 +15,12 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/google/uuid"
 )
 
-func inviteForTest(t *testing.T, e *env, ctx context.Context, inviterID int64, email string) string {
+func inviteForTest(t *testing.T, e *env, ctx context.Context, inviterID uuid.UUID, email string) string {
 	t.Helper()
-	invitations := identityservice.NewInvitationService(e.stores, e.tx, e.mail, "https://app.example.test")
+	invitations := identityservice.NewInvitationService(e.stores, e.tx, "https://app.example.test")
 	_, err := invitations.Invite(ctx, identityservice.InviteInput{
 		InviterID: inviterID, Email: email, Role: identityservice.RoleMember,
 	})
@@ -27,9 +28,14 @@ func inviteForTest(t *testing.T, e *env, ctx context.Context, inviterID int64, e
 	return e.mail.tokenFor(t, email)
 }
 
-func memberContextIn(tenantID, userID int64, role string) context.Context {
+func memberContextIn(tenantID, userID uuid.UUID, role string) context.Context {
 	ctx := tenant.WithID(context.Background(), tenantID)
-	return authz.WithSubject(ctx, authz.NewSubject(userID, tenantID, role))
+	granted := testCatalog.PermissionsForRole(role)
+	permissions := make([]authz.Permission, 0, len(granted))
+	for permission := range granted {
+		permissions = append(permissions, permission)
+	}
+	return authz.WithSubject(ctx, authz.NewSubjectWithPermissions(userID, tenantID, role, permissions...))
 }
 
 // Accept runs its membership and audit work under the invitation's tenant
@@ -45,8 +51,8 @@ func TestInvitationAccept_RollsBackWhenAuditFails(t *testing.T) {
 	invitee := testutil.CreateMember(t, ctx, e.pool, otherTenant, "rollback-invitee@example.com", testutil.MemberOptions{})
 	token := inviteForTest(t, e, memberContext(inviter.UserID, identityservice.RoleOwner), inviter.UserID, invitee.Email)
 
-	broken := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), nil, nil, nil) // nil recorder fails closed
-	refusing := identityservice.NewInvitationService(e.stores, broken, e.mail, "https://app.example.test")
+	broken := identityrepo.NewTransactor(e.fx.Tx(), nil, nil, nil, testutil.BanHasher(t)) // nil recorder fails closed
+	refusing := identityservice.NewInvitationService(e.stores, broken, "https://app.example.test")
 	_, err := refusing.Accept(context.Background(), invitee.UserID, token)
 	require.Error(t, err)
 	assert.Equal(t, string(apperror.CodeSystemAuditUnavailable), appCode(err))
@@ -59,8 +65,8 @@ func TestInvitationAccept_RollsBackWhenAuditFails(t *testing.T) {
 }
 
 // The possession-based accept joins a non-default invitation tenant; the
-// tenant-scoped lock/read carries an explicit tenant predicate, so it cannot
-// use the tenant-1 fallback.
+// tenant-scoped lock/read carries an explicit tenant predicate and cannot
+// borrow a fallback tenant.
 func TestInvitationAccept_JoinsTheInvitingTenant(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
@@ -71,7 +77,7 @@ func TestInvitationAccept_JoinsTheInvitingTenant(t *testing.T) {
 	invitee := testutil.CreateMember(t, ctx, e.pool, otherTenant, "join-invitee@example.com", testutil.MemberOptions{})
 	token := inviteForTest(t, e, memberContextIn(inviteTenant, inviter.UserID, identityservice.RoleOwner), inviter.UserID, invitee.Email)
 
-	invitations := identityservice.NewInvitationService(e.stores, e.tx, e.mail, "https://app.example.test")
+	invitations := identityservice.NewInvitationService(e.stores, e.tx, "https://app.example.test")
 	// The request context has no tenant; the accept must use the invitation's.
 	member, err := invitations.Accept(context.Background(), invitee.UserID, token)
 	require.NoError(t, err)
@@ -92,7 +98,7 @@ func TestInvitationLookup_IsTenantScoped(t *testing.T) {
 		testutil.MemberOptions{Role: identityservice.RoleOwner})
 	invitee := testutil.CreateMember(t, ctx, e.pool, otherTenant, "scope-invitee@example.com", testutil.MemberOptions{})
 	inviteForTest(t, e, memberContextIn(inviteTenant, inviter.UserID, identityservice.RoleOwner), inviter.UserID, invitee.Email)
-	tokenHash := scalar[string](t, e.pool,
+	tokenHash := scalar[[]byte](t, e.pool,
 		`SELECT token_hash FROM invitations WHERE email_normalized = $1`, invitee.Email)
 
 	_, err := e.stores.Invitations.GetByTokenHashForUpdate(tenant.WithID(ctx, otherTenant), otherTenant, tokenHash)

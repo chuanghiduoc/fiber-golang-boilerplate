@@ -13,10 +13,9 @@ data:
   # ---------------------------------------------------------------------------
   APP_ENV: "production"
   APP_PORT: "8080"
-  # all = API + job worker + scheduler in every pod. The optional worker
-  # component (base/worker) overrides this per Deployment: api for the API
-  # pods, worker for a separate worker Deployment.
-  APP_ROLE: "all"
+  # APP_ROLE is not set here: the api and worker Deployments each set their own
+  # role, and no Kubernetes workload runs `all`. Compose keeps APP_ROLE=all for
+  # the single-container local stack.
   # APP_BODY_LIMIT must stay above STORAGE_MAX_FILE_SIZE: multipart framing
   # adds overhead before the upload handler can enforce the file limit.
   APP_BODY_LIMIT: "12582912"
@@ -26,7 +25,7 @@ data:
   # budget (terminationGracePeriodSeconds 30 = 5s preStop + 20s + 5s margin),
   # together with the 3s post-handler reserve. config.MaxRequestTimeoutSeconds
   # is the code-side ceiling.
-  APP_REQUEST_TIMEOUT: "12"
+  APP_REQUEST_TIMEOUT: "12s"
   LOG_LEVEL: "info"
   # Replace with the public frontend origin (https is enforced in production).
   APP_FRONTEND_URL: "https://app.example.com"
@@ -52,19 +51,24 @@ data:
   # Explicit origins only; "*" is rejected when APP_ENV=production.
   CORS_ALLOW_ORIGINS: "https://app.example.com"
   CORS_ALLOW_METHODS: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Accept-Language,Accept-Version,Authorization,Idempotency-Key,X-Tenant-Slug"
-  CORS_EXPOSE_HEADERS: "Location,ETag,Idempotent-Replayed,Content-Language,API-Version,Deprecation,Sunset,Link,RateLimit,RateLimit-Policy,Retry-After,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,X-Request-Id"
+  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Accept-Language,Authorization,Idempotency-Key,X-Tenant-Slug,X-CSRF-Token"
+  CORS_EXPOSE_HEADERS: "Location,ETag,Idempotent-Replayed,Content-Language,RateLimit,RateLimit-Policy,Retry-After,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,X-Request-Id"
   CORS_ALLOW_CREDENTIALS: "false"
 
   # ---------------------------------------------------------------------------
   # Rate limiting (tiered)
   # ---------------------------------------------------------------------------
   RATE_LIMIT_STRICT_MAX: "5"
-  RATE_LIMIT_STRICT_WINDOW_SECS: "60"
+  RATE_LIMIT_STRICT_WINDOW: "1m"
   RATE_LIMIT_NORMAL_MAX: "60"
-  RATE_LIMIT_NORMAL_WINDOW_SECS: "60"
+  RATE_LIMIT_NORMAL_WINDOW: "1m"
   RATE_LIMIT_RELAXED_MAX: "120"
-  RATE_LIMIT_RELAXED_WINDOW_SECS: "60"
+  RATE_LIMIT_RELAXED_WINDOW: "1m"
+
+  # Credentials are mounted as files from the Secret, never injected as env:
+  # every Secret-backed setting below is consumed through its <NAME>_FILE path
+  # (see base/deployment.yaml). This keeps values out of `kubectl describe` and
+  # lets External Secrets refresh them in place.
 
   # ---------------------------------------------------------------------------
   # PostgreSQL (managed/external service; DB_PASSWORD lives in the Secret)
@@ -78,6 +82,14 @@ data:
   # is not a member of the bypass role.
   DB_USERNAME: "app"
   DB_BYPASS_USERNAME: "app_bypass"
+  # Schema owner used only by the migration Job (its password is mounted from
+  # fiber-boilerplate-migrate-secrets as DB_MIGRATE_PASSWORD_FILE). Uncomment
+  # DB_MIGRATE_HOST/PORT to connect the Job directly instead of through the
+  # API's host/port (required when the API uses a transaction-mode pooler:
+  # golang-migrate holds a session advisory lock).
+  DB_MIGRATE_USERNAME: "postgres"
+  # DB_MIGRATE_HOST: "db.example.com"
+  # DB_MIGRATE_PORT: "5432"
   DB_SCHEMA: "public"
   # verify-full both encrypts and verifies the server certificate against
   # DB_SSLROOTCERT; production rejects require/verify-ca because they accept
@@ -86,21 +98,24 @@ data:
   # CA bundle used for verify-full. The image ships the system bundle; mount a
   # provider-specific CA here for RDS/Cloud SQL and point this at the file.
   DB_SSLROOTCERT: "/etc/ssl/certs/ca-certificates.crt"
-  DB_CONNECT_TIMEOUT: "10"
+  DB_CONNECT_TIMEOUT: "10s"
   # Per-pool limit. Each pod opens a normal and a bypass pool, so keep
   # DB_MAX_CONNS * 2 * HPA maxReplicas (10) below the managed database's
   # connection limit. The defaults here allow at most 200 connections.
   DB_MAX_CONNS: "10"
   DB_MIN_CONNS: "2"
-  DB_MAX_CONN_LIFETIME: "3600"
-  DB_MAX_CONN_IDLE_TIME: "300"
+  DB_MAX_CONN_LIFETIME: "1h"
+  DB_MAX_CONN_IDLE_TIME: "5m"
 
   # ---------------------------------------------------------------------------
   # JWT (JWT_SECRET lives in the Secret)
   # ---------------------------------------------------------------------------
-  JWT_EXPIRE_HOUR: "1"
-  JWT_REFRESH_EXPIRE_DAYS: "30"
+  JWT_ACCESS_TTL: "15m"
+  JWT_REFRESH_TTL: "720h"
   SESSION_MAX_LIFETIME: "720h"
+  # Browser BFF transport: the refresh token is an HttpOnly __Host-refresh
+  # cookie. Keep false for JSON clients; true requires explicit CORS origins.
+  AUTH_REFRESH_COOKIE: "false"
 
   # ---------------------------------------------------------------------------
   # Object storage (recommended for multi-replica production deployments)
@@ -117,25 +132,28 @@ data:
   STORAGE_S3_ENDPOINT: "s3.us-east-1.amazonaws.com"
   STORAGE_S3_REGION: "us-east-1"
   STORAGE_S3_BUCKET: "REPLACE_WITH_S3_BUCKET"
+  # The access key ID is not a secret (it is half of a credential pair and
+  # appears in request signatures); the secret key is mounted from the Secret as
+  # STORAGE_S3_SECRET_KEY_FILE. Prefer workload identity over static keys: see
+  # README.md#workload-identity.
+  STORAGE_S3_ACCESS_KEY: "REPLACE_WITH_S3_ACCESS_KEY"
   # Required in production unless STORAGE_S3_ALLOW_INSECURE=true acknowledges
   # plaintext storage on a trusted private network.
   STORAGE_S3_USE_SSL: "true"
 
   # ---------------------------------------------------------------------------
   # Data retention (days, 1..3650). The purge jobs are scheduled only when
-  # SCHEDULER_ENABLED=true, so the process that runs jobs (APP_ROLE=all, the
-  # default, or worker) must enable it; otherwise expired data-export blobs,
-  # trashed files, notifications, and tokens are never purged.
+  # SCHEDULER_ENABLED=true, so the worker Deployment (APP_ROLE=worker) is the
+  # only process that runs them. API pods run no worker or scheduler, so they
+  # ignore this setting.
   # ---------------------------------------------------------------------------
-  # API-only pods ignore this (they run no worker or scheduler). A separate
-  # worker Deployment (base/worker) inherits this ConfigMap.
   SCHEDULER_ENABLED: "true"
   # Soft-deleted files stay restorable this long, then files.trash.purge
   # deletes the blob and the metadata row.
-  FILES_TRASH_RETENTION_DAYS: "30"
+  FILES_TRASH_RETENTION: "720h"
   # Read notifications are deleted this long after being read; unread ones are
   # kept at any age.
-  NOTIFICATIONS_RETENTION_DAYS: "180"
+  NOTIFICATIONS_RETENTION: "4320h"
 
   # ---------------------------------------------------------------------------
   # Cache (Redis is required for multi-replica session invalidation)
@@ -152,36 +170,52 @@ data:
   SMTP_REQUIRE_TLS: "true"
   EMAIL_FROM_ADDRESS: "noreply@example.com"
   EMAIL_FROM_NAME: "Fiber App"
-  # SMTP_USERNAME / SMTP_PASSWORD live in the Secret.
+  # The username is not a secret and has no *_FILE form; the password is
+  # mounted as SMTP_PASSWORD_FILE. Leave both empty for an unauthenticated relay
+  # on a trusted network.
+  SMTP_USERNAME: ""
+  # SMTP_PASSWORD lives in the Secret.
 
   # ---------------------------------------------------------------------------
-  # OpenTelemetry tracing (optional; disabled by default)
+  # One-shot admin seed (cmd/seed Job only; the API ignores these)
+  # ---------------------------------------------------------------------------
+  # Replace with the bootstrap admin address. ADMIN_PASSWORD is mounted from
+  # fiber-boilerplate-seed-secrets; re-running the Job never re-promotes an
+  # existing account.
+  ADMIN_EMAIL: "admin@example.com"
+  ADMIN_NAME: "Admin"
+
+  # ---------------------------------------------------------------------------
+  # OpenTelemetry tracing and metrics (optional; tracing disabled by default)
   #
   # Enable per environment after a collector is reachable. The app never waits
-  # for the collector at startup and readiness does not include it. Set
-  # OTEL_SERVICE_VERSION from the release tag in your CD overlay.
+  # for the collector at startup and readiness does not include it. The SDK
+  # reads the standard OTEL_* variables itself; the TRACING_ prefix marks
+  # application switches. service.version comes from the image build, so do
+  # not set it here.
   # ---------------------------------------------------------------------------
-  OTEL_ENABLED: "false"
+  TRACING_ENABLED: "false"
   OTEL_TRACES_EXPORTER: "otlp"
-  OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
-  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"
+  OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4318"
   OTEL_EXPORTER_OTLP_INSECURE: "true"
   OTEL_SERVICE_NAME: "fiber-boilerplate"
-  OTEL_SERVICE_NAMESPACE: "fiber-boilerplate"
-  OTEL_SERVICE_VERSION: "dev"
-  OTEL_DEPLOYMENT_ENVIRONMENT: "production"
+  OTEL_RESOURCE_ATTRIBUTES: "service.namespace=fiber-boilerplate,deployment.environment.name=production"
   OTEL_TRACES_SAMPLER: "parentbased_traceidratio"
   OTEL_TRACES_SAMPLER_ARG: "0.1"
-  OTEL_TRACING_EXCLUDE_PATHS: "/healthz,/readyz,/health,/metrics"
-  OTEL_INSTRUMENT_DB: "true"
+  TRACING_EXCLUDE_PATHS: "/healthz,/readyz,/health,/metrics"
+  TRACING_INSTRUMENT_DB: "true"
   # Honor incoming traceparent only from APP_TRUSTED_PROXIES; off by default
   # so clients cannot force sampling.
-  OTEL_TRUST_INCOMING_TRACE: "false"
-  OTEL_BATCH_TIMEOUT_SECS: "5"
-  OTEL_EXPORT_TIMEOUT_SECS: "30"
-  OTEL_SHUTDOWN_TIMEOUT_SECS: "10"
-  OTEL_BATCH_MAX_QUEUE_SIZE: "2048"
-  OTEL_BATCH_MAX_EXPORT_BATCH_SIZE: "512"
+  TRACING_TRUST_INCOMING_TRACE: "false"
+  TRACING_SHUTDOWN_TIMEOUT: "10s"
+  # Optional standard batch-span-processor overrides:
+  # OTEL_BSP_SCHEDULE_DELAY: "5000"
+  # OTEL_BSP_EXPORT_TIMEOUT: "30000"
+  # OTEL_BSP_MAX_QUEUE_SIZE: "2048"
+  # OTEL_BSP_MAX_EXPORT_BATCH_SIZE: "512"
+  # Prometheus /metrics is always on; set this to also push OTLP metrics.
+  METRICS_OTLP_ENABLED: "false"
 
   # ---------------------------------------------------------------------------
   # Optional: Google OAuth (disabled by default)

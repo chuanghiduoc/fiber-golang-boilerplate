@@ -23,29 +23,34 @@ import (
 
 func testConfig() config.TracingConfig {
 	return config.TracingConfig{
-		Enabled:               true,
-		Exporter:              "none",
-		Protocol:              "grpc",
-		Endpoint:              "localhost:4317",
-		Insecure:              true,
-		ServiceName:           "test-service",
-		ServiceNamespace:      "test-namespace",
-		ServiceVersion:        "1.2.3",
-		DeploymentEnvironment: "test",
-		Sampler:               "parentbased_traceidratio",
-		SamplerArg:            1,
-		ExcludePaths:          "/healthz,/metrics",
-		InstrumentDB:          true,
-		BatchTimeout:          1,
-		ExportTimeout:         1,
-		ShutdownTimeout:       1,
-		MaxQueueSize:          16,
-		MaxExportBatchSize:    8,
+		Enabled:         true,
+		ExcludePaths:    []string{"/healthz", "/metrics"},
+		InstrumentDB:    true,
+		ShutdownTimeout: time.Second,
+	}
+}
+
+// clearOTELEnv removes the standard SDK variables a developer shell may export
+// so each test exercises what it sets explicitly.
+func clearOTELEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"OTEL_TRACES_EXPORTER",
+		"OTEL_EXPORTER_OTLP_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_INSECURE",
+		"OTEL_TRACES_SAMPLER",
+		"OTEL_TRACES_SAMPLER_ARG",
+		"OTEL_METRICS_EXPORTER",
+	} {
+		t.Setenv(key, "")
 	}
 }
 
 func TestNewDisabledIsNoop(t *testing.T) {
-	t.Parallel()
+	clearOTELEnv(t)
 
 	provider, err := New(context.Background(), config.TracingConfig{})
 	require.NoError(t, err)
@@ -62,8 +67,6 @@ func TestNewDisabledIsNoop(t *testing.T) {
 }
 
 func TestNilProviderIsSafe(t *testing.T) {
-	t.Parallel()
-
 	var provider *Provider
 	assert.False(t, provider.Enabled())
 	assert.Equal(t, "disabled", provider.Sampler())
@@ -76,57 +79,79 @@ func TestNilProviderIsSafe(t *testing.T) {
 	assert.Empty(t, CaptureRemoteContext(ctx))
 }
 
-func TestSamplerValidationAndDecisions(t *testing.T) {
-	t.Parallel()
+// TestNewReadsSDKSamplerEnv proves the SDK, not a copied config field, reads
+// OTEL_TRACES_SAMPLER/OTEL_TRACES_SAMPLER_ARG.
+func TestNewReadsSDKSamplerEnv(t *testing.T) {
+	clearOTELEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
 
-	cfg := testConfig()
-	cfg.Sampler = "not-a-sampler"
-	_, err := New(context.Background(), cfg)
-	require.Error(t, err)
-
-	cfg = testConfig()
-	cfg.SamplerArg = 1.5
-	_, err = New(context.Background(), cfg)
-	require.Error(t, err)
-
-	traceID := trace.TraceID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
-	params := sdktrace.SamplingParameters{TraceID: traceID, Name: "test"}
-
-	sampler, name, err := newSampler("parentbased_traceidratio", 0)
+	provider, err := New(context.Background(), testConfig())
 	require.NoError(t, err)
-	assert.Equal(t, "parentbased_traceidratio(0)", name)
-	assert.Equal(t, sdktrace.Drop, sampler.ShouldSample(params).Decision)
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+	assert.Equal(t, "always_off", provider.Sampler())
 
-	sampler, name, err = newSampler("parentbased_traceidratio", 1)
+	_, span := provider.Tracer("test").Start(context.Background(), "never")
+	assert.False(t, span.IsRecording())
+
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_on")
+	provider, err = New(context.Background(), testConfig())
 	require.NoError(t, err)
-	assert.Equal(t, "parentbased_traceidratio(1)", name)
-	assert.Equal(t, sdktrace.RecordAndSample, sampler.ShouldSample(params).Decision)
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+	_, span = provider.Tracer("test").Start(context.Background(), "always")
+	assert.True(t, span.IsRecording())
+}
 
-	// A sampled parent wins over the root ratio, which is what keeps traces
-	// complete when a downstream service samples more conservatively.
-	params.ParentContext = trace.ContextWithRemoteSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID:    traceID,
-		SpanID:     trace.SpanID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
-		TraceFlags: trace.FlagsSampled,
-		Remote:     true,
-	}))
-	assert.Equal(t, sdktrace.RecordAndSample, sampler.ShouldSample(params).Decision)
+func TestExportSelection(t *testing.T) {
+	clearOTELEnv(t)
 
-	sampler, name, err = newSampler("always_off", 0)
-	require.NoError(t, err)
-	assert.Equal(t, "always_off", name)
-	assert.Equal(t, sdktrace.Drop, sampler.ShouldSample(sdktrace.SamplingParameters{TraceID: traceID}).Decision)
+	t.Run("none samples without exporting", func(t *testing.T) {
+		t.Setenv("OTEL_TRACES_EXPORTER", "none")
+		provider, err := New(context.Background(), testConfig())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+		assert.Equal(t, "none", provider.Exporter())
+		_, span := provider.Tracer("test").Start(context.Background(), "sampled")
+		assert.True(t, span.IsRecording())
+		span.End()
+	})
 
-	_, _, err = newSampler("unknown", 0)
-	require.Error(t, err)
+	t.Run("unsupported exporter fails startup", func(t *testing.T) {
+		t.Setenv("OTEL_TRACES_EXPORTER", "carrier-pigeon")
+		_, err := New(context.Background(), testConfig())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OTEL_TRACES_EXPORTER")
+	})
+
+	t.Run("unsupported protocol fails startup", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/json")
+		_, err := New(context.Background(), testConfig())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP")
+	})
+
+	t.Run("protocol defaults to http/protobuf", func(t *testing.T) {
+		clearOTELEnv(t)
+		protocol, err := otlpProtocol("TRACES")
+		require.NoError(t, err)
+		assert.Equal(t, "http/protobuf", protocol)
+	})
+
+	t.Run("grpc protocol is honored", func(t *testing.T) {
+		clearOTELEnv(t)
+		t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+		protocol, err := otlpProtocol("TRACES")
+		require.NoError(t, err)
+		assert.Equal(t, "grpc", protocol)
+	})
 }
 
 func TestTraceparentRoundTrip(t *testing.T) {
-	t.Parallel()
+	clearOTELEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_on")
 
-	cfg := testConfig()
-	cfg.Sampler = "always_on"
-	provider, err := New(context.Background(), cfg)
+	provider, err := New(context.Background(), testConfig())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
 
@@ -153,7 +178,8 @@ func TestTraceparentRoundTrip(t *testing.T) {
 }
 
 func TestShutdownIsIdempotent(t *testing.T) {
-	t.Parallel()
+	clearOTELEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 
 	provider, err := New(context.Background(), testConfig())
 	require.NoError(t, err)
@@ -179,15 +205,12 @@ func TestShutdownIsIdempotent(t *testing.T) {
 }
 
 func TestNewWithUnreachableCollectorDoesNotFail(t *testing.T) {
-	t.Parallel()
-
-	cfg := testConfig()
-	cfg.Exporter = "otlp"
-	cfg.Endpoint = "127.0.0.1:1" // nothing listens here
-	cfg.Insecure = true
+	clearOTELEnv(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "true")
 
 	start := time.Now()
-	provider, err := New(context.Background(), cfg)
+	provider, err := New(context.Background(), testConfig())
 	require.NoError(t, err, "an unreachable collector must never fail startup")
 	assert.Less(t, time.Since(start), 2*time.Second, "provider creation must not dial synchronously")
 
@@ -199,38 +222,45 @@ func TestNewWithUnreachableCollectorDoesNotFail(t *testing.T) {
 	assert.True(t, provider.Enabled())
 }
 
-func TestResourceAttributes(t *testing.T) {
-	t.Parallel()
+func TestResourceUsesBuildVersion(t *testing.T) {
+	clearOTELEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_on")
 
-	cfg := testConfig()
-	cfg.InstanceID = "instance-1"
-	res := newResource(cfg)
-	attrs := res.Set()
+	provider, err := New(context.Background(), testConfig(), WithServiceVersion("1.2.3"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
 
-	for _, key := range []attribute.Key{
-		semconv.ServiceNameKey,
-		semconv.ServiceNamespaceKey,
-		semconv.ServiceVersionKey,
-		semconv.ServiceInstanceIDKey,
-		semconv.DeploymentEnvironmentNameKey,
-	} {
-		value, ok := attrs.Value(key)
-		require.True(t, ok, "missing resource attribute %s", key)
-		assert.NotEmpty(t, value.AsString())
-	}
+	attrs := provider.Resource().Set()
+	version, ok := attrs.Value(semconv.ServiceVersionKey)
+	require.True(t, ok, "service.version must be present")
+	assert.Equal(t, "1.2.3", version.AsString())
 
-	name, _ := attrs.Value(semconv.ServiceNameKey)
-	assert.Equal(t, "test-service", name.AsString())
-	env, _ := attrs.Value(semconv.DeploymentEnvironmentNameKey)
-	assert.Equal(t, "test", env.AsString())
-	instance, _ := attrs.Value(semconv.ServiceInstanceIDKey)
-	assert.Equal(t, "instance-1", instance.AsString())
+	name, ok := attrs.Value(semconv.ServiceNameKey)
+	require.True(t, ok, "service.name must come from the SDK default resource")
+	assert.NotEmpty(t, name.AsString())
+}
 
-	// Empty instance IDs fall back to the hostname instead of an empty value.
-	cfg.InstanceID = ""
-	res = newResource(cfg)
-	instance, _ = res.Set().Value(semconv.ServiceInstanceIDKey)
-	assert.NotEmpty(t, instance.AsString())
+// TestInMemoryExporterEndToEnd is the in-memory exporter check: the provider
+// built from configuration records and exports to a tracetest recorder.
+func TestInMemoryExporterEndToEnd(t *testing.T) {
+	clearOTELEnv(t)
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_on")
+
+	exporter := tracetest.NewInMemoryExporter()
+	provider, err := New(context.Background(), testConfig(),
+		WithServiceVersion("1.2.3"), withSpanExporter(exporter))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+	_, span := provider.Tracer("test").Start(context.Background(), "in-memory")
+	span.SetAttributes(semconv.HTTPRequestMethodKey.String("GET"))
+	span.End()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	assert.Equal(t, "in-memory", spans[0].Name)
+	assert.Equal(t, "1.2.3", resourceAttribute(spans[0].Resource.Set(), semconv.ServiceVersionKey))
 }
 
 func TestMarkErrorIsBoundedAndPIIFree(t *testing.T) {
@@ -293,4 +323,12 @@ func attributeValue(attrs []attribute.KeyValue, key attribute.Key) string {
 		}
 	}
 	return ""
+}
+
+func resourceAttribute(attrs *attribute.Set, key attribute.Key) string {
+	value, ok := attrs.Value(key)
+	if !ok {
+		return ""
+	}
+	return value.AsString()
 }

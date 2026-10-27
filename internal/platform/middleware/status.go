@@ -13,14 +13,18 @@ import (
 // runs the ErrorHandler after middleware unwinds, so reading
 // c.Response().StatusCode() inside Logger/Metrics would record handler errors
 // as 200.
-func effectiveStatus(c fiber.Ctx, err error) int {
+func effectiveStatus(catalog *apperror.Catalog, c fiber.Ctx, err error) int {
 	if err == nil {
 		return c.Response().StatusCode()
 	}
 
 	var appErr *apperror.AppError
 	if errors.As(err, &appErr) {
-		return appErr.Status
+		if catalog == nil {
+			catalog = apperror.PlatformCatalog()
+		}
+		_, spec := catalog.Resolve(apperror.Code(appErr.Code))
+		return spec.Status
 	}
 	// Mirror apperror's error handler precedence: an explicit AppError wins,
 	// then context errors.

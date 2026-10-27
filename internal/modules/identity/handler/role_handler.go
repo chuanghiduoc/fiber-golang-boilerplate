@@ -1,19 +1,18 @@
 package handler
 
 import (
+	"context"
 	"time"
 
-	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
-// RoleHandler serves tenant role management and member role replacement.
+// RoleHandler serves tenant role management.
 type RoleHandler struct {
 	roles service.RoleService
 }
@@ -22,157 +21,122 @@ func NewRoleHandler(roles service.RoleService) *RoleHandler {
 	return &RoleHandler{roles: roles}
 }
 
-// ListRoles godoc
-// @Summary List roles
-// @Description System roles plus the request tenant's roles, newest first
-// @Tags Roles
-// @Produce json
-// @Security BearerAuth
-// @Param limit query int false "Max items to return" default(20)
-// @Param startingAfter query string false "Cursor from the last item of the previous page"
-// @Success 200 {object} response.ListResponse{data=[]dto.RoleResponse}
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Router /admin/roles [get]
-func (h *RoleHandler) ListRoles(c fiber.Ctx) error {
-	limit, startingAfter, err := httpx.CursorQuery(c)
+type listRolesInput struct {
+	Limit         int    `query:"limit" minimum:"1" maximum:"100" default:"20"`
+	StartingAfter string `query:"startingAfter"`
+}
+
+type createRoleInput struct {
+	Body dto.CreateRoleRequest
+}
+
+type roleInput struct {
+	RoleID string `path:"roleId" format:"uuid"`
+}
+
+type updateRoleInput struct {
+	RoleID  string `path:"roleId" format:"uuid"`
+	IfMatch string `header:"If-Match"`
+	RawBody []byte `rawBody:"application/merge-patch+json" contentType:"application/merge-patch+json" required:"true"`
+}
+
+// ListRoles returns system roles plus the request tenant's roles.
+func (h *RoleHandler) ListRoles(ctx context.Context, input *listRolesInput) (*httpapi.ListOutput[dto.RoleResponse], error) {
+	roles, hasMore, err := h.roles.List(ctx, paginationLimit(input.Limit), input.StartingAfter)
 	if err != nil {
-		return err
-	}
-	roles, hasMore, err := h.roles.List(c.Context(), limit, startingAfter)
-	if err != nil {
-		return err
+		return nil, err
 	}
 	out := make([]dto.RoleResponse, len(roles))
 	for i := range roles {
 		out[i] = toRoleResponse(&roles[i])
 	}
-	return response.List(c, out, hasMore, pagination.NextCursor(out, func(r dto.RoleResponse) (time.Time, int64) {
-		return r.CreatedAt, r.ID
-	}))
+	return &httpapi.ListOutput[dto.RoleResponse]{
+		Body: pagination.NewList("/api/v1/roles", out, hasMore,
+			pagination.NextCursor(out, func(r dto.RoleResponse) (time.Time, uuid.UUID) { return r.CreatedAt, r.ID })),
+	}, nil
 }
 
-// CreateRole godoc
-// @Summary Create a tenant role
-// @Description Create a tenant role with known tenant permissions
-// @Tags Roles
-// @Accept json
-// @Produce json
-// @Security BearerAuth
-// @Param request body dto.CreateRoleRequest true "Role"
-// @Success 201 {object} dto.RoleResponse
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 409 {object} apperror.ProblemDetails
-// @Router /admin/roles [post]
-func (h *RoleHandler) CreateRole(c fiber.Ctx) error {
-	var req dto.CreateRoleRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-	created, err := h.roles.Create(c.Context(), service.NewRole{
-		Key:         req.Key,
-		Name:        req.Name,
-		Permissions: req.Permissions,
+// CreateRole creates a tenant role.
+func (h *RoleHandler) CreateRole(ctx context.Context, input *createRoleInput) (*httpapi.Created[dto.RoleResponse], error) {
+	created, err := h.roles.Create(ctx, service.NewRole{
+		Key:         input.Body.Key,
+		Name:        input.Body.Name,
+		Permissions: input.Body.Permissions,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return response.Created(c, toRoleResponse(created))
+	return httpapi.NewCreated("/api/v1/roles/"+created.ID.String(), toRoleResponse(created)), nil
 }
 
-// UpdateRole godoc
-// @Summary Update a tenant role
-// @Description Change a tenant role's name and/or permission set
-// @Tags Roles
-// @Accept json
-// @Produce json
-// @Security BearerAuth
-// @Param id path int true "Role ID"
-// @Param request body dto.UpdateRoleDefinitionRequest true "Role update"
-// @Success 200 {object} dto.RoleResponse
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 404 {object} apperror.ProblemDetails
-// @Router /admin/roles/{id} [patch]
-func (h *RoleHandler) UpdateRole(c fiber.Ctx) error {
-	id, err := httpx.ParamID(c, "id")
+// GetRole returns one system or tenant role.
+func (h *RoleHandler) GetRole(ctx context.Context, input *roleInput) (*httpapi.ETagOutput[dto.RoleResponse], error) {
+	id, err := parseUUID(input.RoleID, "roleId")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var req dto.UpdateRoleDefinitionRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-	updated, err := h.roles.Update(c.Context(), id, service.RoleUpdate{
-		Name:        req.Name,
-		Permissions: req.Permissions,
-	})
+	role, err := h.roles.Get(ctx, id)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return response.Success(c, toRoleResponse(updated))
+	return &httpapi.ETagOutput[dto.RoleResponse]{ETag: etagHeader(role.UpdatedAt), Body: toRoleResponse(role)}, nil
 }
 
-// DeleteRole godoc
-// @Summary Delete a tenant role
-// @Description Delete an unassigned tenant role
-// @Tags Roles
-// @Security BearerAuth
-// @Param id path int true "Role ID"
-// @Success 204
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 404 {object} apperror.ProblemDetails
-// @Failure 409 {object} apperror.ProblemDetails
-// @Router /admin/roles/{id} [delete]
-func (h *RoleHandler) DeleteRole(c fiber.Ctx) error {
-	id, err := httpx.ParamID(c, "id")
+// UpdateRole applies an RFC 7396 merge patch to a tenant role.
+func (h *RoleHandler) UpdateRole(ctx context.Context, input *updateRoleInput) (*httpapi.ETagOutput[dto.RoleResponse], error) {
+	id, err := parseUUID(input.RoleID, "roleId")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := h.roles.Delete(c.Context(), id); err != nil {
-		return err
+	existing, err := h.roles.Get(ctx, id)
+	if err != nil {
+		return nil, err
 	}
-	return response.NoContent(c)
+	if err := checkETag(input.IfMatch, existing.UpdatedAt); err != nil {
+		return nil, err
+	}
+	var req dto.RolePatch
+	if err := decodeMergePatch(input.RawBody, &req); err != nil {
+		return nil, err
+	}
+	if req.Name.Present && req.Name.Null {
+		return nil, unprocessable("name cannot be cleared")
+	}
+	update := service.RoleUpdate{ID: id}
+	if input.IfMatch != "" {
+		expected := existing.UpdatedAt
+		update.ExpectedUpdatedAt = &expected
+	}
+	if req.Name.Present {
+		value := req.Name.Value
+		update.Name = &value
+	}
+	if req.Permissions.Present {
+		// RFC 7396: an explicit null clears the member; a role with no
+		// permissions is valid.
+		value := req.Permissions.Value
+		if req.Permissions.Null {
+			value = []string{}
+		}
+		update.Permissions = &value
+	}
+	updated, err := h.roles.Update(ctx, id, update)
+	if err != nil {
+		return nil, err
+	}
+	return &httpapi.ETagOutput[dto.RoleResponse]{ETag: etagHeader(updated.UpdatedAt), Body: toRoleResponse(updated)}, nil
 }
 
-// ReplaceMemberRoles godoc
-// @Summary Replace a member's roles
-// @Description Replace every role of a member in the request tenant; the member's sessions end
-// @Tags Roles
-// @Accept json
-// @Produce json
-// @Security BearerAuth
-// @Param id path int true "User ID"
-// @Param request body dto.ReplaceMemberRolesRequest true "Roles"
-// @Success 200 {object} dto.UserResponse
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 404 {object} apperror.ProblemDetails
-// @Failure 409 {object} apperror.ProblemDetails
-// @Router /admin/users/{id}/roles [put]
-func (h *RoleHandler) ReplaceMemberRoles(c fiber.Ctx) error {
-	id, err := httpx.ParamID(c, "id")
+// DeleteRole deletes an unassigned tenant role.
+func (h *RoleHandler) DeleteRole(ctx context.Context, input *roleInput) (*httpapi.Empty, error) {
+	id, err := parseUUID(input.RoleID, "roleId")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if id == httpx.AuthUserID(c) {
-		return apperror.NewBadRequest("you cannot change your own roles")
+	if err := h.roles.Delete(ctx, id); err != nil {
+		return nil, err
 	}
-	var req dto.ReplaceMemberRolesRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-	member, err := h.roles.ReplaceMemberRoles(c.Context(), id, req.Roles)
-	if err != nil {
-		return err
-	}
-	return response.Success(c, toUserResponse(member))
+	return &httpapi.Empty{}, nil
 }
 
 func toRoleResponse(role *service.Role) dto.RoleResponse {

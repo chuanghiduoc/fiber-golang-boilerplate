@@ -1,67 +1,98 @@
+// Package dto contains the notifications module's HTTP request and response
+// bodies. The route contract lives in docs/api-routes.md.
 package dto
 
-import "time"
+import (
+	"time"
+
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/google/uuid"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/patch"
+)
 
 // NotificationResponse is one in-app notification owned by the authenticated
-// user in the request tenant.
+// member in the request tenant.
 type NotificationResponse struct {
-	ID        int64          `json:"id"`
-	TenantID  int64          `json:"tenantId"`
-	UserID    int64          `json:"userId"`
+	ID        uuid.UUID      `json:"id" format:"uuid"`
+	TenantID  uuid.UUID      `json:"tenantId" format:"uuid"`
+	UserID    uuid.UUID      `json:"userId" format:"uuid"`
 	Type      string         `json:"type"`
 	Title     string         `json:"title"`
 	Body      string         `json:"body"`
-	Data      map[string]any `json:"data" swaggertype:"object"`
+	Data      map[string]any `json:"data"`
 	ReadAt    *time.Time     `json:"readAt,omitempty"`
 	CreatedAt time.Time      `json:"createdAt"`
 }
 
-// UnreadCountResponse is the unread badge count for the authenticated user.
+// UnreadCountResponse is the unread badge count for the authenticated member.
 type UnreadCountResponse struct {
 	Count int64 `json:"count"`
 }
 
-// ReadAllResponse reports how many notifications were newly marked as read.
-type ReadAllResponse struct {
+// UpdatedCountResponse reports how many notifications a bulk update changed.
+type UpdatedCountResponse struct {
 	Updated int64 `json:"updated"`
 }
 
-// PreferenceResponse is one explicit channel preference. A missing row means
-// the channel is enabled, so only rows the user changed are returned.
-type PreferenceResponse struct {
-	ID        int64     `json:"id"`
-	TenantID  int64     `json:"tenantId"`
-	UserID    int64     `json:"userId"`
+// NotificationPreferenceResponse is one explicit channel preference. A missing
+// row means the channel is enabled, so only rows the member changed are
+// returned.
+type NotificationPreferenceResponse struct {
 	Type      string    `json:"type"`
-	Channel   string    `json:"channel"`
+	Channel   string    `json:"channel" enum:"in_app,email"`
 	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// UpdatePreferenceRequest upserts the enabled state for one notification type
-// and channel. Types are lower-case identifiers such as "security.alert".
-// Enabled is a pointer so an omitted field is rejected instead of silently
-// decoding as false (which would disable the channel).
-type UpdatePreferenceRequest struct {
-	Type    string `json:"type" validate:"required,max=100"`
-	Channel string `json:"channel" validate:"required,oneof=in_app email"`
-	Enabled *bool  `json:"enabled" validate:"required"`
+// NotificationPreferencesResponse is the member's explicit preference set. An
+// empty set is {} preferences with every channel enabled.
+type NotificationPreferencesResponse struct {
+	Preferences []NotificationPreferenceResponse `json:"preferences"`
 }
 
-// SendNotificationRequest is the back-office request for creating a
-// notification for another user in the request tenant.
-type SendNotificationRequest struct {
-	UserID int64          `json:"userId" validate:"required,gt=0"`
-	Type   string         `json:"type" validate:"required,max=100"`
-	Title  string         `json:"title" validate:"required,max=255"`
-	Body   string         `json:"body" validate:"required,max=10000"`
-	Data   map[string]any `json:"data,omitempty" swaggertype:"object"`
+// SetPreferenceRequest replaces the enabled state of one type/channel pair.
+// The pair is identified by the item URI, so the body only carries the state.
+type SetPreferenceRequest struct {
+	Enabled *bool `json:"enabled" required:"true"`
 }
 
-// SendNotificationResponse reports which channels accepted the notification.
-// Notification is null when the user disabled the in-app channel.
-type SendNotificationResponse struct {
+// MergeRead is one RFC 7396 member for the notification read state. It records
+// presence and null separately from the value; the schema documents the
+// member's own type rather than the presence carrier.
+type MergeRead struct{ patch.Field[bool] }
+
+// Schema implements huma.SchemaProvider.
+func (MergeRead) Schema(huma.Registry) *huma.Schema {
+	return &huma.Schema{Type: huma.TypeBoolean, Nullable: true}
+}
+
+// UpdateNotificationRequest is a merge patch on one notification. An absent
+// read member leaves the state unchanged and an explicit null clears it
+// (marks the notification unread).
+type UpdateNotificationRequest struct {
+	Read MergeRead `json:"read" required:"false"`
+}
+
+// UpdateNotificationsRequest marks the caller's whole feed read. The target
+// map's only collection update is {read:true}; the merge-patch shape keeps the
+// one patch syntax on both routes.
+type UpdateNotificationsRequest struct {
+	Read MergeRead `json:"read" required:"false"`
+}
+
+// CreateMemberNotificationRequest creates a notification for another member of
+// the request tenant. The recipient comes from the path, never the body.
+type CreateMemberNotificationRequest struct {
+	Type  string         `json:"type" required:"true" maxLength:"100"`
+	Title string         `json:"title" required:"true" maxLength:"255"`
+	Body  string         `json:"body" required:"true" maxLength:"10000"`
+	Data  map[string]any `json:"data,omitempty"`
+}
+
+// CreateNotificationResponse reports which channels accepted the notification.
+// Notification is null when the recipient disabled the in-app channel.
+type CreateNotificationResponse struct {
 	Notification *NotificationResponse `json:"notification"`
 	EmailQueued  bool                  `json:"emailQueued"`
 }

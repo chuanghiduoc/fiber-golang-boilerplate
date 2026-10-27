@@ -1,12 +1,16 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	apikeyscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/catalog"
@@ -18,20 +22,32 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
+var (
+	testTenantA = testID(1)
+	testTenantB = testID(2)
+	testUser    = testID(10)
+	testOther   = testID(20)
+)
+
+// testID returns a deterministic UUIDv7-shaped fixture id.
+func testID(n int) uuid.UUID {
+	return uuid.MustParse(fmt.Sprintf("0192c9b0-7e4a-7000-8000-%012d", n))
+}
+
 type fakeRepo struct {
-	keys   map[int64]*APIKey
-	nextID int64
+	keys   map[uuid.UUID]*APIKey
+	nextID int
 }
 
 func newFakeRepo() *fakeRepo {
-	return &fakeRepo{keys: make(map[int64]*APIKey), nextID: 1}
+	return &fakeRepo{keys: make(map[uuid.UUID]*APIKey), nextID: 1}
 }
 
 func (r *fakeRepo) Create(ctx context.Context, params NewKey) (*APIKey, error) {
 	now := time.Now().UTC()
 	key := &APIKey{
-		ID:        r.nextID,
-		TenantID:  tenant.EffectiveID(ctx),
+		ID:        testID(r.nextID),
+		TenantID:  tenant.IDFromContext(ctx),
 		UserID:    params.UserID,
 		Name:      params.Name,
 		Prefix:    params.Prefix,
@@ -47,18 +63,18 @@ func (r *fakeRepo) Create(ctx context.Context, params NewKey) (*APIKey, error) {
 	return &clone, nil
 }
 
-func (r *fakeRepo) GetByID(ctx context.Context, id int64) (*APIKey, error) {
+func (r *fakeRepo) GetByID(ctx context.Context, id uuid.UUID) (*APIKey, error) {
 	key, ok := r.keys[id]
-	if !ok || key.TenantID != tenant.EffectiveID(ctx) {
+	if !ok || key.TenantID != tenant.IDFromContext(ctx) {
 		return nil, apperror.ErrNotFound
 	}
 	clone := *key
 	return &clone, nil
 }
 
-func (r *fakeRepo) GetByHash(_ context.Context, hash string) (*APIKey, error) {
+func (r *fakeRepo) GetByHash(_ context.Context, hash []byte) (*APIKey, error) {
 	for _, key := range r.keys {
-		if key.Hash == hash {
+		if bytes.Equal(key.Hash, hash) {
 			clone := *key
 			return &clone, nil
 		}
@@ -67,15 +83,27 @@ func (r *fakeRepo) GetByHash(_ context.Context, hash string) (*APIKey, error) {
 }
 
 func (r *fakeRepo) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]APIKey, error) {
+	return r.list(ctx, nil, cur), nil
+}
+
+func (r *fakeRepo) ListByUserCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]APIKey, error) {
+	return r.list(ctx, &userID, cur), nil
+}
+
+func (r *fakeRepo) list(ctx context.Context, userID *uuid.UUID, cur pagination.DBCursor) []APIKey {
 	keys := make([]APIKey, 0)
 	for _, key := range r.keys {
-		if key.TenantID == tenant.EffectiveID(ctx) {
-			keys = append(keys, *key)
+		if key.TenantID != tenant.IDFromContext(ctx) {
+			continue
 		}
+		if userID != nil && key.UserID != *userID {
+			continue
+		}
+		keys = append(keys, *key)
 	}
 	sort.Slice(keys, func(i, j int) bool {
 		if keys[i].CreatedAt.Equal(keys[j].CreatedAt) {
-			return keys[i].ID > keys[j].ID
+			return keys[i].ID.String() > keys[j].ID.String()
 		}
 		return keys[i].CreatedAt.After(keys[j].CreatedAt)
 	})
@@ -83,12 +111,12 @@ func (r *fakeRepo) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]A
 	if limit > 0 && len(keys) > limit {
 		keys = keys[:limit]
 	}
-	return keys, nil
+	return keys
 }
 
-func (r *fakeRepo) Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*APIKey, error) {
+func (r *fakeRepo) Update(ctx context.Context, id uuid.UUID, name string, scopes []authz.Permission) (*APIKey, error) {
 	key, ok := r.keys[id]
-	if !ok || key.TenantID != tenant.EffectiveID(ctx) || key.RevokedAt != nil {
+	if !ok || key.TenantID != tenant.IDFromContext(ctx) || key.RevokedAt != nil {
 		return nil, apperror.ErrNotFound
 	}
 	key.Name = name
@@ -98,9 +126,9 @@ func (r *fakeRepo) Update(ctx context.Context, id int64, name string, scopes []a
 	return &clone, nil
 }
 
-func (r *fakeRepo) Revoke(ctx context.Context, id int64) (*APIKey, error) {
+func (r *fakeRepo) Revoke(ctx context.Context, id uuid.UUID) (*APIKey, error) {
 	key, ok := r.keys[id]
-	if !ok || key.TenantID != tenant.EffectiveID(ctx) || key.RevokedAt != nil {
+	if !ok || key.TenantID != tenant.IDFromContext(ctx) || key.RevokedAt != nil {
 		return nil, apperror.ErrNotFound
 	}
 	now := time.Now().UTC()
@@ -110,9 +138,9 @@ func (r *fakeRepo) Revoke(ctx context.Context, id int64) (*APIKey, error) {
 	return &clone, nil
 }
 
-func (r *fakeRepo) MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*APIKey, error) {
+func (r *fakeRepo) MarkRotated(ctx context.Context, id uuid.UUID, graceSeconds int32) (*APIKey, error) {
 	key, ok := r.keys[id]
-	if !ok || key.TenantID != tenant.EffectiveID(ctx) || key.RevokedAt != nil || key.RotatedAt != nil {
+	if !ok || key.TenantID != tenant.IDFromContext(ctx) || key.RevokedAt != nil || key.RotatedAt != nil {
 		return nil, apperror.ErrNotFound
 	}
 	now := time.Now().UTC()
@@ -124,7 +152,7 @@ func (r *fakeRepo) MarkRotated(ctx context.Context, id int64, graceSeconds int32
 	return &clone, nil
 }
 
-func (r *fakeRepo) TouchLastUsed(_ context.Context, id int64, at time.Time) error {
+func (r *fakeRepo) TouchLastUsed(_ context.Context, id uuid.UUID, at time.Time) error {
 	if key, ok := r.keys[id]; ok {
 		key.LastUsedAt = &at
 	}
@@ -132,10 +160,10 @@ func (r *fakeRepo) TouchLastUsed(_ context.Context, id int64, at time.Time) erro
 }
 
 type fakePrincipals struct {
-	users map[int64]identitycontracts.Principal
+	users map[uuid.UUID]identitycontracts.Principal
 }
 
-func (p fakePrincipals) GetPrincipal(_ context.Context, tenantID, userID int64) (identitycontracts.Principal, error) {
+func (p fakePrincipals) GetPrincipal(_ context.Context, tenantID, userID uuid.UUID) (identitycontracts.Principal, error) {
 	user, ok := p.users[userID]
 	if !ok || user.TenantID != tenantID {
 		return identitycontracts.Principal{}, apperror.ErrNotFound
@@ -143,7 +171,7 @@ func (p fakePrincipals) GetPrincipal(_ context.Context, tenantID, userID int64) 
 	return user, nil
 }
 
-func (p fakePrincipals) LockPrincipal(ctx context.Context, tenantID, userID int64) (identitycontracts.Principal, error) {
+func (p fakePrincipals) LockPrincipal(ctx context.Context, tenantID, userID uuid.UUID) (identitycontracts.Principal, error) {
 	return p.GetPrincipal(ctx, tenantID, userID)
 }
 
@@ -167,22 +195,22 @@ func (f fakeTx) InTx(ctx context.Context, fn func(ctx context.Context, tx TxRepo
 
 // testContext is a trusted system-caller context for tenantID. Tests that
 // model an HTTP caller wrap it with authz.WithSubject; the subject wins.
-func testContext(tenantID int64) context.Context {
+func testContext(tenantID uuid.UUID) context.Context {
 	return authz.SystemContext(tenant.WithID(context.Background(), tenantID))
 }
 
 func TestService_NoSubjectNoSystemMarkerIsDenied(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 
-	_, err := svc.Create(tenant.WithID(context.Background(), 1), 10, CreateInput{
+	_, err := svc.Create(tenant.WithID(context.Background(), testTenantA), testUser, CreateInput{
 		Name: "x", Scopes: []string{"files:read"},
 	})
 	var appErr *apperror.AppError
-	if !errors.As(err, &appErr) || appErr.Status != 403 || appErr.Code != string(apperror.CodePermissionDenied) {
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != 403 || appErr.Code != string(apperror.CodePermissionDenied) {
 		t.Fatalf("error = %v, want 403 permission.denied", err)
 	}
 	if len(repo.keys) != 0 {
@@ -195,7 +223,7 @@ func newTestService(repo *fakeRepo, principals fakePrincipals) Service {
 }
 
 func newAuditedTestService(repo *fakeRepo, principals fakePrincipals, recorder AuditWriter) Service {
-	return NewService(repo, principals, nil, fakeTx{keys: repo, audit: recorder, principals: principals}, 8760*time.Hour)
+	return NewService(repo, principals, nil, fakeTx{keys: repo, audit: recorder, principals: principals}, testAuthorizer, 8760*time.Hour)
 }
 
 // fakeRanks records the rank checks the service asks identity for. err is
@@ -203,46 +231,46 @@ func newAuditedTestService(repo *fakeRepo, principals fakePrincipals, recorder A
 // the key's owner.
 type fakeRanks struct {
 	err   error
-	calls []int64
+	calls []uuid.UUID
 }
 
-func (r *fakeRanks) CanManageMember(_ context.Context, targetUserID int64) error {
+func (r *fakeRanks) CanManageMember(_ context.Context, targetUserID uuid.UUID) error {
 	r.calls = append(r.calls, targetUserID)
 	return r.err
 }
 
 func TestService_CreateAppliesMaxLifetime(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	now := time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)
 	const maxLifetime = 2 * time.Hour
-	svc := NewService(repo, principals, nil, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, maxLifetime)
+	svc := NewService(repo, principals, nil, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, testAuthorizer, maxLifetime)
 	svc.(*service).now = func() time.Time { return now }
-	ctx := testContext(1)
+	ctx := testContext(testTenantA)
 
-	created, err := svc.Create(ctx, 10, CreateInput{Name: "defaulted", Scopes: []string{"files:read"}})
+	created, err := svc.Create(ctx, testUser, CreateInput{Name: "defaulted", Scopes: []string{"files:read"}})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if created.ExpiresAt == nil || !created.ExpiresAt.Equal(now.Add(maxLifetime)) {
+	if !created.ExpiresAt.Equal(now.Add(maxLifetime)) {
 		t.Fatalf("expiresAt = %v, want now + max (%v)", created.ExpiresAt, now.Add(maxLifetime))
 	}
 
 	explicit := now.Add(time.Hour)
-	created, err = svc.Create(ctx, 10, CreateInput{Name: "explicit", Scopes: []string{"files:read"}, ExpiresAt: &explicit})
+	created, err = svc.Create(ctx, testUser, CreateInput{Name: "explicit", Scopes: []string{"files:read"}, ExpiresAt: &explicit})
 	if err != nil {
 		t.Fatalf("create explicit: %v", err)
 	}
-	if created.ExpiresAt == nil || !created.ExpiresAt.Equal(explicit) {
+	if !created.ExpiresAt.Equal(explicit) {
 		t.Fatalf("expiresAt = %v, want %v", created.ExpiresAt, explicit)
 	}
 
 	tooLate := now.Add(maxLifetime + time.Second)
-	_, err = svc.Create(ctx, 10, CreateInput{Name: "too-late", Scopes: []string{"files:read"}, ExpiresAt: &tooLate})
+	_, err = svc.Create(ctx, testUser, CreateInput{Name: "too-late", Scopes: []string{"files:read"}, ExpiresAt: &tooLate})
 	var appErr *apperror.AppError
-	if !errors.As(err, &appErr) || appErr.Status != 400 {
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != 400 {
 		t.Fatalf("late expiry error = %v, want 400", err)
 	}
 	if appErr.Code != string(apikeyscatalog.CodeAPIKeyExpiryExceedsMaxLifetime) {
@@ -256,35 +284,33 @@ func TestService_RotateInheritsBoundedExpiry(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		original *time.Time
+		original time.Time
 		want     time.Time
 	}{
-		{name: "legacy NULL expiry gets the maximum", original: nil, want: now.Add(maxLifetime)},
-		{name: "earlier expiry is preserved", original: ptrTime(now.Add(6 * time.Hour)), want: now.Add(6 * time.Hour)},
-		{name: "later legacy expiry is capped", original: ptrTime(now.Add(240 * time.Hour)), want: now.Add(maxLifetime)},
+		{name: "earlier expiry is preserved", original: now.Add(6 * time.Hour), want: now.Add(6 * time.Hour)},
+		{name: "later expiry is capped", original: now.Add(240 * time.Hour), want: now.Add(maxLifetime)},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := newFakeRepo()
-			principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-				10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+			principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+				testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 			}}
-			svc := NewService(repo, principals, nil, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, maxLifetime)
+			svc := NewService(repo, principals, nil, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, testAuthorizer, maxLifetime)
 			svc.(*service).now = func() time.Time { return now }
-			ctx := testContext(1)
+			ctx := testContext(testTenantA)
 
-			created, err := svc.Create(ctx, 10, CreateInput{Name: "legacy", Scopes: []string{"files:read"}})
+			created, err := svc.Create(ctx, testUser, CreateInput{Name: "legacy", Scopes: []string{"files:read"}})
 			if err != nil {
 				t.Fatalf("create: %v", err)
 			}
-			// Simulate a row issued before APIKEYS_MAX_LIFETIME existed.
 			repo.keys[created.ID].ExpiresAt = tc.original
 
-			rotated, err := svc.Rotate(ctx, 10, created.ID)
+			rotated, err := svc.Rotate(ctx, testUser, created.ID)
 			if err != nil {
 				t.Fatalf("rotate: %v", err)
 			}
-			if rotated.ExpiresAt == nil || !rotated.ExpiresAt.Equal(tc.want) {
+			if !rotated.ExpiresAt.Equal(tc.want) {
 				t.Fatalf("successor expiresAt = %v, want %v", rotated.ExpiresAt, tc.want)
 			}
 		})
@@ -293,12 +319,12 @@ func TestService_RotateInheritsBoundedExpiry(t *testing.T) {
 
 func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 
-	created, err := svc.Create(testContext(1), 10, CreateInput{
+	created, err := svc.Create(testContext(testTenantA), testUser, CreateInput{
 		Name:   "  deploy  ",
 		Scopes: []string{"files:read", "files:read"},
 	})
@@ -321,20 +347,20 @@ func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
 	if stored == nil {
 		t.Fatal("key not persisted")
 	}
-	if stored.Hash != apikey.Hash(created.Secret) {
+	if !bytes.Equal(stored.Hash, apikey.Hash(created.Secret)) {
 		t.Fatal("stored hash does not match the returned key")
 	}
-	if strings.Contains(stored.Hash, created.Secret) {
+	if strings.Contains(string(stored.Hash), created.Secret) {
 		t.Fatal("plaintext key must never be stored")
 	}
-	if stored.TenantID != 1 || stored.UserID != 10 {
-		t.Fatalf("stored binding = tenant %d user %d, want 1/10", stored.TenantID, stored.UserID)
+	if stored.TenantID != testTenantA || stored.UserID != testUser {
+		t.Fatalf("stored binding = tenant %s user %s, want %s/%s", stored.TenantID, stored.UserID, testTenantA, testUser)
 	}
-	if stored.Hash == "" || len(stored.Hash) != apikey.KeyHashBytes*2 {
-		t.Fatalf("stored hash = %q, want 64 hex chars", stored.Hash)
+	if len(stored.Hash) != apikey.KeyHashBytes {
+		t.Fatalf("stored hash length = %d, want %d bytes", len(stored.Hash), apikey.KeyHashBytes)
 	}
 
-	list, _, err := svc.List(testContext(1), 10, "")
+	list, _, err := svc.List(testContext(testTenantA), 10, "")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -347,11 +373,11 @@ func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
 
 func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
-	ctx := testContext(1)
+	ctx := testContext(testTenantA)
 
 	tests := []struct {
 		name string
@@ -369,57 +395,57 @@ func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := svc.Create(ctx, 10, tt.req)
+			_, err := svc.Create(ctx, testUser, tt.req)
 			var appErr *apperror.AppError
-			if !errors.As(err, &appErr) || appErr.Status != 400 {
+			if !errors.As(err, &appErr) || resolvedStatus(appErr) != 400 {
 				t.Fatalf("error = %v, want 400", err)
 			}
 		})
 	}
 
-	_, err := svc.Create(ctx, 99, CreateInput{Name: "x", Scopes: []string{"files:read"}})
+	_, err := svc.Create(ctx, testID(99), CreateInput{Name: "x", Scopes: []string{"files:read"}})
 	var appErr *apperror.AppError
-	if !errors.As(err, &appErr) || appErr.Status != 404 {
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != 404 {
 		t.Fatalf("missing owner error = %v, want 404", err)
 	}
 
 	// An API-key caller cannot grant a scope that its own key does not hold.
-	scopedCaller := authz.WithSubject(testContext(1), authz.NewSubjectWithPermissions(
-		10, 1, authz.RoleAdmin, testScopeFilesRead,
+	scopedCaller := authz.WithSubject(testContext(testTenantA), authz.NewSubjectWithPermissions(
+		testUser, testTenantA, authz.RoleAdmin, testScopeFilesRead,
 	))
-	_, err = svc.Create(scopedCaller, 10, CreateInput{Name: "x", Scopes: []string{"files:write"}})
-	if !errors.As(err, &appErr) || appErr.Status != 400 {
+	_, err = svc.Create(scopedCaller, testUser, CreateInput{Name: "x", Scopes: []string{"files:write"}})
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != 400 {
 		t.Fatalf("caller escalation error = %v, want 400", err)
 	}
 
 	// Rotation mints a secret with the existing scopes, so a narrower caller
 	// cannot rotate a broader key either.
-	broad, err := svc.Create(testContext(1), 10, CreateInput{Name: "broad", Scopes: []string{"files:write"}})
+	broad, err := svc.Create(testContext(testTenantA), testUser, CreateInput{Name: "broad", Scopes: []string{"files:write"}})
 	if err != nil {
 		t.Fatalf("create broad key: %v", err)
 	}
-	_, err = svc.Rotate(scopedCaller, 10, broad.ID)
-	if !errors.As(err, &appErr) || appErr.Status != 400 {
+	_, err = svc.Rotate(scopedCaller, testUser, broad.ID)
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != 400 {
 		t.Fatalf("rotate escalation error = %v, want 400", err)
 	}
 }
 
 func TestService_RotateOnlyIssuesSecretsToTheOwner(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive},
-		20: {ID: 20, TenantID: 1, Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser:  {ID: testUser, TenantID: testTenantA, Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive},
+		testOther: {ID: testOther, TenantID: testTenantA, Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
-	ctx := testContext(1)
+	ctx := testContext(testTenantA)
 
-	created, err := svc.Create(ctx, 10, CreateInput{Name: "owner-key", Scopes: []string{"files:read"}})
+	created, err := svc.Create(ctx, testUser, CreateInput{Name: "owner-key", Scopes: []string{"files:read"}})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
 	// Another admin in the same tenant cannot obtain a secret for this key.
-	if _, err := svc.Rotate(ctx, 20, created.ID); !isNotFound(err) {
+	if _, err := svc.Rotate(ctx, testOther, created.ID); !isNotFound(err) {
 		t.Fatalf("cross-owner rotate error = %v, want 404", err)
 	}
 	if repo.keys[created.ID].RotatedAt != nil {
@@ -429,70 +455,70 @@ func TestService_RotateOnlyIssuesSecretsToTheOwner(t *testing.T) {
 		t.Fatalf("keys = %d, want no successor key", len(repo.keys))
 	}
 
-	rotated, err := svc.Rotate(ctx, 10, created.ID)
+	rotated, err := svc.Rotate(ctx, testUser, created.ID)
 	if err != nil {
 		t.Fatalf("owner rotate: %v", err)
 	}
-	if rotated.UserID != 10 {
-		t.Fatalf("successor owner = %d, want the caller 10", rotated.UserID)
+	if rotated.UserID != testUser {
+		t.Fatalf("successor owner = %s, want the caller %s", rotated.UserID, testUser)
 	}
 }
 
 func TestService_TenantIsolation(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
-		20: {ID: 20, TenantID: 2, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser:  {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+		testOther: {ID: testOther, TenantID: testTenantB, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 
-	keyA, err := svc.Create(testContext(1), 10, CreateInput{Name: "a", Scopes: []string{"files:read"}})
+	keyA, err := svc.Create(testContext(testTenantA), testUser, CreateInput{Name: "a", Scopes: []string{"files:read"}})
 	if err != nil {
-		t.Fatalf("create tenant 1: %v", err)
+		t.Fatalf("create tenant A: %v", err)
 	}
-	keyB, err := svc.Create(testContext(2), 20, CreateInput{Name: "b", Scopes: []string{"files:read"}})
+	keyB, err := svc.Create(testContext(testTenantB), testOther, CreateInput{Name: "b", Scopes: []string{"files:read"}})
 	if err != nil {
-		t.Fatalf("create tenant 2: %v", err)
+		t.Fatalf("create tenant B: %v", err)
 	}
 
-	if _, err := svc.Get(testContext(1), keyB.ID); !isNotFound(err) {
+	if _, err := svc.Get(testContext(testTenantA), keyB.ID); !isNotFound(err) {
 		t.Fatalf("cross-tenant get error = %v, want 404", err)
 	}
-	if _, err := svc.Update(testContext(1), keyB.ID, UpdateInput{Name: ptrString("hijack")}); !isNotFound(err) {
+	if _, err := svc.Update(testContext(testTenantA), keyB.ID, UpdateInput{Name: ptrString("hijack")}); !isNotFound(err) {
 		t.Fatalf("cross-tenant update error = %v, want 404", err)
 	}
-	if err := svc.Revoke(testContext(1), keyB.ID); !isNotFound(err) {
+	if err := svc.Revoke(testContext(testTenantA), keyB.ID); !isNotFound(err) {
 		t.Fatalf("cross-tenant revoke error = %v, want 404", err)
 	}
-	if _, err := svc.Rotate(testContext(1), 10, keyB.ID); !isNotFound(err) {
+	if _, err := svc.Rotate(testContext(testTenantA), testUser, keyB.ID); !isNotFound(err) {
 		t.Fatalf("cross-tenant rotate error = %v, want 404", err)
 	}
 
-	listA, _, err := svc.List(testContext(1), 10, "")
+	listA, _, err := svc.List(testContext(testTenantA), 10, "")
 	if err != nil {
-		t.Fatalf("list tenant 1: %v", err)
+		t.Fatalf("list tenant A: %v", err)
 	}
 	if len(listA) != 1 || listA[0].ID != keyA.ID {
-		t.Fatalf("tenant 1 list = %+v, want only key %d", listA, keyA.ID)
+		t.Fatalf("tenant A list = %+v, want only key %s", listA, keyA.ID)
 	}
-	listB, _, err := svc.List(testContext(2), 10, "")
+	listB, _, err := svc.List(testContext(testTenantB), 10, "")
 	if err != nil {
-		t.Fatalf("list tenant 2: %v", err)
+		t.Fatalf("list tenant B: %v", err)
 	}
 	if len(listB) != 1 || listB[0].ID != keyB.ID {
-		t.Fatalf("tenant 2 list = %+v, want only key %d", listB, keyB.ID)
+		t.Fatalf("tenant B list = %+v, want only key %s", listB, keyB.ID)
 	}
 }
 
 func TestService_UpdateRevokeAndRotation(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
-	ctx := testContext(1)
+	ctx := testContext(testTenantA)
 
-	created, err := svc.Create(ctx, 10, CreateInput{
+	created, err := svc.Create(ctx, testUser, CreateInput{
 		Name:   "deploy",
 		Scopes: []string{"files:read"},
 	})
@@ -514,12 +540,12 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 		t.Fatalf("scope escalation update error = %v, want 400", err)
 	}
 
-	rotated, err := svc.Rotate(ctx, 10, created.ID)
+	rotated, err := svc.Rotate(ctx, testUser, created.ID)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 	if rotated.PreviousKeyID != created.ID {
-		t.Fatalf("previous key id = %d, want %d", rotated.PreviousKeyID, created.ID)
+		t.Fatalf("previous key id = %s, want %s", rotated.PreviousKeyID, created.ID)
 	}
 	if rotated.Secret == created.Secret {
 		t.Fatal("rotation must return a new secret")
@@ -538,7 +564,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 		t.Fatal("rotation grace must be in the future")
 	}
 
-	if _, err := svc.Rotate(ctx, 10, created.ID); !isConflict(err) {
+	if _, err := svc.Rotate(ctx, testUser, created.ID); !isConflict(err) {
 		t.Fatalf("second rotate error = %v, want 409", err)
 	}
 	if err := svc.Revoke(ctx, rotated.ID); err != nil {
@@ -550,54 +576,54 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 	if _, err := svc.Update(ctx, rotated.ID, UpdateInput{Name: ptrString("x")}); !isConflict(err) {
 		t.Fatalf("update revoked error = %v, want 409", err)
 	}
-	if _, err := svc.Rotate(ctx, 10, rotated.ID); !isConflict(err) {
+	if _, err := svc.Rotate(ctx, testUser, rotated.ID); !isConflict(err) {
 		t.Fatalf("rotate revoked error = %v, want 409", err)
 	}
 }
 
 func TestService_RotationGraceIsAcceptedByVerifier(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
-	ctx := testContext(1)
+	ctx := testContext(testTenantA)
 
-	created, err := svc.Create(ctx, 10, CreateInput{Name: "deploy", Scopes: []string{"files:read"}})
+	created, err := svc.Create(ctx, testUser, CreateInput{Name: "deploy", Scopes: []string{"files:read"}})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	rotated, err := svc.Rotate(ctx, 10, created.ID)
+	rotated, err := svc.Rotate(ctx, testUser, created.ID)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 
 	verifier := apikey.NewVerifier(verifierStore{repo: repo}, principals)
-	if _, err := verifier.Verify(ctx, created.Secret, 1); err != nil {
+	if _, err := verifier.Verify(ctx, created.Secret, testTenantA); err != nil {
 		t.Fatalf("old key must remain valid during grace: %v", err)
 	}
-	if _, err := verifier.Verify(ctx, rotated.Secret, 1); err != nil {
+	if _, err := verifier.Verify(ctx, rotated.Secret, testTenantA); err != nil {
 		t.Fatalf("new key must verify: %v", err)
 	}
-	if _, err := verifier.Verify(ctx, created.Secret, 2); !isForbidden(err) {
+	if _, err := verifier.Verify(ctx, created.Secret, testTenantB); !isForbidden(err) {
 		t.Fatalf("tenant mismatch error = %v, want 403", err)
 	}
 }
 
 func TestService_AnotherMembersKeyRequiresHigherRank(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, Permissions: []string{"files:read", "files:write"}, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, Permissions: []string{"files:read", "files:write"}, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	ranks := &fakeRanks{}
-	svc := NewService(repo, principals, ranks, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, 8760*time.Hour)
+	svc := NewService(repo, principals, ranks, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, testAuthorizer, 8760*time.Hour)
 
-	created, err := svc.Create(testContext(1), 10, CreateInput{Name: "owner-key", Scopes: []string{"files:read", "files:write"}})
+	created, err := svc.Create(testContext(testTenantA), testUser, CreateInput{Name: "owner-key", Scopes: []string{"files:read", "files:write"}})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	adminCtx := authz.WithSubject(testContext(1), authz.NewSubjectWithPermissions(
-		20, 1, authz.RoleAdmin, authz.Permission("files:read"), authz.Permission("files:write"),
+	adminCtx := authz.WithSubject(testContext(testTenantA), authz.NewSubjectWithPermissions(
+		testOther, testTenantA, authz.RoleAdmin, authz.Permission("files:read"), authz.Permission("files:write"),
 	))
 	ranks.err = apperror.NewCode(apperror.CodePermissionDenied, "cannot manage a member with an equal or higher role")
 	if _, err := svc.Update(adminCtx, created.ID, UpdateInput{Name: ptrString("hijack")}); !hasStatus(err, 403) {
@@ -634,17 +660,17 @@ func TestService_AnotherMembersKeyRequiresHigherRank(t *testing.T) {
 
 func TestService_OwnerMayWidenOwnKeyScopes(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, Permissions: []string{"files:read", "files:write"}, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, Permissions: []string{"files:read", "files:write"}, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	ranks := &fakeRanks{}
-	svc := NewService(repo, principals, ranks, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, 8760*time.Hour)
-	created, err := svc.Create(testContext(1), 10, CreateInput{Name: "own-key", Scopes: []string{"files:read"}})
+	svc := NewService(repo, principals, ranks, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, testAuthorizer, 8760*time.Hour)
+	created, err := svc.Create(testContext(testTenantA), testUser, CreateInput{Name: "own-key", Scopes: []string{"files:read"}})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	ownerCtx := authz.WithSubject(testContext(1), authz.NewSubjectWithPermissions(
-		10, 1, authz.RoleMember, authz.Permission("files:read"), authz.Permission("files:write"),
+	ownerCtx := authz.WithSubject(testContext(testTenantA), authz.NewSubjectWithPermissions(
+		testUser, testTenantA, authz.RoleMember, authz.Permission("files:read"), authz.Permission("files:write"),
 	))
 	updated, err := svc.Update(ownerCtx, created.ID, UpdateInput{Scopes: []string{"files:read", "files:write"}})
 	if err != nil {
@@ -660,21 +686,21 @@ func TestService_OwnerMayWidenOwnKeyScopes(t *testing.T) {
 
 func TestService_RotateExpiredKeyIsConflict(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 	now := time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)
 	svc.(*service).now = func() time.Time { return now }
-	ctx := testContext(1)
+	ctx := testContext(testTenantA)
 
-	created, err := svc.Create(ctx, 10, CreateInput{Name: "short-lived", Scopes: []string{"files:read"}})
+	created, err := svc.Create(ctx, testUser, CreateInput{Name: "short-lived", Scopes: []string{"files:read"}})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	svc.(*service).now = func() time.Time { return now.Add(25 * time.Hour) }
-	repo.keys[created.ID].ExpiresAt = ptrTime(now.Add(time.Hour))
-	if _, err := svc.Rotate(ctx, 10, created.ID); !isConflict(err) {
+	repo.keys[created.ID].ExpiresAt = now.Add(time.Hour)
+	if _, err := svc.Rotate(ctx, testUser, created.ID); !isConflict(err) {
 		t.Fatalf("expired rotate error = %v, want 409", err)
 	}
 	if len(repo.keys) != 1 {
@@ -689,7 +715,7 @@ type verifierStore struct {
 	repo *fakeRepo
 }
 
-func (s verifierStore) FindByHash(ctx context.Context, hash string) (apikey.Key, error) {
+func (s verifierStore) FindByHash(ctx context.Context, hash []byte) (apikey.Key, error) {
 	key, err := s.repo.GetByHash(ctx, hash)
 	if err != nil {
 		return apikey.Key{}, err
@@ -702,7 +728,7 @@ func (s verifierStore) FindByHash(ctx context.Context, hash string) (apikey.Key,
 		Prefix:             key.Prefix,
 		Hash:               key.Hash,
 		Scopes:             key.Scopes,
-		ExpiresAt:          key.ExpiresAt,
+		ExpiresAt:          &key.ExpiresAt,
 		RevokedAt:          key.RevokedAt,
 		RotatedAt:          key.RotatedAt,
 		RotationGraceUntil: key.RotationGraceUntil,
@@ -712,7 +738,7 @@ func (s verifierStore) FindByHash(ctx context.Context, hash string) (apikey.Key,
 	}, nil
 }
 
-func (s verifierStore) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
+func (s verifierStore) TouchLastUsed(ctx context.Context, id uuid.UUID, at time.Time) error {
 	return s.repo.TouchLastUsed(ctx, id, at)
 }
 
@@ -723,8 +749,107 @@ func isForbidden(err error) bool  { return hasStatus(err, 403) }
 
 func hasStatus(err error, status int) bool {
 	var appErr *apperror.AppError
-	return errors.As(err, &appErr) && appErr.Status == status
+	return errors.As(err, &appErr) && resolvedStatus(appErr) == status
 }
 
 func ptrString(value string) *string     { return &value }
 func ptrTime(value time.Time) *time.Time { return &value }
+
+// newMemberScopedService wires a rank checker so cross-member paths can be
+// exercised without a database.
+func newMemberScopedService(repo *fakeRepo, principals fakePrincipals, ranks *fakeRanks) Service {
+	recorder := auditWriterFunc(func(context.Context, audit.Event) error { return nil })
+	return NewService(repo, principals, ranks, fakeTx{keys: repo, audit: recorder, principals: principals}, testAuthorizer, 8760*time.Hour)
+}
+
+func TestService_OwnedViewsConcealAnotherMembersKey(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser:  {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+		testOther: {ID: testOther, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	}}
+	ranks := &fakeRanks{}
+	svc := newMemberScopedService(repo, principals, ranks)
+	ctx := testContext(testTenantA)
+
+	created, err := svc.Create(ctx, testOther, CreateInput{Name: "other", Scopes: []string{"files:read"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// The owner's page never contains another member's key.
+	keys, _, err := svc.ListOwnedBy(ctx, testUser, 10, "")
+	if err != nil {
+		t.Fatalf("list owned: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("owned list = %+v, want only the caller's keys", keys)
+	}
+	keys, _, err = svc.ListOwnedBy(ctx, testOther, 10, "")
+	if err != nil {
+		t.Fatalf("list other: %v", err)
+	}
+	if len(keys) != 1 || keys[0].ID != created.ID {
+		t.Fatalf("other list = %+v, want the owner's key", keys)
+	}
+	if _, _, err := svc.ListForMember(ctx, testID(999), 10, ""); !isNotFound(err) {
+		t.Fatalf("unknown member list = %v, want 404", err)
+	}
+
+	if _, err := svc.GetOwnedBy(ctx, testUser, created.ID); !isNotFound(err) {
+		t.Fatalf("get another member's key = %v, want 404", err)
+	}
+	name := "hijack"
+	if _, err := svc.UpdateOwnedBy(ctx, testUser, created.ID, UpdateInput{Name: &name}); !isNotFound(err) {
+		t.Fatalf("update another member's key = %v, want 404", err)
+	}
+	if err := svc.RevokeOwnedBy(ctx, testUser, created.ID); !isNotFound(err) {
+		t.Fatalf("revoke another member's key = %v, want 404", err)
+	}
+	if repo.keys[created.ID].Name != "other" {
+		t.Fatalf("another member's key was modified: %+v", repo.keys[created.ID])
+	}
+	if repo.keys[created.ID].RevokedAt != nil {
+		t.Fatal("another member's key was revoked through the self-service path")
+	}
+}
+
+func TestService_MemberScopedMutationsCheckPathOwnerAndRank(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser:  {ID: testUser, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+		testOther: {ID: testOther, TenantID: testTenantA, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	}}
+	ranks := &fakeRanks{}
+	svc := newMemberScopedService(repo, principals, ranks)
+	ctx := authz.WithSubject(testContext(testTenantA), authz.NewSubject(testUser, testTenantA, authz.RoleAdmin))
+
+	created, err := svc.Create(testContext(testTenantA), testOther, CreateInput{Name: "other", Scopes: []string{"files:read"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// The member id on the path must match the key's owner.
+	name := "renamed"
+	if _, err := svc.UpdateForMember(ctx, testUser, created.ID, UpdateInput{Name: &name}); !isNotFound(err) {
+		t.Fatalf("wrong member id = %v, want 404", err)
+	}
+	if len(ranks.calls) != 0 {
+		t.Fatal("a mismatched member id must not reach the rank checker")
+	}
+
+	updated, err := svc.UpdateForMember(ctx, testOther, created.ID, UpdateInput{Name: &name})
+	if err != nil {
+		t.Fatalf("member update: %v", err)
+	}
+	if updated.Name != name || len(ranks.calls) != 1 || ranks.calls[0] != testOther {
+		t.Fatalf("updated = %+v, rank calls = %v", updated, ranks.calls)
+	}
+
+	if err := svc.RevokeForMember(ctx, testOther, created.ID); err != nil {
+		t.Fatalf("member revoke: %v", err)
+	}
+	if repo.keys[created.ID].RevokedAt == nil {
+		t.Fatal("member revoke did not persist")
+	}
+}

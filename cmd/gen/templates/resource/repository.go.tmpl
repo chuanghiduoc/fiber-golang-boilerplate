@@ -2,7 +2,13 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	{{.M.Ident}}service "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/service"
 	{{.M.Ident}}sqlc "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/sqlc"
@@ -12,7 +18,8 @@ import (
 )
 
 // {{.R.Pascal}}Repository implements {{.M.Ident}}service.{{.R.Pascal}}Repository over
-// {{.R.Table}}. Every query binds tenant.EffectiveID(ctx).
+// {{.R.Table}}. Every query binds tenant.Require(ctx); a context without a
+// tenant is an error, never a fallback.
 type {{.R.Pascal}}Repository struct {
 	q *{{.M.Ident}}sqlc.Queries
 }
@@ -27,8 +34,12 @@ func New{{.R.Pascal}}Repository(db {{.M.Ident}}sqlc.DBTX) *{{.R.Pascal}}Reposito
 
 // Create{{.R.Pascal}} inserts a {{.R.Human}} in the request tenant.
 func (r *{{.R.Pascal}}Repository) Create{{.R.Pascal}}(ctx context.Context, in {{.M.Ident}}service.{{.R.Pascal}}Input) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return {{.M.Ident}}service.{{.R.Pascal}}{}, err
+	}
 	row, err := r.q.Create{{.R.Pascal}}(ctx, {{.M.Ident}}sqlc.Create{{.R.Pascal}}Params{
-		TenantID: tenant.EffectiveID(ctx),
+		TenantID: tenantID,
 		Name:     in.Name,
 	})
 	if err != nil {
@@ -38,9 +49,13 @@ func (r *{{.R.Pascal}}Repository) Create{{.R.Pascal}}(ctx context.Context, in {{
 }
 
 // Get{{.R.Pascal}} loads one {{.R.Human}} of the request tenant.
-func (r *{{.R.Pascal}}Repository) Get{{.R.Pascal}}(ctx context.Context, id int64) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+func (r *{{.R.Pascal}}Repository) Get{{.R.Pascal}}(ctx context.Context, id uuid.UUID) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return {{.M.Ident}}service.{{.R.Pascal}}{}, err
+	}
 	row, err := r.q.Get{{.R.Pascal}}(ctx, {{.M.Ident}}sqlc.Get{{.R.Pascal}}Params{
-		TenantID: tenant.EffectiveID(ctx),
+		TenantID: tenantID,
 		ID:       id,
 	})
 	if err != nil {
@@ -52,8 +67,12 @@ func (r *{{.R.Pascal}}Repository) Get{{.R.Pascal}}(ctx context.Context, id int64
 // List{{.R.PluralPascal}} returns up to cursor.Limit {{.R.HumanPlural}} older than the
 // cursor, newest first.
 func (r *{{.R.Pascal}}Repository) List{{.R.PluralPascal}}(ctx context.Context, cursor pagination.DBCursor) ([]{{.M.Ident}}service.{{.R.Pascal}}, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.q.List{{.R.PluralPascal}}(ctx, {{.M.Ident}}sqlc.List{{.R.PluralPascal}}Params{
-		TenantID:        tenant.EffectiveID(ctx),
+		TenantID:        tenantID,
 		CursorCreatedAt: cursor.CreatedAtParam(),
 		CursorID:        cursor.IDParam(),
 		RowLimit:        cursor.Limit,
@@ -70,25 +89,47 @@ func (r *{{.R.Pascal}}Repository) List{{.R.PluralPascal}}(ctx context.Context, c
 
 // Patch{{.R.Pascal}} changes only the fields the caller supplied; an omitted
 // field stays as it is.
-func (r *{{.R.Pascal}}Repository) Patch{{.R.Pascal}}(ctx context.Context, id int64, in {{.M.Ident}}service.{{.R.Pascal}}Patch) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+func (r *{{.R.Pascal}}Repository) Patch{{.R.Pascal}}(ctx context.Context, id uuid.UUID, in {{.M.Ident}}service.{{.R.Pascal}}Patch, expected *time.Time) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return {{.M.Ident}}service.{{.R.Pascal}}{}, err
+	}
 	params := {{.M.Ident}}sqlc.Patch{{.R.Pascal}}Params{
-		TenantID: tenant.EffectiveID(ctx),
+		TenantID: tenantID,
 		ID:       id,
 	}
 	if in.Name != nil {
 		params.SetName, params.Name = true, *in.Name
 	}
-	row, err := r.q.Patch{{.R.Pascal}}(ctx, params)
+	var row {{.M.Ident}}sqlc.{{.R.Model}}
+	if expected != nil {
+		row, err = r.q.Patch{{.R.Pascal}}IfUnchanged(ctx, {{.M.Ident}}sqlc.Patch{{.R.Pascal}}IfUnchangedParams{
+			TenantID:          tenantID,
+			ID:                id,
+			SetName:           params.SetName,
+			Name:              params.Name,
+			ExpectedUpdatedAt: pgtype.Timestamptz{Time: *expected, Valid: true},
+		})
+	} else {
+		row, err = r.q.Patch{{.R.Pascal}}(ctx, params)
+	}
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return {{.M.Ident}}service.{{.R.Pascal}}{}, apperror.NewPreconditionFailed("the resource has changed since it was read; refresh and retry")
+		}
 		return {{.M.Ident}}service.{{.R.Pascal}}{}, noRows(err, "patch {{.R.Table}}")
 	}
 	return to{{.R.Pascal}}(row), nil
 }
 
 // Delete{{.R.Pascal}} removes one {{.R.Human}}; deleting nothing is not found.
-func (r *{{.R.Pascal}}Repository) Delete{{.R.Pascal}}(ctx context.Context, id int64) error {
+func (r *{{.R.Pascal}}Repository) Delete{{.R.Pascal}}(ctx context.Context, id uuid.UUID) error {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return err
+	}
 	affected, err := r.q.Delete{{.R.Pascal}}(ctx, {{.M.Ident}}sqlc.Delete{{.R.Pascal}}Params{
-		TenantID: tenant.EffectiveID(ctx),
+		TenantID: tenantID,
 		ID:       id,
 	})
 	if err != nil {

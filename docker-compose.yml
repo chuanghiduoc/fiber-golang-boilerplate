@@ -15,7 +15,7 @@ services:
       # api/worker services with APP_ROLE=api and APP_ROLE=worker if needed.
       APP_ROLE: ${APP_ROLE:-all}
       APP_BODY_LIMIT: ${APP_BODY_LIMIT:-12582912}
-      APP_REQUEST_TIMEOUT: ${APP_REQUEST_TIMEOUT:-12}
+      APP_REQUEST_TIMEOUT: ${APP_REQUEST_TIMEOUT:-12s}
       APP_FRONTEND_URL: ${APP_FRONTEND_URL:-http://localhost:3000}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       REQUIRE_EMAIL_VERIFICATION: ${REQUIRE_EMAIL_VERIFICATION:-false}
@@ -28,20 +28,23 @@ services:
       EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Fiber App}
       SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:-false}
       METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
-      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+      TRACING_ENABLED: ${TRACING_ENABLED:-false}
       OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-otlp}
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-otel-collector:4317}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
       OTEL_EXPORTER_OTLP_INSECURE: ${OTEL_EXPORTER_OTLP_INSECURE:-true}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-fiber-golang-boilerplate}
-      OTEL_SERVICE_NAMESPACE: ${OTEL_SERVICE_NAMESPACE:-fiber-golang-boilerplate}
-      OTEL_SERVICE_VERSION: ${OTEL_SERVICE_VERSION:-dev}
-      OTEL_DEPLOYMENT_ENVIRONMENT: ${OTEL_DEPLOYMENT_ENVIRONMENT:-local}
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-service.namespace=fiber-golang-boilerplate,deployment.environment.name=local}
       OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
       OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-1.0}
-      OTEL_INSTRUMENT_DB: ${OTEL_INSTRUMENT_DB:-true}
+      TRACING_INSTRUMENT_DB: ${TRACING_INSTRUMENT_DB:-true}
+      TRACING_SHUTDOWN_TIMEOUT: ${TRACING_SHUTDOWN_TIMEOUT:-10}
+      METRICS_OTLP_ENABLED: ${METRICS_OTLP_ENABLED:-false}
       CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-*}"
-      JWT_REFRESH_EXPIRE_DAYS: ${JWT_REFRESH_EXPIRE_DAYS:-30}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-720h}
       SESSION_MAX_LIFETIME: ${SESSION_MAX_LIFETIME:-720h}
+      AUTH_REFRESH_COOKIE: ${AUTH_REFRESH_COOKIE:-false}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_DATABASE: ${DB_DATABASE:-boilerplate}
@@ -49,15 +52,17 @@ services:
       # the bypass role spans tenants for jobs/retention/catalog sync. The app
       # role is not a member of the bypass role.
       DB_USERNAME: ${DB_USERNAME:-app}
-      DB_PASSWORD: ${DB_PASSWORD:-app-password}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD (openssl rand -base64 24)}
       DB_BYPASS_USERNAME: ${DB_BYPASS_USERNAME:-app_bypass}
-      DB_BYPASS_PASSWORD: ${DB_BYPASS_PASSWORD:-app-bypass-password}
+      DB_BYPASS_PASSWORD: ${DB_BYPASS_PASSWORD:?set DB_BYPASS_PASSWORD (openssl rand -base64 24)}
       DB_SCHEMA: ${DB_SCHEMA:-public}
       DB_SSLMODE: ${DB_SSLMODE:-disable}
-      JWT_SECRET: ${JWT_SECRET:-your-super-secret-key-change-in-production}
-      JWT_EXPIRE_HOUR: ${JWT_EXPIRE_HOUR:-1}
-      # Empty falls back to JWT_SECRET locally; production requires its own key.
-      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:-}
+      # Public local sample keys (base64-encoded 32 bytes); production rejects
+      # them and requires distinct random keys per purpose.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (openssl rand -base64 32)}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY (openssl rand -base64 32)}
+      WEBHOOK_SECRET_ENCRYPTION_KEY: ${WEBHOOK_SECRET_ENCRYPTION_KEY:?set WEBHOOK_SECRET_ENCRYPTION_KEY (openssl rand -base64 32)}
+      OAUTH_STATE_KEY: ${OAUTH_STATE_KEY:?set OAUTH_STATE_KEY (openssl rand -base64 32)}
       STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
       STORAGE_LOCAL_PATH: ${STORAGE_LOCAL_PATH:-./uploads}
       STORAGE_MAX_FILE_SIZE: ${STORAGE_MAX_FILE_SIZE:-10485760}
@@ -65,14 +70,20 @@ services:
       STORAGE_S3_REGION: ${STORAGE_S3_REGION:-us-east-1}
       STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-uploads}
       STORAGE_S3_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:-seaweedadmin}
-      STORAGE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:-seaweedadmin}
+      STORAGE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:?set STORAGE_S3_SECRET_KEY}
       STORAGE_S3_USE_SSL: ${STORAGE_S3_USE_SSL:-false}
       CACHE_DRIVER: ${CACHE_DRIVER:-memory}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     volumes:
       - uploads_data:/app/uploads
+      # The image runs as UID/GID 65532 (distroless nonroot). A named volume
+      # created by an image built before that change is owned by 100:101 and is
+      # not writable by the new user; recreate it once with
+      # `docker compose down -v` (local data only).
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${APP_PORT}/readyz >/dev/null || exit 1"]
+      # The distroless image has no shell or HTTP client: the binary probes
+      # /readyz itself (APP_PORT comes from the environment).
+      test: ["CMD", "/app/server", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -107,7 +118,7 @@ services:
       DB_DATABASE: ${DB_DATABASE:-boilerplate}
       # The schema owner applies DDL; the API never uses this role.
       DB_USERNAME: ${DB_MIGRATE_USERNAME:-postgres}
-      DB_PASSWORD: ${DB_MIGRATE_PASSWORD:-password}
+      DB_PASSWORD: ${DB_MIGRATE_PASSWORD:?set DB_MIGRATE_PASSWORD (openssl rand -base64 24)}
       DB_SCHEMA: ${DB_SCHEMA:-public}
       DB_SSLMODE: ${DB_SSLMODE:-disable}
     depends_on:
@@ -137,11 +148,13 @@ services:
       DB_PORT: 5432
       DB_DATABASE: ${DB_DATABASE:-boilerplate}
       DB_USERNAME: ${DB_USERNAME:-app}
-      DB_PASSWORD: ${DB_PASSWORD:-app-password}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD (openssl rand -base64 24)}
       DB_BYPASS_USERNAME: ${DB_BYPASS_USERNAME:-app_bypass}
-      DB_BYPASS_PASSWORD: ${DB_BYPASS_PASSWORD:-app-bypass-password}
+      DB_BYPASS_PASSWORD: ${DB_BYPASS_PASSWORD:?set DB_BYPASS_PASSWORD (openssl rand -base64 24)}
       DB_SCHEMA: ${DB_SCHEMA:-public}
       DB_SSLMODE: ${DB_SSLMODE:-disable}
+      # The ban marker needs the dedicated data key; there is no JWT fallback.
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY (openssl rand -base64 32)}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       ADMIN_NAME: ${ADMIN_NAME:-Admin}
@@ -154,7 +167,7 @@ services:
       - app-network
 
   postgres:
-    image: postgres:18-alpine
+    image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     restart: unless-stopped
     deploy:
       resources:
@@ -165,12 +178,12 @@ services:
       POSTGRES_DB: ${DB_DATABASE:-boilerplate}
       # The container superuser owns the schema and runs migrations.
       POSTGRES_USER: ${DB_MIGRATE_USERNAME:-postgres}
-      POSTGRES_PASSWORD: ${DB_MIGRATE_PASSWORD:-password}
+      POSTGRES_PASSWORD: ${DB_MIGRATE_PASSWORD:?set DB_MIGRATE_PASSWORD (openssl rand -base64 24)}
       # The init hook below creates both non-superuser runtime roles.
       APP_DB_USERNAME: ${DB_USERNAME:-app}
-      APP_DB_PASSWORD: ${DB_PASSWORD:-app-password}
+      APP_DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD (openssl rand -base64 24)}
       APP_DB_BYPASS_USERNAME: ${DB_BYPASS_USERNAME:-app_bypass}
-      APP_DB_BYPASS_PASSWORD: ${DB_BYPASS_PASSWORD:-app-bypass-password}
+      APP_DB_BYPASS_PASSWORD: ${DB_BYPASS_PASSWORD:?set DB_BYPASS_PASSWORD (openssl rand -base64 24)}
       DB_SCHEMA: ${DB_SCHEMA:-public}
     ports:
       - "127.0.0.1:${DB_PORT:-5432}:5432"
@@ -192,7 +205,7 @@ services:
       - app-network
 
   redis:
-    image: redis:8-alpine
+    image: redis:8-alpine@sha256:47b08295737773de3b711fb86f13ae802f5074e96a9a2d29f5f80164ac08c046
     restart: unless-stopped
     deploy:
       resources:
@@ -213,12 +226,12 @@ services:
       - app-network
 
   # Optional OpenTelemetry collector. Tracing stays disabled unless the app is
-  # started with OTEL_ENABLED=true; start this profile explicitly with
+  # started with TRACING_ENABLED=true; start this profile explicitly with
   # `docker compose --profile otel up`. The app intentionally does not depend on
   # the collector: an outage only drops spans.
   otel-collector:
     profiles: ["otel"]
-    image: otel/opentelemetry-collector:0.162.0
+    image: otel/opentelemetry-collector:0.162.0@sha256:310a800ad69ee430e7c541796852a242c9c7db97aaad4daa5ccf843c525fbdb2
     restart: unless-stopped
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
@@ -242,7 +255,7 @@ services:
   # gateway share the STORAGE_S3_* credentials.
   seaweedfs:
     profiles: ["s3"]
-    image: chrislusf/seaweedfs:4.48
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
     restart: unless-stopped
     deploy:
       resources:
@@ -253,7 +266,7 @@ services:
       - "127.0.0.1:8333:8333"
     environment:
       AWS_ACCESS_KEY_ID: ${STORAGE_S3_ACCESS_KEY:-seaweedadmin}
-      AWS_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_KEY:-seaweedadmin}
+      AWS_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_KEY:?set STORAGE_S3_SECRET_KEY}
     command: server -s3 -dir=/data
     volumes:
       - seaweedfs_data:/data

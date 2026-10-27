@@ -3,12 +3,12 @@
 // routes. It has no dependency on the transport DTOs so modules can share the
 // catalog without importing handler-level types.
 //
-// The catalog has two sources. Permissions checked by more than one module
-// (the admin back-office permissions enforced both by the admin routes and by
-// the identity/files services) are declared here. Every other permission is
-// owned by one module and registered at startup through Register (wired by
-// app.RegisterCatalogs from app.PermissionProvider). Owner and admin receive
-// every tenant permission by construction.
+// The catalog is an injected instance (authz.Catalog): the composition root
+// builds it from the shared platform grants plus every app.PermissionProvider,
+// detects duplicate or conflicting registrations, seals it, and injects it
+// into the session/permission sync, the services' authz.Authorizer, role
+// validation, and the API-key scope intersection. There is deliberately no
+// process-wide mutable registry.
 package authz
 
 import (
@@ -16,7 +16,6 @@ import (
 	"regexp"
 	"slices"
 	"sync"
-	"sync/atomic"
 )
 
 // Permission identifies a single capability that can be granted to a role.
@@ -44,6 +43,7 @@ const (
 	// platform_admin role receives them.
 	PermissionPlatformTenantsRead   Permission = "platform:tenants:read"
 	PermissionPlatformTenantsWrite  Permission = "platform:tenants:write"
+	PermissionPlatformFeaturesRead  Permission = "platform:features:read"
 	PermissionPlatformFeaturesWrite Permission = "platform:features:write"
 	PermissionPlatformUsersMFAReset Permission = "platform:users:mfa_reset"
 )
@@ -71,43 +71,36 @@ type Grant struct {
 	Platform   bool
 }
 
+// Provider contributes one owner's grants to a Catalog. The composition root
+// builds one provider per app.PermissionProvider plus the shared platform
+// grants.
+type Provider struct {
+	Owner  string
+	Grants []Grant
+}
+
 // permissionPattern keeps identifiers stable and scope-friendly:
 // lower-case segments separated by ':' (for example "orders:read" or
 // "admin:api_keys:rotate").
 var permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)+$`)
 
-// catalogState is an immutable snapshot; Register publishes a new one so the
-// per-request read path (Has) is a lock-free atomic load.
-type catalogState struct {
+// Catalog is an injected, instance-scoped permission catalog. It is populated
+// at the composition root (or by a test helper) and sealed before serving, so
+// the per-request read path is lock-free after startup.
+type Catalog struct {
+	mu       sync.RWMutex
 	order    []Permission
 	owners   map[Permission]string
 	grants   map[Permission][]string
 	platform map[Permission]struct{}
 	roles    map[string]map[Permission]struct{}
+	sealed   bool
 }
 
-var (
-	registerMu sync.Mutex
-	state      atomic.Pointer[catalogState]
-)
-
-func init() {
-	shared := []Grant{
-		{Permission: PermissionAdminUsersRead},
-		{Permission: PermissionAdminUsersWrite},
-		{Permission: PermissionAdminUsersDelete},
-		{Permission: PermissionAdminUsersRole},
-		{Permission: PermissionAdminUsersBan},
-		{Permission: PermissionAdminFilesRead},
-		{Permission: PermissionAdminFilesDelete},
-		{Permission: PermissionAdminFilesRestore},
-		{Permission: PermissionAdminStatsRead},
-		{Permission: PermissionPlatformTenantsRead, Platform: true},
-		{Permission: PermissionPlatformTenantsWrite, Platform: true},
-		{Permission: PermissionPlatformFeaturesWrite, Platform: true},
-		{Permission: PermissionPlatformUsersMFAReset, Platform: true},
-	}
-	state.Store(&catalogState{
+// NewCatalog returns a catalog pre-populated with the shared platform grants.
+// It is unsealed so the composition root can add module providers.
+func NewCatalog() *Catalog {
+	c := &Catalog{
 		owners:   map[Permission]string{},
 		grants:   map[Permission][]string{},
 		platform: map[Permission]struct{}{},
@@ -117,68 +110,102 @@ func init() {
 			RoleOwner:         {},
 			RolePlatformAdmin: {},
 		},
-	})
-	if err := Register(platformOwner, shared...); err != nil {
+	}
+	// Shared grants are trusted constants; a failure here is a build bug.
+	if err := c.Add(Provider{Owner: platformOwner, Grants: sharedGrants}); err != nil {
 		panic(err)
 	}
+	return c
 }
 
-// Register adds owner's permissions to the catalog. It fails on an invalid
-// permission identifier, an unknown role, a permission listed twice, or a
-// permission already registered by a different owner or with different
-// roles. Re-registering the identical grants for the same owner is a no-op,
-// so building the application more than once in a process (tests) is safe.
-// Call it during startup, before serving requests.
-func Register(owner string, grants ...Grant) error {
-	if owner == "" {
-		return fmt.Errorf("authz: register: owner is required")
-	}
-	registerMu.Lock()
-	defer registerMu.Unlock()
+var sharedGrants = []Grant{
+	{Permission: PermissionAdminUsersRead},
+	{Permission: PermissionAdminUsersWrite},
+	{Permission: PermissionAdminUsersDelete},
+	{Permission: PermissionAdminUsersRole},
+	{Permission: PermissionAdminUsersBan},
+	{Permission: PermissionAdminFilesRead},
+	{Permission: PermissionAdminFilesDelete},
+	{Permission: PermissionAdminFilesRestore},
+	{Permission: PermissionAdminStatsRead},
+	{Permission: PermissionPlatformTenantsRead, Platform: true},
+	{Permission: PermissionPlatformTenantsWrite, Platform: true},
+	{Permission: PermissionPlatformFeaturesRead, Platform: true},
+	{Permission: PermissionPlatformFeaturesWrite, Platform: true},
+	{Permission: PermissionPlatformUsersMFAReset, Platform: true},
+}
 
-	current := state.Load()
-	next := current.clone()
-	seen := make(map[Permission]struct{}, len(grants))
-	for _, grant := range grants {
+// Add contributes owner's grants. It fails on an invalid permission
+// identifier, an unknown role, a permission listed twice, a permission already
+// registered by a different owner or with different roles, and on a sealed
+// catalog. Re-adding the identical grants for the same owner is a no-op. A
+// failed call adds nothing.
+func (c *Catalog) Add(provider Provider) error {
+	if provider.Owner == "" {
+		return fmt.Errorf("authz: add: owner is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sealed {
+		return fmt.Errorf("authz: %s: catalog is sealed", provider.Owner)
+	}
+
+	type pendingGrant struct {
+		permission Permission
+		roles      []string
+		platform   bool
+	}
+	pending := make([]pendingGrant, 0, len(provider.Grants))
+	seen := make(map[Permission]struct{}, len(provider.Grants))
+	for _, grant := range provider.Grants {
 		p := grant.Permission
 		if !permissionPattern.MatchString(string(p)) {
-			return fmt.Errorf("authz: %s: invalid permission %q (want lower-case segments joined by ':')", owner, p)
+			return fmt.Errorf("authz: %s: invalid permission %q (want lower-case segments joined by ':')", provider.Owner, p)
 		}
 		if _, dup := seen[p]; dup {
-			return fmt.Errorf("authz: %s: permission %q listed twice", owner, p)
+			return fmt.Errorf("authz: %s: permission %q listed twice", provider.Owner, p)
 		}
 		seen[p] = struct{}{}
 
 		roles, err := normalizeRoles(grant)
 		if err != nil {
-			return fmt.Errorf("authz: %s: permission %q: %w", owner, p, err)
+			return fmt.Errorf("authz: %s: permission %q: %w", provider.Owner, p, err)
 		}
-		if existingOwner, exists := current.owners[p]; exists {
-			if existingOwner != owner {
-				return fmt.Errorf("authz: permission %q registered by %q is already owned by %q", p, owner, existingOwner)
+		if existingOwner, exists := c.owners[p]; exists {
+			if existingOwner != provider.Owner {
+				return fmt.Errorf("authz: permission %q registered by %q is already owned by %q", p, provider.Owner, existingOwner)
 			}
-			_, wasPlatform := current.platform[p]
-			if !slices.Equal(current.grants[p], roles) || wasPlatform != grant.Platform {
-				return fmt.Errorf("authz: %s: permission %q re-registered with roles %v (was %v)", owner, p, roles, current.grants[p])
+			_, wasPlatform := c.platform[p]
+			if !slices.Equal(c.grants[p], roles) || wasPlatform != grant.Platform {
+				return fmt.Errorf("authz: %s: permission %q re-registered with roles %v (was %v)", provider.Owner, p, roles, c.grants[p])
 			}
 			continue
 		}
-		next.order = append(next.order, p)
-		next.owners[p] = owner
-		next.grants[p] = roles
-		if grant.Platform {
-			next.platform[p] = struct{}{}
-			next.roles[RolePlatformAdmin][p] = struct{}{}
+		pending = append(pending, pendingGrant{permission: p, roles: roles, platform: grant.Platform})
+	}
+	for _, grant := range pending {
+		c.order = append(c.order, grant.permission)
+		c.owners[grant.permission] = provider.Owner
+		c.grants[grant.permission] = grant.roles
+		if grant.platform {
+			c.platform[grant.permission] = struct{}{}
+			c.roles[RolePlatformAdmin][grant.permission] = struct{}{}
 		} else {
-			next.roles[RoleAdmin][p] = struct{}{}
-			next.roles[RoleOwner][p] = struct{}{}
-			for _, role := range roles {
-				next.roles[role][p] = struct{}{}
+			c.roles[RoleAdmin][grant.permission] = struct{}{}
+			c.roles[RoleOwner][grant.permission] = struct{}{}
+			for _, role := range grant.roles {
+				c.roles[role][grant.permission] = struct{}{}
 			}
 		}
 	}
-	state.Store(next)
 	return nil
+}
+
+// Seal prevents further additions.
+func (c *Catalog) Seal() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sealed = true
 }
 
 // normalizeRoles validates a grant and returns the member roles it lists,
@@ -208,38 +235,13 @@ func normalizeRoles(grant Grant) ([]string, error) {
 	return out, nil
 }
 
-func (s *catalogState) clone() *catalogState {
-	next := &catalogState{
-		order:    slices.Clone(s.order),
-		owners:   make(map[Permission]string, len(s.owners)),
-		grants:   make(map[Permission][]string, len(s.grants)),
-		platform: make(map[Permission]struct{}, len(s.platform)),
-		roles:    make(map[string]map[Permission]struct{}, len(s.roles)),
-	}
-	for p, owner := range s.owners {
-		next.owners[p] = owner
-	}
-	for p, roles := range s.grants {
-		next.grants[p] = roles
-	}
-	for p := range s.platform {
-		next.platform[p] = struct{}{}
-	}
-	for role, perms := range s.roles {
-		copied := make(map[Permission]struct{}, len(perms))
-		for p := range perms {
-			copied[p] = struct{}{}
-		}
-		next.roles[role] = copied
-	}
-	return next
-}
-
 // PermissionsForRole returns a copy of the permission set granted to role.
 // Unknown roles yield an empty, non-nil map. Callers may mutate the result
-// without affecting the shared catalog.
-func PermissionsForRole(role string) map[Permission]struct{} {
-	granted := state.Load().roles[canonicalRole(role)]
+// without affecting the catalog.
+func (c *Catalog) PermissionsForRole(role string) map[Permission]struct{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	granted := c.roles[role]
 	out := make(map[Permission]struct{}, len(granted))
 	for p := range granted {
 		out[p] = struct{}{}
@@ -248,40 +250,38 @@ func PermissionsForRole(role string) map[Permission]struct{} {
 }
 
 // Has reports whether role is granted permission p.
-func Has(role string, p Permission) bool {
-	_, ok := state.Load().roles[canonicalRole(role)][p]
+func (c *Catalog) Has(role string, p Permission) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.roles[role][p]
 	return ok
-}
-
-// canonicalRole maps the pre-RBAC "user" key, still present in tokens and
-// old rows, to member.
-func canonicalRole(role string) string {
-	if role == "user" {
-		return RoleMember
-	}
-	return role
 }
 
 // IsKnownPermission reports whether p is part of the published catalog. It is
 // used by API-key creation to reject unknown scopes instead of silently
 // creating a key that can never pass an authz.Require check.
-func IsKnownPermission(p Permission) bool {
-	_, ok := state.Load().owners[p]
+func (c *Catalog) IsKnownPermission(p Permission) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.owners[p]
 	return ok
 }
 
 // AllPermissions returns a copy of the canonical permission catalog in
 // registration order (shared entries first, then modules in registry order).
-func AllPermissions() []Permission {
-	return slices.Clone(state.Load().order)
+func (c *Catalog) AllPermissions() []Permission {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return slices.Clone(c.order)
 }
 
 // AllTenantPermissions returns the tenant-scoped permissions in catalog order.
-func AllTenantPermissions() []Permission {
-	current := state.Load()
-	out := make([]Permission, 0, len(current.order))
-	for _, p := range current.order {
-		if _, platform := current.platform[p]; !platform {
+func (c *Catalog) AllTenantPermissions() []Permission {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]Permission, 0, len(c.order))
+	for _, p := range c.order {
+		if _, platform := c.platform[p]; !platform {
 			out = append(out, p)
 		}
 	}
@@ -290,11 +290,12 @@ func AllTenantPermissions() []Permission {
 
 // AllPlatformPermissions returns the platform-scoped permissions in catalog
 // order.
-func AllPlatformPermissions() []Permission {
-	current := state.Load()
-	out := make([]Permission, 0, len(current.platform))
-	for _, p := range current.order {
-		if _, platform := current.platform[p]; platform {
+func (c *Catalog) AllPlatformPermissions() []Permission {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]Permission, 0, len(c.platform))
+	for _, p := range c.order {
+		if _, platform := c.platform[p]; platform {
 			out = append(out, p)
 		}
 	}
@@ -302,14 +303,18 @@ func AllPlatformPermissions() []Permission {
 }
 
 // IsPlatformPermission reports whether p is platform-scoped.
-func IsPlatformPermission(p Permission) bool {
-	_, ok := state.Load().platform[p]
+func (c *Catalog) IsPlatformPermission(p Permission) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.platform[p]
 	return ok
 }
 
 // OwnerOf returns the owner that registered p ("platform" for the shared
 // catalog) and whether p is known.
-func OwnerOf(p Permission) (string, bool) {
-	owner, ok := state.Load().owners[p]
+func (c *Catalog) OwnerOf(p Permission) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	owner, ok := c.owners[p]
 	return owner, ok
 }

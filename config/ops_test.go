@@ -18,7 +18,7 @@ func writeSecretFile(t *testing.T, content string) string {
 
 func TestLoad_ReadsSecretsFromFiles(t *testing.T) {
 	t.Setenv("JWT_SECRET", "")
-	t.Setenv("JWT_SECRET_FILE", writeSecretFile(t, "file-jwt-secret-at-least-32-characters\n"))
+	t.Setenv("JWT_SECRET_FILE", writeSecretFile(t, prodJWTKey+"\n"))
 	t.Setenv("DB_PASSWORD", "")
 	t.Setenv("DB_PASSWORD_FILE", writeSecretFile(t, "db pass with spaces \r\n"))
 
@@ -26,7 +26,7 @@ func TestLoad_ReadsSecretsFromFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if cfg.JWT.Secret != "file-jwt-secret-at-least-32-characters" {
+	if cfg.JWT.Secret != prodJWTKey {
 		t.Errorf("JWT secret = %q, want the file content without its trailing newline", cfg.JWT.Secret)
 	}
 	if cfg.DB.Password != "db pass with spaces " {
@@ -62,7 +62,7 @@ func TestLoad_SecretFileErrors(t *testing.T) {
 
 func TestValidate_JWTPreviousSecrets(t *testing.T) {
 	cfg := productionValidConfig()
-	cfg.JWT.PreviousSecrets = strings.Repeat("p", 32) + ", " + strings.Repeat("q", 32)
+	cfg.JWT.PreviousSecrets = []string{testOAuthKey, " " + testDataKey}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid previous secrets rejected: %v", err)
 	}
@@ -70,12 +70,12 @@ func TestValidate_JWTPreviousSecrets(t *testing.T) {
 		t.Fatalf("PreviousSecretList() = %d entries, want 2", len(got))
 	}
 
-	cfg.JWT.PreviousSecrets = "short"
+	cfg.JWT.PreviousSecrets = []string{"short"}
 	if err := cfg.Validate(); err == nil {
-		t.Error("a short previous JWT secret must be rejected outside local/test")
+		t.Error("a previous JWT secret that is not base64 32 bytes must be rejected")
 	}
 
-	cfg.JWT.PreviousSecrets = cfg.JWT.Secret
+	cfg.JWT.PreviousSecrets = []string{cfg.JWT.Secret}
 	if err := cfg.Validate(); err == nil {
 		t.Error("the active JWT secret must not be listed as a previous secret")
 	}
@@ -103,46 +103,114 @@ func TestValidate_DataEncryptionKey(t *testing.T) {
 			t.Fatal("a short DATA_ENCRYPTION_KEY must be rejected")
 		}
 	})
-	t.Run("local falls back to JWT secret", func(t *testing.T) {
+	t.Run("local has no fallback", func(t *testing.T) {
 		cfg := baseValidConfig()
-		if err := cfg.Validate(); err != nil {
-			t.Fatalf("local config without DATA_ENCRYPTION_KEY: %v", err)
+		cfg.DataEncryption.Key = ""
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("DATA_ENCRYPTION_KEY must be required in every environment")
 		}
-		if got := cfg.DataEncryption.ResolvedKey(cfg.JWT.Secret); got != cfg.JWT.Secret {
-			t.Fatalf("ResolvedKey() = %q, want the JWT secret fallback", got)
+	})
+	t.Run("resolved key is the dedicated key", func(t *testing.T) {
+		cfg := baseValidConfig()
+		if got := cfg.DataEncryption.ResolvedKey(); got != testDataKey {
+			t.Fatalf("ResolvedKey() = %q, want the dedicated key", got)
 		}
 	})
 	t.Run("previous keys", func(t *testing.T) {
 		cfg := productionValidConfig()
 		// The old JWT secret is the expected previous key when migrating.
-		cfg.DataEncryption.PreviousKeys = cfg.JWT.Secret
+		cfg.DataEncryption.PreviousKeys = []string{cfg.JWT.Secret}
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("JWT secret as previous data key rejected: %v", err)
 		}
-		cfg.DataEncryption.PreviousKeys = cfg.DataEncryption.Key
+		cfg.DataEncryption.PreviousKeys = []string{cfg.DataEncryption.Key}
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("the active data key must not be listed as a previous key")
 		}
-		cfg.DataEncryption.PreviousKeys = "short"
+		cfg.DataEncryption.PreviousKeys = []string{"short"}
 		if err := cfg.Validate(); err == nil {
-			t.Fatal("a short previous data key must be rejected outside local/test")
+			t.Fatal("a previous data key that is not base64 32 bytes must be rejected")
 		}
 	})
 }
 
 func TestValidate_WebhookPreviousKeys(t *testing.T) {
 	cfg := productionValidConfig()
-	cfg.Webhook.SecretEncryptionPreviousKeys = strings.Repeat("o", 32)
+	cfg.Webhook.SecretEncryptionPreviousKeys = []string{testOAuthKey}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid previous webhook key rejected: %v", err)
 	}
-	cfg.Webhook.SecretEncryptionPreviousKeys = cfg.Webhook.SecretEncryptionKey
+	cfg.Webhook.SecretEncryptionPreviousKeys = []string{cfg.Webhook.SecretEncryptionKey}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("the active webhook key must not be listed as a previous key")
 	}
-	cfg.Webhook.SecretEncryptionPreviousKeys = "short"
+	cfg.Webhook.SecretEncryptionPreviousKeys = []string{"short"}
 	if err := cfg.Validate(); err == nil {
-		t.Fatal("a short previous webhook key must be rejected outside local/test")
+		t.Fatal("a previous webhook key that is not base64 32 bytes must be rejected")
+	}
+}
+
+func TestValidate_KeysAreBase64Encoded32Bytes(t *testing.T) {
+	t.Run("JWT not base64", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.JWT.Secret = "not base64!"
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "JWT_SECRET") {
+			t.Fatalf("Validate() = %v, want a JWT_SECRET encoding error", err)
+		}
+	})
+	t.Run("JWT wrong decoded length", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.JWT.Secret = "c2hvcnQ="
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "exactly 32 bytes") {
+			t.Fatalf("Validate() = %v, want a length error", err)
+		}
+	})
+	t.Run("valid keys accepted", func(t *testing.T) {
+		cfg := baseValidConfig()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("valid keys rejected: %v", err)
+		}
+	})
+	t.Run("keys are distinct per purpose", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.SecretEncryptionKey = cfg.DataEncryption.Key
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must differ") {
+			t.Fatalf("Validate() = %v, want a key-separation error", err)
+		}
+	})
+	t.Run("OAuth state key required with Google", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.OAuth.GoogleClientID = "client"
+		cfg.OAuth.GoogleClientSecret = testCredential("google", "fixture")
+		cfg.OAuth.StateKey = ""
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "OAUTH_STATE_KEY") {
+			t.Fatalf("Validate() = %v, want OAUTH_STATE_KEY required", err)
+		}
+	})
+	t.Run("OAuth state key is independent", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.OAuth.StateKey = "short"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("a short OAUTH_STATE_KEY must be rejected")
+		}
+	})
+}
+
+func TestValidate_RefreshCookieModeCORS(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.JWT.RefreshCookie = true
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("cookie mode must reject wildcard CORS origins")
+	}
+	cfg.CORS.AllowOrigins = []string{"https://app.example.com"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cookie mode with explicit origins rejected: %v", err)
+	}
+
+	cfg = baseValidConfig()
+	cfg.CORS.AllowCredentials = true
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("CORS credentials must require cookie mode")
 	}
 }
 
@@ -176,7 +244,7 @@ func TestAppRole(t *testing.T) {
 
 func TestJobsConfig(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.Jobs = JobsConfig{WorkerKinds: "webhook.delivery, events.file.uploaded.webhooks", WorkerExcludeKinds: "email.send"}
+	cfg.Jobs = JobsConfig{WorkerKinds: []string{"webhook.delivery", " events.file.uploaded.webhooks"}, WorkerExcludeKinds: []string{"email.send.encrypted"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("disjoint kind filters rejected: %v", err)
 	}
@@ -184,7 +252,7 @@ func TestJobsConfig(t *testing.T) {
 		t.Fatalf("WorkerKindList() = %v", got)
 	}
 
-	cfg.Jobs.WorkerExcludeKinds = "webhook.delivery"
+	cfg.Jobs.WorkerExcludeKinds = []string{"webhook.delivery"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("a kind both included and excluded must be rejected")
 	}
@@ -220,13 +288,13 @@ func TestDBConfig_QueryExecModeAndMigrationTarget(t *testing.T) {
 		t.Fatal("ForMigration must not modify the API settings")
 	}
 
-	db = DBConfig{Host: "db", Username: "app", Password: "app-password"}
-	db.MigrateUsername, db.MigratePassword = "owner", "owner-password"
+	db = DBConfig{Host: "db", Username: "app", Password: testCredential("app", "fixture")}
+	db.MigrateUsername, db.MigratePassword = "owner", testCredential("owner", "fixture")
 	got := db.ForMigration()
-	if got.Username != "owner" || got.Password != "owner-password" {
+	if got.Username != "owner" || got.Password != testCredential("owner", "fixture") {
 		t.Fatalf("ForMigration() credentials = %q/%q, want the DB_MIGRATE_* role", got.Username, got.Password)
 	}
-	if db.Username != "app" || db.Password != "app-password" {
+	if db.Username != "app" || db.Password != testCredential("app", "fixture") {
 		t.Fatal("ForMigration must not modify the API credentials")
 	}
 }

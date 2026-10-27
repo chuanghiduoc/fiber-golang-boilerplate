@@ -75,8 +75,8 @@ UPDATE api_keys
 SET rotated_at = NOW(),
     rotation_grace_until = NOW() + make_interval(secs => @grace_seconds::int),
     updated_at = NOW()
-WHERE id = @id::bigint
-  AND tenant_id = @tenant_id::bigint
+WHERE id = @id::uuid
+  AND tenant_id = @tenant_id::uuid
   AND revoked_at IS NULL
   AND rotated_at IS NULL
 RETURNING *,
@@ -95,7 +95,22 @@ SELECT api_keys.*,
              WHERE s.api_key_id = api_keys.id
              ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
 FROM api_keys
-WHERE tenant_id = @tenant_id::bigint
-  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+WHERE tenant_id = @tenant_id::uuid
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;
+
+-- name: ListAPIKeysByUserCursor :many
+-- One member's keys for /me/api-keys and /members/{memberId}/api-keys. The
+-- tenant predicate keeps RLS and the explicit scope aligned; user_id narrows
+-- the page without ever exposing another member's rows.
+SELECT api_keys.*,
+       ARRAY(SELECT s.permission_key FROM api_key_scopes s
+             WHERE s.api_key_id = api_keys.id
+             ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
+FROM api_keys
+WHERE tenant_id = @tenant_id::uuid
+  AND user_id = @user_id::uuid
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;

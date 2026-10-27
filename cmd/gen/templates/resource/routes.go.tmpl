@@ -1,35 +1,84 @@
 package {{.M.Name}}
 
 import (
-	"github.com/gofiber/fiber/v3"
+	"context"
+	"net/http"
 
-	"{{.M.ModulePath}}/internal/app"
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
-	"{{.M.ModulePath}}/internal/platform/audit/audithttp"
-	"{{.M.ModulePath}}/internal/platform/authz/authzhttp"
+	{{.M.Ident}}dto "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/dto"
+	{{.M.Ident}}handler "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/handler"
+	"{{.M.ModulePath}}/internal/platform/httpapi"
 )
 
-// register{{.R.Pascal}}Routes mounts the {{.R.Human}} CRUD routes on the module
-// group (already authenticated). Mutations are Tier 2 audited: a required
-// intent row is written after idempotency and before the handler, so an
-// unavailable audit store rejects the change with 503.
-func (m *Module) register{{.R.Pascal}}Routes(group fiber.Router, deps app.Deps) {
+// register{{.R.Pascal}}Routes declares the {{.R.Human}} CRUD operations. The
+// policy carries the permission, rate tier, idempotency, and audit contract:
+// mutations are Tier 2 guarded (a required intent row after idempotency), and
+// PATCH/GET expose the updated_at ETag for conditional updates.
+func (m *Module) register{{.R.Pascal}}Routes(api *httpapi.API) {
+	const collection = "/api/v1/{{.M.Route}}/{{.R.PluralRoute}}"
 	h := m.handlers.{{.R.PluralPascal}}
-	rl := deps.Limiters
-	guard := func(action string) fiber.Handler {
-		return audithttp.Guard(deps.Audit, audithttp.Policy{
-			Mode:     audithttp.ModeRequired,
-			Action:   action,
-			Resource: "{{.R.Table}}",
-		})
-	}
-	read := authzhttp.Require({{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read)
-	write := authzhttp.Require({{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write)
-	remove := authzhttp.Require({{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Delete)
 
-	group.Get("/{{.R.PluralRoute}}", rl.Relaxed, read, h.List)
-	group.Get("/{{.R.PluralRoute}}/:id", rl.Relaxed, read, h.Get)
-	group.Post("/{{.R.PluralRoute}}", rl.Normal, write, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.created"), h.Create)
-	group.Patch("/{{.R.PluralRoute}}/:id", rl.Normal, write, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.updated"), h.Patch)
-	group.Delete("/{{.R.PluralRoute}}/:id", rl.Normal, remove, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.deleted"), h.Delete)
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: collection, OperationID: "list{{.M.Pascal}}{{.R.PluralPascal}}",
+		Tags: []string{"{{.M.Route}}"}, Summary: "List {{.R.HumanPlural}}",
+		Description: "Cursor-paginated, newest first.",
+	}, httpapi.Policy{
+		Permission: {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read,
+		RateLimit:  httpapi.RateLimitRelaxed,
+	}, func(ctx context.Context, in *{{.M.Ident}}handler.List{{.R.PluralPascal}}Input) (*httpapi.ListOutput[{{.M.Ident}}dto.{{.R.Pascal}}Response], error) {
+		return h.List(ctx, in)
+	})
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: collection + "/{id}", OperationID: "get{{.R.Pascal}}",
+		Tags: []string{"{{.M.Route}}"}, Summary: "Get a {{.R.Human}}",
+	}, httpapi.Policy{
+		Permission: {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read,
+		RateLimit:  httpapi.RateLimitRelaxed,
+	}, func(ctx context.Context, in *{{.M.Ident}}handler.{{.R.Pascal}}IDInput) (*httpapi.ETagOutput[{{.M.Ident}}dto.{{.R.Pascal}}Response], error) {
+		return h.Get(ctx, in)
+	})
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: collection, OperationID: "create{{.R.Pascal}}",
+		Tags: []string{"{{.M.Route}}"}, Summary: "Create a {{.R.Human}}",
+	}, httpapi.Policy{
+		Permission: {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write,
+		RateLimit:  httpapi.RateLimitNormal,
+		Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: &httpapi.GuardPolicy{
+			Action: "{{.M.Name}}.{{.R.Name}}.created", Resource: "{{.R.Table}}",
+		}},
+	}, func(ctx context.Context, in *{{.M.Ident}}handler.Create{{.R.Pascal}}Input) (*httpapi.Created[{{.M.Ident}}dto.{{.R.Pascal}}Response], error) {
+		return h.Create(ctx, in)
+	})
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPatch, Path: collection + "/{id}", OperationID: "patch{{.R.Pascal}}",
+		Tags: []string{"{{.M.Route}}"}, Summary: "Update a {{.R.Human}}",
+		Description: "RFC 7396 merge patch. If-Match is compared inside the UPDATE.",
+	}, httpapi.Policy{
+		Permission: {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write,
+		RateLimit:  httpapi.RateLimitNormal,
+		Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: &httpapi.GuardPolicy{
+			Action: "{{.M.Name}}.{{.R.Name}}.updated", Resource: "{{.R.Table}}",
+		}},
+	}, func(ctx context.Context, in *{{.M.Ident}}handler.Patch{{.R.Pascal}}Input) (*httpapi.ETagOutput[{{.M.Ident}}dto.{{.R.Pascal}}Response], error) {
+		return h.Patch(ctx, in)
+	})
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodDelete, Path: collection + "/{id}", OperationID: "delete{{.R.Pascal}}",
+		Tags: []string{"{{.M.Route}}"}, Summary: "Delete a {{.R.Human}}",
+	}, httpapi.Policy{
+		Permission: {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Delete,
+		RateLimit:  httpapi.RateLimitNormal,
+		Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: &httpapi.GuardPolicy{
+			Action: "{{.M.Name}}.{{.R.Name}}.deleted", Resource: "{{.R.Table}}",
+		}},
+	}, func(ctx context.Context, in *{{.M.Ident}}handler.{{.R.Pascal}}IDInput) (*httpapi.Empty, error) {
+		return h.Delete(ctx, in)
+	})
 }

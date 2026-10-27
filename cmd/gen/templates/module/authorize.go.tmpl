@@ -13,5 +13,5 @@ import (
 // (authz.Authorize denies a context with neither a subject nor
 // authz.SystemContext).
 func authorize(ctx context.Context, permission authz.Permission) error {
-	return authz.Authorize(ctx, permission, authz.Resource{TenantID: tenant.EffectiveID(ctx)}, authz.TenantPolicy{})
+	return authz.Authorize(ctx, permission, authz.Resource{TenantID: tenant.IDFromContext(ctx)}, authz.TenantPolicy{})
 }

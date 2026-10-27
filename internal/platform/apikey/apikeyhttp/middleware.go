@@ -3,10 +3,10 @@
 package apikeyhttp
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
@@ -30,7 +30,8 @@ import (
 // A key can
 // therefore never exceed its recorded scopes or the owner's current
 // permissions, even when its owner is an administrator.
-func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier) fiber.Handler {
+func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier, catalog *authz.Catalog) fiber.Handler {
+	authorizer := authz.NewAuthorizer(catalog)
 	return func(c fiber.Ctx) error {
 		header := c.Get(fiber.HeaderAuthorization)
 		scheme, credential, ok := parseAuthorization(header)
@@ -53,7 +54,7 @@ func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier) fiber.Han
 		// an absent header to the default tenant; that must not make a
 		// non-default key fail. The key's tenant is authoritative otherwise.
 		headerSlug := strings.TrimSpace(c.Get(tenant.Header))
-		expectedTenantID := int64(0)
+		expectedTenantID := uuid.Nil
 		if headerSlug != "" {
 			expectedTenantID = tenanthttp.ID(c)
 		}
@@ -70,22 +71,17 @@ func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier) fiber.Han
 		// default resolution, the resolved slug describes another tenant, so
 		// clear it rather than leave a misleading value for link builders.
 		resolvedTenantID := tenanthttp.ID(c)
-		if headerSlug == "" && resolvedTenantID != 0 && resolvedTenantID != key.TenantID {
-			fiber.Locals[string](c, "tenant_slug", "")
+		if headerSlug == "" && resolvedTenantID != uuid.Nil && resolvedTenantID != key.TenantID {
 			c.SetContext(tenant.WithSlug(c.Context(), ""))
 		}
 
-		fiber.Locals[int64](c, apikey.LocalAPIKeyID, key.ID)
-		fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodAPIKey)
-		fiber.Locals[int64](c, "user_id", principal.ID)
-		fiber.Locals[string](c, "email", principal.Email)
-		fiber.Locals[string](c, "role", principal.Role)
-		fiber.Locals[int64](c, "tenant_id", key.TenantID)
 		c.SetContext(tenant.WithID(c.Context(), key.TenantID))
+		c.SetContext(apikey.WithAPIKeyID(c.Context(), key.ID))
+		c.SetContext(apikey.WithAuthMethod(c.Context(), apikey.AuthMethodAPIKey))
 
-		subject := authz.NewSubjectWithPermissions(principal.ID, key.TenantID, principal.Role, effectiveScopes(principal, key.Scopes)...).
+		subject := authz.NewSubjectWithPermissions(principal.ID, key.TenantID, principal.Role, effectiveScopes(principal, key.Scopes, authorizer)...).
 			WithAttribute(authz.AttributeAuthMethod, apikey.AuthMethodAPIKey).
-			WithAttribute(authz.AttributeAPIKeyID, strconv.FormatInt(key.ID, 10))
+			WithAttribute(authz.AttributeAPIKeyID, key.ID.String())
 		subject.CrossTenant = principal.Platform
 		authzhttp.SetSubject(c, subject)
 
@@ -93,11 +89,11 @@ func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier) fiber.Han
 		// context, so the actor and request metadata must be there too, exactly
 		// as JWTAuth installs them. The audit actor model has no credential
 		// field; the key id stays on the authz subject (AttributeAPIKeyID) and
-		// the api_key_id local.
+		// the request context.
 		c.SetContext(requestctx.WithActorID(c.Context(), principal.ID))
 		ctx := audit.WithActor(c.Context(), principal.ID, principal.Role)
 		ctx = audit.WithRequestMeta(ctx,
-			fiber.Locals[string](c, "request_id"), c.IP(), c.Get("User-Agent"))
+			requestctx.RequestID(c.Context()), c.IP(), c.Get("User-Agent"))
 		c.SetContext(ctx)
 
 		return c.Next()
@@ -109,22 +105,22 @@ func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier) fiber.Han
 // therefore loses it immediately after a role change, matching the principal
 // revalidation performed on every request. A principal without a loaded
 // permission set (tests, minimal deployments) falls back to its role.
-func effectiveScopes(principal identitycontracts.Principal, scopes []authz.Permission) []authz.Permission {
+func effectiveScopes(principal identitycontracts.Principal, scopes []authz.Permission, authorizer authz.Authorizer) []authz.Permission {
 	if principal.Role == "" && principal.Permissions == nil {
 		return scopes
 	}
 	effective := make([]authz.Permission, 0, len(scopes))
 	for _, scope := range scopes {
-		if hasPermission(principal, scope) {
+		if hasPermission(principal, scope, authorizer) {
 			effective = append(effective, scope)
 		}
 	}
 	return effective
 }
 
-func hasPermission(principal identitycontracts.Principal, permission authz.Permission) bool {
+func hasPermission(principal identitycontracts.Principal, permission authz.Permission, authorizer authz.Authorizer) bool {
 	if principal.Permissions == nil {
-		return principal.Role != "" && authz.Has(principal.Role, permission)
+		return principal.Role != "" && authorizer.Has(principal.Role, permission)
 	}
 	for _, granted := range principal.Permissions {
 		if granted == string(permission) {

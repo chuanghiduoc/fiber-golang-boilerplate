@@ -4,7 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/google/uuid"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 )
 
 // UserEvent is one audit row a user produced in one tenant, for a GDPR
@@ -24,7 +26,7 @@ type UserEvent struct {
 // is append-only and platform-owned, so the read lives here rather than in a
 // module query.
 type UserEventReader interface {
-	ListUserEvents(ctx context.Context, tenantID, userID int64, limit int32) ([]UserEvent, error)
+	ListUserEvents(ctx context.Context, tenantID, userID uuid.UUID, limit int32) ([]UserEvent, error)
 }
 
 // PostgresUserEventReader implements UserEventReader over audit_events.
@@ -45,7 +47,7 @@ WHERE tenant_id = $1 AND actor_id = $2
 ORDER BY created_at DESC, id DESC
 LIMIT $3`
 
-func (r *PostgresUserEventReader) ListUserEvents(ctx context.Context, tenantID, userID int64, limit int32) ([]UserEvent, error) {
+func (r *PostgresUserEventReader) ListUserEvents(ctx context.Context, tenantID, userID uuid.UUID, limit int32) ([]UserEvent, error) {
 	rows, err := r.db.Query(ctx, listUserAuditEventsSQL, tenantID, userID, limit)
 	if err != nil {
 		return nil, err

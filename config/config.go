@@ -5,6 +5,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -25,6 +26,7 @@ type Config struct {
 	Admin        AdminConfig
 	Tenant       TenantConfig
 	Tracing      TracingConfig
+	Metrics      MetricsConfig
 	I18N         I18NConfig
 	FeatureFlags FeatureFlagsConfig
 	Scheduler    SchedulerConfig
@@ -40,6 +42,8 @@ type Config struct {
 	Password PasswordConfig
 	// MFA bounds how long a second-factor verification stays valid.
 	MFA MFAConfig
+	// WebAuthn configures the passkey relying party.
+	WebAuthn WebAuthnConfig
 }
 
 func Load() (*Config, error) {
@@ -127,23 +131,24 @@ func LoadSeed() (*Config, error) {
 	return cfg, nil
 }
 
-// Validate checks every section and returns the first violation. The order is
-// part of the contract: when several settings are wrong, operators see the
-// same first error as before, so the steps below are listed in the order they
-// run rather than grouped by section.
+// Validate checks every section and joins every violation, so an operator
+// sees every misconfigured setting in one startup failure instead of fixing
+// them one restart at a time. The order is still stable: general checks run
+// first, then the production-only safety rails.
 func (cfg *Config) Validate() error {
 	checks := []func() error{
 		cfg.App.validate,
 		// The sample JWT secret is public and must never sign tokens outside
 		// local/test, so secrets are checked before any other section.
-		func() error { return cfg.JWT.validateSigningSecret(cfg.App.Env) },
+		cfg.JWT.validateSigningSecret,
 		func() error { return cfg.Admin.validate(cfg.App.Env) },
 		cfg.JWT.validate,
 		cfg.Tenant.validate,
 		cfg.FeatureFlags.validate,
-		func() error { return cfg.Webhook.validate(cfg.App.Env, cfg.JWT.Secret) },
+		func() error { return cfg.Webhook.validate(cfg.App.Env) },
 		cfg.APIKeys.validate,
-		func() error { return cfg.DataEncryption.validate(cfg.App.Env, cfg.JWT.Secret) },
+		cfg.DataEncryption.validate,
+		cfg.validateKeySeparation,
 		cfg.Jobs.validate,
 		cfg.App.validateBodyLimits,
 		cfg.RateLimit.validate,
@@ -152,21 +157,30 @@ func (cfg *Config) Validate() error {
 		cfg.DB.Validate,
 		// Observability: tracing is inert unless explicitly enabled.
 		cfg.Tracing.Validate,
+		cfg.Metrics.Validate,
 		cfg.Scheduler.Validate,
 		cfg.Retention.validate,
 		cfg.Cache.Validate,
 		cfg.Email.validate,
 		cfg.CORS.validate,
+		func() error { return cfg.CORS.validateSessionMode(cfg.JWT.RefreshCookie) },
 		cfg.App.validateTrustedProxies,
 		cfg.OAuth.validate,
 		cfg.Password.validate,
 		cfg.MFA.validate,
+		cfg.WebAuthn.validate,
 		cfg.Storage.validateDriver,
 	}
 	if cfg.App.Env == envProduction {
 		checks = append(checks, cfg.productionChecks()...)
 	}
-	return firstError(checks)
+	var errs []error
+	for _, check := range checks {
+		if err := check(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // productionChecks are safety rails that would break local development
@@ -185,26 +199,42 @@ func (cfg *Config) productionChecks() []func() error {
 		cfg.Storage.validateProductionTransport,
 		cfg.OAuth.validateProduction,
 		cfg.App.validateProductionMetricsToken,
+		cfg.WebAuthn.validateProduction,
 	}
 }
 
-// firstError runs checks in order and returns the first failure.
-func firstError(checks []func() error) error {
-	for _, check := range checks {
-		if err := check(); err != nil {
-			return err
+// validateKeySeparation enforces one key per purpose (NIST SP 800-57): the
+// active signing, payload-encryption, webhook-encryption, and OAuth state keys
+// must all be distinct, so a compromise or rotation of one cannot affect the
+// others.
+func (cfg *Config) validateKeySeparation() error {
+	keys := []struct {
+		name  string
+		value string
+	}{
+		{"JWT_SECRET", strings.TrimSpace(cfg.JWT.Secret)},
+		{"DATA_ENCRYPTION_KEY", strings.TrimSpace(cfg.DataEncryption.Key)},
+		{"WEBHOOK_SECRET_ENCRYPTION_KEY", strings.TrimSpace(cfg.Webhook.SecretEncryptionKey)},
+		{"OAUTH_STATE_KEY", strings.TrimSpace(cfg.OAuth.StateKey)},
+	}
+	for i := range keys {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[i].value != "" && keys[i].value == keys[j].value {
+				return fmt.Errorf("%s must differ from %s", keys[j].name, keys[i].name)
+			}
 		}
 	}
 	return nil
 }
 
-// splitCSV splits a comma-separated string into trimmed, non-empty values.
-func splitCSV(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			out = append(out, t)
+// trimmedList trims env-parsed list entries and drops empty ones, so a
+// hand-written .env with spaces or a trailing comma behaves like the previous
+// string-based parser.
+func trimmedList(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
 		}
 	}
 	return out

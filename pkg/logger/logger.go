@@ -10,6 +10,12 @@ import (
 // env "production"/"staging" → JSON output; otherwise → Text output.
 // level is one of: debug, info, warn, error (defaults to info).
 func Setup(env, level string) {
+	SetupWith(env, level, nil)
+}
+
+// SetupWith is Setup with a handler decorator. The composition root passes the
+// context-enriching handler here; nil installs the bare handler.
+func SetupWith(env, level string, wrap func(slog.Handler) slog.Handler) {
 	lvl := parseLevel(level)
 	opts := &slog.HandlerOptions{Level: lvl}
 
@@ -19,6 +25,9 @@ func Setup(env, level string) {
 		handler = slog.NewJSONHandler(os.Stdout, opts)
 	default:
 		handler = slog.NewTextHandler(os.Stdout, opts)
+	}
+	if wrap != nil {
+		handler = wrap(handler)
 	}
 
 	slog.SetDefault(slog.New(handler))

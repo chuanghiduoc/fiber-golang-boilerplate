@@ -4,15 +4,17 @@ import (
 	"context"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+	"github.com/google/uuid"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 // Notification is one in-app notification row.
 type Notification struct {
-	ID        int64
-	TenantID  int64
-	UserID    int64
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	UserID    uuid.UUID
 	Type      string
 	Title     string
 	Body      string
@@ -21,11 +23,11 @@ type Notification struct {
 	CreatedAt time.Time
 }
 
-// Preference is one explicit channel preference row.
+// Preference is one explicit channel preference row. It has no surrogate id:
+// the natural key is (tenant, user, type, channel).
 type Preference struct {
-	ID        int64
-	TenantID  int64
-	UserID    int64
+	TenantID  uuid.UUID
+	UserID    uuid.UUID
 	Type      string
 	Channel   string
 	Enabled   bool
@@ -36,7 +38,7 @@ type Preference struct {
 // NewNotification is the input for creating an in-app row. The tenant comes
 // from the request context.
 type NewNotification struct {
-	UserID int64
+	UserID uuid.UUID
 	Type   string
 	Title  string
 	Body   string
@@ -45,7 +47,7 @@ type NewNotification struct {
 
 // NewPreference is a validated channel preference write.
 type NewPreference struct {
-	UserID  int64
+	UserID  uuid.UUID
 	Type    string
 	Channel string
 	Enabled bool
@@ -71,17 +73,18 @@ type CreateResult struct {
 // filter by user ID; no row match is apperror.ErrNotFound.
 type NotificationRepository interface {
 	Create(ctx context.Context, in NewNotification) (*Notification, error)
-	GetByID(ctx context.Context, id, userID int64) (*Notification, error)
-	ListCursor(ctx context.Context, userID int64, cur pagination.DBCursor, unreadOnly bool) ([]Notification, error)
-	CountUnread(ctx context.Context, userID int64) (int64, error)
-	MarkRead(ctx context.Context, id, userID int64) (*Notification, error)
-	MarkAllRead(ctx context.Context, userID int64) (int64, error)
-	GetPreference(ctx context.Context, userID int64, notificationType, channel string) (*Preference, error)
-	ListPreferences(ctx context.Context, userID int64) ([]Preference, error)
+	GetByID(ctx context.Context, id, userID uuid.UUID) (*Notification, error)
+	ListCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor, unreadOnly bool) ([]Notification, error)
+	CountUnread(ctx context.Context, userID uuid.UUID) (int64, error)
+	MarkRead(ctx context.Context, id, userID uuid.UUID) (*Notification, error)
+	MarkUnread(ctx context.Context, id, userID uuid.UUID) (*Notification, error)
+	MarkAllRead(ctx context.Context, userID uuid.UUID) (int64, error)
+	GetPreference(ctx context.Context, userID uuid.UUID, notificationType, channel string) (*Preference, error)
+	ListPreferences(ctx context.Context, userID uuid.UUID) ([]Preference, error)
 	UpsertPreference(ctx context.Context, in NewPreference) (*Preference, error)
 }
 
-// Mailer sends an email. Bound to a transaction it enqueues the email.send job
+// Mailer sends an email. Bound to a transaction it enqueues the email.send.encrypted job
 // so the job commits with the caller's writes.
 type Mailer interface {
 	Send(ctx context.Context, msg email.Message) error

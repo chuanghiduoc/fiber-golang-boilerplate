@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -52,9 +53,9 @@ func (s *orphanStore) Delete(_ context.Context, p string) error {
 }
 
 type orphanLookup struct {
-	existing map[int64]map[string]struct{}
+	existing map[uuid.UUID]map[string]struct{}
 	err      error
-	tenants  map[int64][]string
+	tenants  map[uuid.UUID][]string
 }
 
 func (l *orphanLookup) ExistingStoragePaths(ctx context.Context, paths []string) (map[string]struct{}, error) {
@@ -62,9 +63,9 @@ func (l *orphanLookup) ExistingStoragePaths(ctx context.Context, paths []string)
 		return nil, l.err
 	}
 	if l.tenants == nil {
-		l.tenants = make(map[int64][]string)
+		l.tenants = make(map[uuid.UUID][]string)
 	}
-	tenantID := tenant.EffectiveID(ctx)
+	tenantID := tenant.IDFromContext(ctx)
 	l.tenants[tenantID] = append(l.tenants[tenantID], paths...)
 	out := make(map[string]struct{}, len(paths))
 	for p := range l.existing[tenantID] {
@@ -77,28 +78,35 @@ func TestOrphanSweepRemovesOldUnreferencedFileBlobs(t *testing.T) {
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	old := now.Add(-2 * time.Hour)
 	fresh := now.Add(-10 * time.Minute)
+	tenantOne, tenantOther := testID(1), testID(23)
+	userOne, userOther := testID(2), testID(5)
+	orphan := blobPath(tenantOne, userOne, "orphan.png")
+	live := blobPath(tenantOne, userOne, "live.png")
+	freshBlob := blobPath(tenantOne, userOne, "fresh.png")
+	exportBlob := blobPath(tenantOne, userOne, "exports/export.json")
+	otherOrphan := blobPath(tenantOther, userOther, "orphan.png")
 	store := &orphanStore{objects: []storage.Object{
-		{Path: "1/2/orphan.png", ModifiedAt: old},
-		{Path: "1/2/live.png", ModifiedAt: old},
-		{Path: "1/2/fresh.png", ModifiedAt: fresh},
-		{Path: "1/2/exports/export.json", ModifiedAt: old},
-		{Path: "23/5/orphan.png", ModifiedAt: old},
+		{Path: orphan, ModifiedAt: old},
+		{Path: live, ModifiedAt: old},
+		{Path: freshBlob, ModifiedAt: fresh},
+		{Path: exportBlob, ModifiedAt: old},
+		{Path: otherOrphan, ModifiedAt: old},
 		{Path: "not-a-tenant/5/x.png", ModifiedAt: old},
 	}}
-	lookup := &orphanLookup{existing: map[int64]map[string]struct{}{
-		1: {"1/2/live.png": {}},
+	lookup := &orphanLookup{existing: map[uuid.UUID]map[string]struct{}{
+		tenantOne: {live: {}},
 	}}
 	sweeper := NewOrphanSweeper(lookup, store)
 	sweeper.now = func() time.Time { return now }
 
 	require.NoError(t, sweeper.HandleJob(context.Background(), nil))
-	assert.ElementsMatch(t, []string{"1/2/orphan.png", "23/5/orphan.png"}, store.deleted,
+	assert.ElementsMatch(t, []string{orphan, otherOrphan}, store.deleted,
 		"only old, three-segment, unreferenced file keys are removed")
 	for tenantID, paths := range lookup.tenants {
 		for _, p := range paths {
 			parts := strings.Split(p, "/")
 			require.Len(t, parts, 3, "the lookup must be asked only about file-shaped keys")
-			require.Equal(t, strconv.FormatInt(tenantID, 10), parts[0],
+			require.Equal(t, tenantID.String(), parts[0],
 				"each lookup must be scoped to the tenant in the path")
 		}
 	}
@@ -115,7 +123,7 @@ func TestOrphanSweepBoundsOneBatch(t *testing.T) {
 	objects := make([]storage.Object, orphanSweepDeleteBatch+10)
 	for i := range objects {
 		objects[i] = storage.Object{
-			Path:       fmt.Sprintf("1/2/%s.png", strconv.Itoa(i)),
+			Path:       blobPath(testID(1), testID(2), strconv.Itoa(i)+".png"),
 			ModifiedAt: old,
 		}
 	}
@@ -132,44 +140,48 @@ func TestOrphanSweepBoundsOneBatch(t *testing.T) {
 func TestOrphanSweepLiveObjectsDoNotStarveLaterOrphans(t *testing.T) {
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	old := now.Add(-2 * time.Hour)
+	tenantID, userID := testID(1), testID(2)
 	objects := make([]storage.Object, 0, orphanSweepDeleteBatch+1)
-	live := make(map[int64]map[string]struct{})
+	live := make(map[uuid.UUID]map[string]struct{})
 	for i := 0; i < orphanSweepDeleteBatch; i++ {
-		path := fmt.Sprintf("1/2/live-%d.png", i)
+		path := blobPath(tenantID, userID, fmt.Sprintf("live-%d.png", i))
 		objects = append(objects, storage.Object{Path: path, ModifiedAt: old})
-		if live[1] == nil {
-			live[1] = make(map[string]struct{})
+		if live[tenantID] == nil {
+			live[tenantID] = make(map[string]struct{})
 		}
-		live[1][path] = struct{}{}
+		live[tenantID][path] = struct{}{}
 	}
-	objects = append(objects, storage.Object{Path: "1/2/orphan.png", ModifiedAt: old})
+	orphan := blobPath(tenantID, userID, "orphan.png")
+	objects = append(objects, storage.Object{Path: orphan, ModifiedAt: old})
 
 	store := &orphanStore{objects: objects}
 	sweeper := NewOrphanSweeper(&orphanLookup{existing: live}, store)
 	sweeper.now = func() time.Time { return now }
 	require.NoError(t, sweeper.HandleJob(context.Background(), nil))
-	assert.Equal(t, []string{"1/2/orphan.png"}, store.deleted)
+	assert.Equal(t, []string{orphan}, store.deleted)
 }
 
 func TestOrphanSweepKeepsGoingAfterOneDeleteFailure(t *testing.T) {
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	old := now.Add(-2 * time.Hour)
+	failing := blobPath(testID(1), testID(2), "fail.png")
+	ok := blobPath(testID(1), testID(2), "ok.png")
 	store := &orphanStore{
 		objects: []storage.Object{
-			{Path: "1/2/fail.png", ModifiedAt: old},
-			{Path: "1/2/ok.png", ModifiedAt: old},
+			{Path: failing, ModifiedAt: old},
+			{Path: ok, ModifiedAt: old},
 		},
-		delErr: map[string]error{"1/2/fail.png": errors.New("s3 unavailable")},
+		delErr: map[string]error{failing: errors.New("s3 unavailable")},
 	}
 	sweeper := NewOrphanSweeper(&orphanLookup{}, store)
 	sweeper.now = func() time.Time { return now }
 	require.NoError(t, sweeper.HandleJob(context.Background(), nil))
-	assert.Equal(t, []string{"1/2/ok.png"}, store.deleted)
+	assert.Equal(t, []string{ok}, store.deleted)
 }
 
 func TestOrphanSweepErrorsOnListAndLookupFailures(t *testing.T) {
 	sweeper := NewOrphanSweeper(&orphanLookup{err: errors.New("db down")}, &orphanStore{
-		objects: []storage.Object{{Path: "1/2/x.png", ModifiedAt: time.Now().Add(-2 * time.Hour)}},
+		objects: []storage.Object{{Path: blobPath(testID(1), testID(2), "x.png"), ModifiedAt: time.Now().Add(-2 * time.Hour)}},
 	})
 	if err := sweeper.HandleJob(context.Background(), nil); err == nil {
 		t.Fatal("a lookup failure must fail the job")

@@ -14,7 +14,7 @@ func (g *generator) generateResource(ctx context.Context, module, name, pluralOv
 		"Review the migration and the " + data.R.Table + " columns, then apply it: make migrate-run",
 		"Run the generated integration test: go test -tags=integration ./internal/modules/" + module + "/...",
 		"Grant roles deliberately in internal/modules/" + module + "/catalog/permissions.go (admin-only by default)",
-		"Review the vi translation in catalog/locales/vi.json, then refresh the API spec: make swagger",
+		"Review the vi translation in catalog/locales/vi.json, then refresh the API spec: make openapi",
 	})
 }
 
@@ -94,7 +94,7 @@ func (g *generator) wireResource(p *plan, data templateData) error {
 		edit func(string) (string, error)
 	}{
 		{"service/ports.go", func(src string) (string, error) {
-			return ensureImports("service/ports.go", src+string(port), "context", m.ModulePath+"/pkg/pagination")
+			return ensureImports("service/ports.go", src+string(port), "context", "time", "github.com/google/uuid", m.ModulePath+"/pkg/pagination")
 		}},
 		{"module.go", func(src string) (string, error) {
 			out, err := insertAtMarker("module.go", src, markerHandlers,
@@ -102,7 +102,7 @@ func (g *generator) wireResource(p *plan, data templateData) error {
 			if err != nil {
 				return "", err
 			}
-			return insertAtMarker("module.go", out, markerRoutes, fmt.Sprintf("m.register%sRoutes(group, deps)", r.Pascal))
+			return insertAtMarker("module.go", out, markerRoutes, fmt.Sprintf("m.register%sRoutes(api)", r.Pascal))
 		}},
 		{"build.go", func(src string) (string, error) {
 			out, err := insertAtMarker("build.go", src, markerBuild, fmt.Sprintf(

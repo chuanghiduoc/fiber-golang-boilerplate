@@ -1,13 +1,17 @@
 package apikey
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -20,26 +24,26 @@ type fakeStore struct {
 	findErr        error
 	findCalls      int
 	touched        []time.Time
-	touchedTenants []int64
+	touchedTenants []uuid.UUID
 }
 
-func (s *fakeStore) FindByHash(_ context.Context, hash string) (Key, error) {
+func (s *fakeStore) FindByHash(_ context.Context, hash []byte) (Key, error) {
 	s.findCalls++
 	if s.findErr != nil {
 		return Key{}, s.findErr
 	}
-	if hash != s.key.Hash {
+	if !bytes.Equal(hash, s.key.Hash) {
 		return Key{}, apperror.ErrNotFound
 	}
 	return s.key, nil
 }
 
-func (s *fakeStore) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
+func (s *fakeStore) TouchLastUsed(ctx context.Context, id uuid.UUID, at time.Time) error {
 	if id != s.key.ID {
 		return apperror.ErrNotFound
 	}
 	s.touched = append(s.touched, at)
-	s.touchedTenants = append(s.touchedTenants, tenant.EffectiveID(ctx))
+	s.touchedTenants = append(s.touchedTenants, tenant.IDFromContext(ctx))
 	lastUsed := at
 	s.key.LastUsedAt = &lastUsed
 	return nil
@@ -50,7 +54,7 @@ type fakePrincipals struct {
 	err       error
 }
 
-func (p fakePrincipals) GetPrincipal(context.Context, int64, int64) (identitycontracts.Principal, error) {
+func (p fakePrincipals) GetPrincipal(context.Context, uuid.UUID, uuid.UUID) (identitycontracts.Principal, error) {
 	return p.principal, p.err
 }
 
@@ -61,9 +65,9 @@ func newTestKey(t *testing.T) (Credentials, Key) {
 		t.Fatalf("generate: %v", err)
 	}
 	return credentials, Key{
-		ID:        7,
-		TenantID:  1,
-		UserID:    42,
+		ID:        testID(7),
+		TenantID:  testID(1),
+		UserID:    testID(42),
 		Name:      "ci",
 		Prefix:    credentials.Prefix,
 		Hash:      credentials.Hash,
@@ -87,10 +91,10 @@ func TestGenerate_FormatAndHash(t *testing.T) {
 	if !Valid(credentials.Key) {
 		t.Fatal("generated key must be valid")
 	}
-	if len(credentials.Hash) != KeyHashBytes*2 {
-		t.Fatalf("hash length = %d, want %d hex characters", len(credentials.Hash), KeyHashBytes*2)
+	if len(credentials.Hash) != KeyHashBytes {
+		t.Fatalf("hash length = %d, want %d bytes", len(credentials.Hash), KeyHashBytes*2)
 	}
-	if credentials.Hash != Hash(credentials.Key) {
+	if !bytes.Equal(credentials.Hash, Hash(credentials.Key)) {
 		t.Fatal("stored hash must be SHA-256 of the complete key")
 	}
 	other, err := Generate()
@@ -111,8 +115,8 @@ func TestGenerate_UsesChecksummedBase62Format(t *testing.T) {
 	if !ok || prefix != DefaultPrefix {
 		t.Fatalf("key = %q, want prefix %q", credentials.Key, DefaultPrefix)
 	}
-	if len(secret) != newSecretLen {
-		t.Fatalf("secret length = %d, want %d (43 base62 random + 6 checksum)", len(secret), newSecretLen)
+	if len(secret) != secretLen {
+		t.Fatalf("secret length = %d, want %d (43 base62 random + 6 checksum)", len(secret), secretLen)
 	}
 	if _, err := ParsePrefix(credentials.Key); err != nil {
 		t.Fatalf("parse generated key: %v", err)
@@ -138,9 +142,9 @@ func TestVerifier_RejectsBadChecksumBeforeLookup(t *testing.T) {
 
 	store := &fakeStore{key: key}
 	verifier := NewVerifier(store, nil)
-	_, err := verifier.Verify(context.Background(), corrupted, 0)
+	_, err := verifier.Verify(context.Background(), corrupted, uuid.Nil)
 	var appErr *apperror.AppError
-	if !errors.As(err, &appErr) || appErr.Status != http.StatusUnauthorized {
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != http.StatusUnauthorized {
 		t.Fatalf("error = %v, want 401", err)
 	}
 	if appErr.Detail != "invalid API key" {
@@ -151,21 +155,31 @@ func TestVerifier_RejectsBadChecksumBeforeLookup(t *testing.T) {
 	}
 }
 
-// TestParsePrefix_AcceptsLegacyFormat covers keys issued before the checksum
-// existed: a 32-byte base64url secret with no checksum must keep verifying.
-func TestParsePrefix_AcceptsLegacyFormat(t *testing.T) {
+// TestParsePrefix_RejectsLegacyFormat covers the retired pre-checksum format:
+// a 32-byte base64url secret with no checksum no longer verifies.
+func TestParsePrefix_RejectsLegacyFormat(t *testing.T) {
 	legacy := DefaultPrefix + "_" + base64.RawURLEncoding.EncodeToString([]byte(
 		"0123456789abcdef0123456789abcdef", // exactly 32 bytes
 	))
-	if len(strings.SplitN(legacy, "_", 2)[1]) != legacySecretLen {
+	if len(strings.SplitN(legacy, "_", 2)[1]) != 43 {
 		t.Fatalf("legacy fixture length = %d", len(strings.SplitN(legacy, "_", 2)[1]))
 	}
-	if !Valid(legacy) {
-		t.Fatal("legacy key must stay valid for verification")
+	if Valid(legacy) {
+		t.Fatal("the legacy base64url format must no longer verify")
 	}
-	prefix, err := ParsePrefix(legacy)
-	if err != nil || prefix != DefaultPrefix {
-		t.Fatalf("parse legacy = %q, %v", prefix, err)
+	if _, err := ParsePrefix(legacy); !errors.Is(err, ErrMalformedKey) {
+		t.Fatalf("parse legacy error = %v, want ErrMalformedKey", err)
+	}
+
+	store := &fakeStore{}
+	verifier := NewVerifier(store, nil)
+	_, err := verifier.Verify(context.Background(), legacy, uuid.Nil)
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != http.StatusUnauthorized {
+		t.Fatalf("error = %v, want 401", err)
+	}
+	if store.findCalls != 0 {
+		t.Fatalf("FindByHash calls = %d, want 0: a legacy key must not reach the database", store.findCalls)
 	}
 }
 
@@ -206,14 +220,14 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 	credentials, key := newTestKey(t)
 	store := &fakeStore{key: key}
 	now := time.Unix(1_700_000_100, 0).UTC()
-	principal := identitycontracts.Principal{ID: 42, TenantID: 1, Email: "owner@test.com", Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive}
+	principal := identitycontracts.Principal{ID: testID(42), TenantID: testID(1), Email: "owner@test.com", Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive}
 	verifier := NewVerifier(store, fakePrincipals{principal: principal}, fixedClock(now))
 
-	verified, err := verifier.Verify(context.Background(), credentials.Key, 1)
+	verified, err := verifier.Verify(context.Background(), credentials.Key, testID(1))
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if verified.Key.ID != key.ID || verified.Principal.ID != 42 {
+	if verified.Key.ID != key.ID || verified.Principal.ID != testID(42) {
 		t.Fatalf("verified = %+v, want key 7/principal 42", verified)
 	}
 	if len(verified.Key.Scopes) != 1 || verified.Key.Scopes[0] != testScopeRead {
@@ -227,14 +241,14 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 	}
 
 	// No second write inside the touch interval.
-	verifier.Verify(context.Background(), credentials.Key, 1)
+	verifier.Verify(context.Background(), credentials.Key, testID(1))
 	if len(store.touched) != 1 {
 		t.Fatalf("touches = %d, want 1 within interval", len(store.touched))
 	}
 
 	// A write is attempted again once the interval has elapsed.
 	verifier = NewVerifier(store, fakePrincipals{principal: principal}, fixedClock(now.Add(2*time.Minute)))
-	verifier.Verify(context.Background(), credentials.Key, 1)
+	verifier.Verify(context.Background(), credentials.Key, testID(1))
 	if len(store.touched) != 2 {
 		t.Fatalf("touches = %d, want 2 after interval", len(store.touched))
 	}
@@ -242,16 +256,16 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 
 func TestVerifier_LastUsedTouchUsesKeyTenant(t *testing.T) {
 	credentials, key := newTestKey(t)
-	key.TenantID = 2
+	key.TenantID = testID(2)
 	store := &fakeStore{key: key}
 	now := time.Unix(1_700_000_100, 0).UTC()
-	principal := identitycontracts.Principal{ID: 42, TenantID: 2, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive}
+	principal := identitycontracts.Principal{ID: testID(42), TenantID: testID(2), Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive}
 	verifier := NewVerifier(store, fakePrincipals{principal: principal}, fixedClock(now))
 
 	// A header-less request resolves the default tenant; the write must still
 	// run under the key's own tenant or RLS would update no row.
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
-	if _, err := verifier.Verify(ctx, credentials.Key, 0); err != nil {
+	if _, err := verifier.Verify(ctx, credentials.Key, uuid.Nil); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 	if len(store.touchedTenants) != 1 || store.touchedTenants[0] != key.TenantID {
@@ -262,7 +276,7 @@ func TestVerifier_LastUsedTouchUsesKeyTenant(t *testing.T) {
 func TestVerifier_RejectsInvalidStates(t *testing.T) {
 	credentials, baseKey := newTestKey(t)
 	now := time.Unix(1_700_000_100, 0).UTC()
-	principal := identitycontracts.Principal{ID: 42, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive}
+	principal := identitycontracts.Principal{ID: testID(42), TenantID: testID(1), Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive}
 
 	past := now.Add(-time.Minute)
 	future := now.Add(time.Hour)
@@ -272,19 +286,19 @@ func TestVerifier_RejectsInvalidStates(t *testing.T) {
 	tests := []struct {
 		name       string
 		mutate     func(*Key)
-		tenant     int64
+		tenant     uuid.UUID
 		wantStatus int
 	}{
 		{
 			name:       "expired",
 			mutate:     func(k *Key) { k.ExpiresAt = &past },
-			tenant:     1,
+			tenant:     testID(1),
 			wantStatus: 401,
 		},
 		{
 			name:       "revoked",
 			mutate:     func(k *Key) { k.RevokedAt = &past },
-			tenant:     1,
+			tenant:     testID(1),
 			wantStatus: 401,
 		},
 		{
@@ -293,7 +307,7 @@ func TestVerifier_RejectsInvalidStates(t *testing.T) {
 				k.RotatedAt = &past
 				k.RotationGraceUntil = &future
 			},
-			tenant:     1,
+			tenant:     testID(1),
 			wantStatus: 200,
 		},
 		{
@@ -302,7 +316,7 @@ func TestVerifier_RejectsInvalidStates(t *testing.T) {
 				k.RotatedAt = &past
 				k.RotationGraceUntil = &pastGrace
 			},
-			tenant:     1,
+			tenant:     testID(1),
 			wantStatus: 401,
 		},
 		{
@@ -310,13 +324,13 @@ func TestVerifier_RejectsInvalidStates(t *testing.T) {
 			mutate: func(k *Key) {
 				k.RotatedAt = &past
 			},
-			tenant:     1,
+			tenant:     testID(1),
 			wantStatus: 401,
 		},
 		{
 			name:       "tenant mismatch",
 			mutate:     func(*Key) {},
-			tenant:     2,
+			tenant:     testID(2),
 			wantStatus: 403,
 		},
 		{
@@ -326,7 +340,7 @@ func TestVerifier_RejectsInvalidStates(t *testing.T) {
 				k.ExpiresAt = &future
 				k.RotationGraceUntil = &futureGrace
 			},
-			tenant:     1,
+			tenant:     testID(1),
 			wantStatus: 200,
 		},
 	}
@@ -345,7 +359,7 @@ func TestVerifier_RejectsInvalidStates(t *testing.T) {
 				return
 			}
 			var appErr *apperror.AppError
-			if !errors.As(err, &appErr) || appErr.Status != tt.wantStatus {
+			if !errors.As(err, &appErr) || resolvedStatus(appErr) != tt.wantStatus {
 				t.Fatalf("error = %v, want status %d", err, tt.wantStatus)
 			}
 		})
@@ -383,7 +397,7 @@ func TestVerifier_RejectsUnknownMalformedAndInactiveOwner(t *testing.T) {
 			raw:   credentials.Key,
 			store: &fakeStore{key: key},
 			principals: fakePrincipals{principal: identitycontracts.Principal{
-				ID: 42, TenantID: 2, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive,
+				ID: testID(42), TenantID: testID(2), Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive,
 			}},
 		},
 	}
@@ -391,9 +405,9 @@ func TestVerifier_RejectsUnknownMalformedAndInactiveOwner(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			verifier := NewVerifier(tt.store, tt.principals, fixedClock(now))
-			_, err := verifier.Verify(context.Background(), tt.raw, 0)
+			_, err := verifier.Verify(context.Background(), tt.raw, uuid.Nil)
 			var appErr *apperror.AppError
-			if !errors.As(err, &appErr) || appErr.Status != 401 {
+			if !errors.As(err, &appErr) || resolvedStatus(appErr) != 401 {
 				t.Fatalf("error = %v, want 401", err)
 			}
 		})
@@ -404,15 +418,20 @@ func TestVerifier_RejectsSuspendedTenant(t *testing.T) {
 	credentials, key := newTestKey(t)
 	store := &fakeStore{key: key}
 	verifier := NewVerifier(store, fakePrincipals{principal: identitycontracts.Principal{
-		ID: 42, TenantID: 1, Role: authz.RoleMember, TenantStatus: "suspended",
+		ID: testID(42), TenantID: testID(1), Role: authz.RoleMember, TenantStatus: "suspended",
 	}})
 
-	_, err := verifier.Verify(context.Background(), credentials.Key, 0)
+	_, err := verifier.Verify(context.Background(), credentials.Key, uuid.Nil)
 	var appErr *apperror.AppError
-	if !errors.As(err, &appErr) || appErr.Status != http.StatusUnauthorized {
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != http.StatusUnauthorized {
 		t.Fatalf("err = %v, want 401 for a suspended tenant", err)
 	}
 	if len(store.touched) != 0 {
 		t.Fatal("a rejected key must not update last_used_at")
 	}
+}
+
+// testID returns a deterministic UUID for a small fixture number.
+func testID(n int) uuid.UUID {
+	return uuid.MustParse(fmt.Sprintf("0192c9b0-7e4a-7000-8000-%012d", n))
 }

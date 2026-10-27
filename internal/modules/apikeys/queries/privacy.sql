@@ -7,10 +7,10 @@ SELECT id, tenant_id, user_id, name, prefix, expires_at, revoked_at,
              WHERE s.api_key_id = api_keys.id
              ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
 FROM api_keys
-WHERE tenant_id = @tenant_id::bigint
-  AND user_id = @user_id::bigint
+WHERE tenant_id = @tenant_id::uuid
+  AND user_id = @user_id::uuid
 ORDER BY id;
 
 -- name: DeleteAPIKeysForPrivacy :execrows
 DELETE FROM api_keys
-WHERE tenant_id = @tenant_id::bigint AND user_id = @user_id::bigint;
+WHERE tenant_id = @tenant_id::uuid AND user_id = @user_id::uuid;

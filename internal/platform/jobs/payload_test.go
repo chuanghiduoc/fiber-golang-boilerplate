@@ -99,22 +99,21 @@ func TestPayloadCodecTamperedNonceFails(t *testing.T) {
 	require.ErrorIs(t, err, ErrPayloadDecryption)
 }
 
-func TestPayloadCodecPlaintextFallback(t *testing.T) {
+func TestPayloadCodecRejectsPlaintext(t *testing.T) {
 	t.Parallel()
 
 	codec, err := NewPayloadCodec(testPayloadSecret)
 	require.NoError(t, err)
 
-	payload := json.RawMessage(`{"To":["legacy@example.com"],"Subject":"Legacy job","Body":"https://app.example/reset?token=old-token"}`)
-	opened, err := codec.Open(payload)
-	require.NoError(t, err)
-	assert.Equal(t, []byte(payload), opened, "pre-deployment plaintext jobs must pass through unchanged")
+	// A plaintext payload is no longer a job body: every job payload is an
+	// encrypted envelope.
+	payload := json.RawMessage(`{"To":["user@example.com"],"Subject":"Hello","Body":"body"}`)
+	_, err = codec.Open(payload)
+	require.ErrorIs(t, err, ErrInvalidPayloadEnvelope)
 
-	// Valid JSON that is not an object cannot be an envelope either.
 	nonObject := json.RawMessage(`[1,2,3]`)
-	opened, err = codec.Open(nonObject)
-	require.NoError(t, err)
-	assert.Equal(t, []byte(nonObject), opened)
+	_, err = codec.Open(nonObject)
+	require.ErrorIs(t, err, ErrInvalidPayloadEnvelope)
 }
 
 func TestPayloadCodecOpenCaseVariantEnvelope(t *testing.T) {
@@ -152,29 +151,25 @@ func TestPayloadCodecRejectsEnvelopeWithoutAAD(t *testing.T) {
 	key := codec.ring.Active()
 	nonce := make([]byte, key.AEAD.NonceSize())
 	ciphertext := key.AEAD.Seal(nil, nonce, []byte(`{"token":"secret-token"}`), nil)
-	for _, envelope := range []payloadEnvelope{
-		{Version: legacyPayloadEnvelopeVersion},
-		{Version: payloadEnvelopeVersion, KeyID: key.ID},
-	} {
-		envelope.Nonce = base64.RawURLEncoding.EncodeToString(nonce)
-		envelope.Data = base64.RawURLEncoding.EncodeToString(ciphertext)
-		encoded, err := json.Marshal(envelope)
-		require.NoError(t, err)
+	envelope := payloadEnvelope{Version: payloadEnvelopeVersion, KeyID: key.ID}
+	envelope.Nonce = base64.RawURLEncoding.EncodeToString(nonce)
+	envelope.Data = base64.RawURLEncoding.EncodeToString(ciphertext)
+	encoded, err := json.Marshal(envelope)
+	require.NoError(t, err)
 
-		_, err = codec.Open(encoded)
-		require.ErrorIs(t, err, ErrPayloadDecryption,
-			"a v%d envelope sealed without the version/context AAD must not authenticate", envelope.Version)
-	}
+	_, err = codec.Open(encoded)
+	require.ErrorIs(t, err, ErrPayloadDecryption,
+		"an envelope sealed without the version/context AAD must not authenticate")
 }
 
-// sealLegacyPayload builds a version 1 envelope (no key id) the way codecs
-// sealed payloads before key ids existed.
+// sealLegacyPayload builds a version 1 envelope (no key id) the way retired
+// codecs sealed payloads.
 func sealLegacyPayload(t *testing.T, codec *PayloadCodec, plaintext []byte) json.RawMessage {
 	t.Helper()
 	aead := codec.ring.Active().AEAD
 	nonce := make([]byte, aead.NonceSize())
 	envelope, err := json.Marshal(payloadEnvelope{
-		Version: legacyPayloadEnvelopeVersion,
+		Version: 1,
 		Nonce:   base64.RawURLEncoding.EncodeToString(nonce),
 		Data:    base64.RawURLEncoding.EncodeToString(aead.Seal(nil, nonce, plaintext, []byte(payloadKeyInfo))),
 	})
@@ -197,26 +192,16 @@ func TestPayloadCodecSealsWithActiveKeyID(t *testing.T) {
 	assert.Len(t, envelope.KeyID, 8)
 }
 
-func TestPayloadCodecOpensLegacyEnvelopes(t *testing.T) {
+func TestPayloadCodecRejectsLegacyEnvelope(t *testing.T) {
 	t.Parallel()
 
 	plaintext := []byte(`{"token":"legacy-token"}`)
-	old, err := NewPayloadCodec(testPayloadSecret)
+	codec, err := NewPayloadCodec(testPayloadSecret)
 	require.NoError(t, err)
-	legacy := sealLegacyPayload(t, old, plaintext)
+	legacy := sealLegacyPayload(t, codec, plaintext)
 
-	// Same secret: an envelope queued before this release still opens.
-	opened, err := old.Open(legacy)
-	require.NoError(t, err)
-	assert.Equal(t, plaintext, opened)
-
-	// The secret moved to the previous list (JWT_SECRET -> DATA_ENCRYPTION_KEY
-	// migration): the legacy envelope is tried against every key.
-	rotated, err := NewPayloadCodec("new-data-encryption-key-at-least-32-chars", testPayloadSecret)
-	require.NoError(t, err)
-	opened, err = rotated.Open(legacy)
-	require.NoError(t, err)
-	assert.Equal(t, plaintext, opened)
+	_, err = codec.Open(legacy)
+	require.ErrorIs(t, err, ErrInvalidPayloadEnvelope, "a kid-less version 1 envelope is no longer accepted")
 }
 
 func TestPayloadCodecRotation(t *testing.T) {
@@ -325,6 +310,8 @@ func TestPayloadCodecRejectsInvalidPayloads(t *testing.T) {
 
 	validNonce := base64.RawURLEncoding.EncodeToString(make([]byte, codec.ring.Active().AEAD.NonceSize()))
 	validData := base64.RawURLEncoding.EncodeToString([]byte("not-really-ciphertext"))
+	paddedData := base64.URLEncoding.EncodeToString([]byte("not-really-ciphertext!"))
+	kid := codec.ring.Active().ID
 
 	tests := []struct {
 		name    string
@@ -332,16 +319,19 @@ func TestPayloadCodecRejectsInvalidPayloads(t *testing.T) {
 		wantErr error
 	}{
 		{name: "not JSON", payload: `not-json`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "truncated JSON", payload: `{"v":1`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "missing data", payload: `{"v":1,"nonce":"` + validNonce + `"}`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "missing nonce", payload: `{"v":1,"data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "nonce only", payload: `{"nonce":"` + validNonce + `"}`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "mixed case envelope missing nonce", payload: `{"V":1,"Data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "unsupported version", payload: `{"v":3,"nonce":"` + validNonce + `","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "invalid nonce encoding", payload: `{"v":1,"nonce":"***","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "invalid nonce length", payload: `{"v":1,"nonce":"c2hvcnQ","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "invalid data encoding", payload: `{"v":1,"nonce":"` + validNonce + `","data":"***"}`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "authentication failure", payload: `{"v":1,"nonce":"` + validNonce + `","data":"` + validData + `"}`, wantErr: ErrPayloadDecryption},
+		{name: "truncated JSON", payload: `{"v":2`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "plaintext object", payload: `{"To":["a@example.com"]}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "missing data", payload: `{"v":2,"kid":"` + kid + `","nonce":"` + validNonce + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "missing nonce", payload: `{"v":2,"kid":"` + kid + `","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "missing kid", payload: `{"v":2,"nonce":"` + validNonce + `","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "unsupported version", payload: `{"v":1,"nonce":"` + validNonce + `","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "mixed case envelope missing nonce", payload: `{"V":2,"Kid":"` + kid + `","Data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "invalid nonce encoding", payload: `{"v":2,"kid":"` + kid + `","nonce":"***","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "padded data encoding", payload: `{"v":2,"kid":"` + kid + `","nonce":"` + validNonce + `","data":"` + paddedData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "invalid nonce length", payload: `{"v":2,"kid":"` + kid + `","nonce":"c2hvcnQ","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "invalid data encoding", payload: `{"v":2,"kid":"` + kid + `","nonce":"` + validNonce + `","data":"***"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "authentication failure", payload: `{"v":2,"kid":"` + kid + `","nonce":"` + validNonce + `","data":"` + validData + `"}`, wantErr: ErrPayloadDecryption},
+		{name: "unknown key", payload: `{"v":2,"kid":"unknown-key","nonce":"` + validNonce + `","data":"` + validData + `"}`, wantErr: ErrPayloadDecryption},
 	}
 
 	for _, tt := range tests {

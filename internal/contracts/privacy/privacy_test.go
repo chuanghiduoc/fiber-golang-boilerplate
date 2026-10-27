@@ -4,15 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 type fakeProvider struct{ name string }
 
-func (f fakeProvider) Export(context.Context, int64, int64) (Section, error) {
+func (f fakeProvider) Export(context.Context, uuid.UUID, uuid.UUID) (Section, error) {
 	return Section{Name: f.name, Data: json.RawMessage(`{}`)}, nil
 }
 
-func (f fakeProvider) Erase(context.Context, int64, int64) error { return nil }
+func (f fakeProvider) Erase(context.Context, uuid.UUID, uuid.UUID) error { return nil }
 
 func TestRegistryKeepsRegistrationOrderAndSnapshots(t *testing.T) {
 	r := NewRegistry()

@@ -2,11 +2,13 @@ name: Deploy
 
 # Manual dispatch deploys a chosen environment. The workflow also runs after
 # the Release workflow completes, but only deploys production when that run
-# succeeded and was triggered by a stable v<semver> tag. Neither path touches a
-# cluster unless the GitHub Environment has KUBE_CONFIG configured. Every
-# non-dry-run deployment resolves the tag to its digest, verifies the cosign
-# signature of that digest, and rolls out by digest (image@sha256:...). See
-# deploy/k8s/README.md.
+# succeeded and was triggered by a stable v<semver> tag. Neither path uses a
+# stored kubeconfig: the deploy authenticates with GitHub OIDC federation
+# (`id-token: write`) through the selected cloud provider, using a
+# namespace-scoped RBAC identity in the target cluster. Every non-dry-run
+# deployment resolves the tag to its digest, verifies both the cosign signature
+# and the GitHub build-provenance attestation of that digest, and rolls out by
+# digest (image@sha256:...). See deploy/k8s/README.md.
 on:
   workflow_dispatch:
     inputs:
@@ -18,6 +20,14 @@ on:
         options:
           - staging
           - production
+      provider:
+        description: Cloud provider for OIDC cluster access (defaults to the DEPLOY_PROVIDER repository/environment variable)
+        type: choice
+        required: false
+        options:
+          - aws
+          - gcp
+          - azure
       image_tag:
         description: "Image tag from the Release workflow (for example 1.4.2 or sha-<40 hex>). Staging also accepts pre-release tags; production requires a stable tag."
         type: string
@@ -38,12 +48,15 @@ on:
     types:
       - completed
 
-# The cluster pulls the image; this workflow only needs repository read access.
-# packages: read is used to resolve the image digest and verify its signature.
-# Add id-token: write here if you switch KUBE_CONFIG to cloud OIDC federation.
+# The cluster pulls the image; the workflow only needs repository read access.
+# packages: read resolves the image digest and verifies its signature;
+# attestations: read verifies build provenance; id-token: write mints the
+# short-lived cloud credential (no static kubeconfig).
 permissions:
   contents: read
   packages: read
+  attestations: read
+  id-token: write
 
 # Serialize per environment; never cancel an in-flight migration or rollout.
 concurrency:
@@ -59,17 +72,29 @@ env:
   # present.
   SOURCE_IMAGE: ghcr.io/OWNER/REPO
   APP_DEPLOYMENT: fiber-boilerplate
+  WORKER_DEPLOYMENT: fiber-boilerplate-worker
   MIGRATION_JOB: fiber-boilerplate-migrate
   SEED_JOB: fiber-boilerplate-seed
   APP_SECRET: fiber-boilerplate-secrets
   MIGRATE_SECRET: fiber-boilerplate-migrate-secrets
   SEED_SECRET: fiber-boilerplate-seed-secrets
+  # Keyless cosign identity this workflow accepts. Also verified by release.yml
+  # right after signing (workflows cannot share env; keep both identical), so a
+  # release deploy would refuse fails at release time. Production narrows the
+  # ref pattern below to a stable v<semver> tag.
+  COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
+  COSIGN_IDENTITY_REF_PATTERN: refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?
 
 jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+      id-token: write
     # Manual dispatch is always eligible. A Release-triggered run must have
     # succeeded and must be a stable v<semver> tag build: pre-release tags
     # (v1.2.3-rc.1) never auto-deploy to production; failed releases never
@@ -101,10 +126,12 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_PROVIDER: ${{ inputs.provider }}
           INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           INPUT_SEED: ${{ inputs.seed }}
           WORKFLOW_RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          DEPLOY_PROVIDER: ${{ vars.DEPLOY_PROVIDER }}
           REPO: ${{ github.repository }}
           GHCR_IMAGE_VAR: ${{ vars.GHCR_IMAGE }}
           GHCR_IMAGE_SECRET: ${{ secrets.GHCR_IMAGE }}
@@ -134,6 +161,20 @@ jobs:
               exit 1
               ;;
           esac
+
+          DRY_RUN="${INPUT_DRY_RUN:-false}"
+          # OIDC cluster access: the provider selects which federated login
+          # step runs. A real deployment needs one; a dry run only renders.
+          PROVIDER="${INPUT_PROVIDER:-${DEPLOY_PROVIDER:-}}"
+          if [ "$DRY_RUN" != "true" ]; then
+            case "$PROVIDER" in
+              aws|gcp|azure) ;;
+              *)
+                echo "::error::set the provider input (aws, gcp, azure) or the DEPLOY_PROVIDER repository/environment variable"
+                exit 1
+                ;;
+            esac
+          fi
 
           if [ -z "$IMAGE_TAG" ]; then
             echo "::error::image_tag is required for a manual deployment"
@@ -184,7 +225,7 @@ jobs:
           if [ "$ENVIRONMENT" = "production" ]; then
             IDENTITY_REF_PATTERN='refs/tags/v[0-9]+\.[0-9]+\.[0-9]+'
           else
-            IDENTITY_REF_PATTERN='refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
+            IDENTITY_REF_PATTERN="$COSIGN_IDENTITY_REF_PATTERN"
           fi
           CERTIFICATE_IDENTITY_REGEXP="$(printf '^https://github\\.com/%s/\\.github/workflows/release\\.yml@%s$' "$REPO_REGEXP" "$IDENTITY_REF_PATTERN")"
 
@@ -193,6 +234,7 @@ jobs:
           {
             echo "TARGET_ENV=$ENVIRONMENT"
             echo "NAMESPACE=$NAMESPACE"
+            echo "PROVIDER=$PROVIDER"
             echo "IMAGE_TAG=$IMAGE_TAG"
             echo "IMAGE_REPOSITORY=$IMAGE_REPOSITORY"
             # Dry run renders the tag reference; every real deployment
@@ -293,10 +335,27 @@ jobs:
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin > /dev/null
           trap 'docker logout ghcr.io > /dev/null 2>&1 || true' EXIT
           cosign verify \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
             --certificate-identity-regexp "$CERTIFICATE_IDENTITY_REGEXP" \
             "$IMAGE_REF" > /dev/null
           echo "Signature verified for $IMAGE_REF"
+
+      # A cosign signature proves the image was signed by a workflow with that
+      # identity; the GitHub build-provenance attestation additionally binds it
+      # to this repository's release.yml run and the SLSA predicate. Require
+      # both before a cluster is touched (SLSA v1.0 Build L2+).
+      - name: Verify build provenance
+        if: ${{ !inputs.dry_run }}
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${IMAGE_REF}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            --predicate-type https://slsa.dev/provenance/v1
+          echo "Build provenance verified for $IMAGE_REF"
 
       - name: Render manifests
         timeout-minutes: 10
@@ -380,34 +439,77 @@ jobs:
           path: ${{ env.RENDER_DIR }}/*.yaml
           if-no-files-found: error
 
-      - name: Configure kubectl
-        if: ${{ !inputs.dry_run }}
-        timeout-minutes: 10
+      # Cluster access via OIDC federation only. No kubeconfig Secret exists.
+      # The federated cloud identity is bound to deploy/k8s/rbac/deployer-role.yaml
+      # in the target namespace; see README.md#continuous-deployment-github-actions.
+      - name: Configure AWS credentials
+        if: ${{ !inputs.dry_run && env.PROVIDER == 'aws' }}
+        timeout-minutes: 5
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Configure EKS kubeconfig
+        if: ${{ !inputs.dry_run && env.PROVIDER == 'aws' }}
+        timeout-minutes: 5
         env:
-          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_EKS_CLUSTER: ${{ vars.AWS_EKS_CLUSTER }}
         run: |
           set -euo pipefail
-          if [ -z "${KUBE_CONFIG:-}" ]; then
-            echo "::error::KUBE_CONFIG is not set on the '$TARGET_ENV' GitHub Environment"
-            exit 1
-          fi
-          install -d -m 0700 "$HOME/.kube"
-          if printf '%s' "$KUBE_CONFIG" | grep -q 'apiVersion:'; then
-            # Raw YAML (the value starts with apiVersion:).
-            printf '%s\n' "$KUBE_CONFIG" > "$HOME/.kube/config"
-          else
-            # Base64-encoded kubeconfig (recommended: it survives YAML/multiline
-            # handling). Decode to a private file; never echo the value.
-            printf '%s' "$KUBE_CONFIG" | base64 --decode > "$HOME/.kube/config"
-          fi
-          chmod 0600 "$HOME/.kube/config"
-          if ! grep -q '^apiVersion:' "$HOME/.kube/config"; then
-            rm -f "$HOME/.kube/config"
-            echo "::error::KUBE_CONFIG is neither raw kubeconfig YAML nor valid base64-encoded kubeconfig"
-            exit 1
-          fi
+          : "${AWS_REGION:?set the AWS_REGION repository/environment variable}"
+          : "${AWS_EKS_CLUSTER:?set the AWS_EKS_CLUSTER repository/environment variable}"
+          aws eks update-kubeconfig --name "$AWS_EKS_CLUSTER" --region "$AWS_REGION"
+
+      - name: Authenticate to Google Cloud
+        if: ${{ !inputs.dry_run && env.PROVIDER == 'gcp' }}
+        timeout-minutes: 5
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure GKE credentials
+        if: ${{ !inputs.dry_run && env.PROVIDER == 'gcp' }}
+        timeout-minutes: 5
+        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GKE_LOCATION }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Authenticate to Azure
+        if: ${{ !inputs.dry_run && env.PROVIDER == 'azure' }}
+        timeout-minutes: 5
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false
+
+      - name: Configure AKS context
+        if: ${{ !inputs.dry_run && env.PROVIDER == 'azure' }}
+        timeout-minutes: 5
+        uses: azure/aks-set-context@883bdc8d8d1d0fd87e66cc4ba6f0b618f9eb5281 # v5.0.1
+        with:
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AKS_CLUSTER }}
+
+      - name: Verify cluster access and namespace RBAC
+        if: ${{ !inputs.dry_run }}
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
           kubectl version --client
           kubectl get --raw=/version > /dev/null
+          if [ "$(kubectl auth can-i create deployments -n "$NAMESPACE")" != "yes" ]; then
+            echo "::error::the federated deploy identity cannot create Deployments in $NAMESPACE; bind deploy/k8s/rbac/deployer-role.yaml there"
+            exit 1
+          fi
 
       - name: Apply namespace and ConfigMap
         if: ${{ !inputs.dry_run }}
@@ -415,19 +517,34 @@ jobs:
         run: |
           set -euo pipefail
           kubectl apply -f "$RENDER_DIR/prereqs.yaml"
-          if ! kubectl -n "$NAMESPACE" get secret "$APP_SECRET" > /dev/null 2>&1; then
+
+          # External Secrets creates the Secret asynchronously. Give a fresh
+          # install up to two minutes to sync instead of failing on the first
+          # lookup; an operator-created Secret is present immediately.
+          wait_for_secret() {
+            local name="$1"
+            for _ in $(seq 1 24); do
+              if kubectl -n "$NAMESPACE" get secret "$name" > /dev/null 2>&1; then
+                return 0
+              fi
+              sleep 5
+            done
+            return 1
+          }
+
+          if ! wait_for_secret "$APP_SECRET"; then
             echo "::error::Secret $APP_SECRET is missing in namespace $NAMESPACE."
-            echo "Create it out of band (or via External Secrets / Sealed Secrets) before deploying."
+            echo "Create it out of band (or enable deploy/k8s/components/external-secrets) before deploying."
             exit 1
           fi
-          if ! kubectl -n "$NAMESPACE" get secret "$MIGRATE_SECRET" > /dev/null 2>&1; then
+          if ! wait_for_secret "$MIGRATE_SECRET"; then
             echo "::error::Secret $MIGRATE_SECRET is missing in namespace $NAMESPACE."
-            echo "The migration Job reads the schema-owner credentials from it; create it out of band before deploying."
+            echo "The migration Job reads the schema-owner password from it; create it out of band before deploying."
             exit 1
           fi
-          if [ "$RUN_SEED" = "true" ] && ! kubectl -n "$NAMESPACE" get secret "$SEED_SECRET" > /dev/null 2>&1; then
+          if [ "$RUN_SEED" = "true" ] && ! wait_for_secret "$SEED_SECRET"; then
             echo "::error::Secret $SEED_SECRET is missing in namespace $NAMESPACE."
-            echo "It holds ADMIN_EMAIL/ADMIN_PASSWORD for the seed Job; create it out of band or run with seed=false."
+            echo "It holds ADMIN_PASSWORD for the seed Job; create it out of band or run with seed=false."
             exit 1
           fi
 
@@ -539,6 +656,7 @@ jobs:
           set -euo pipefail
           kubectl apply -f "$RENDER_DIR/app.yaml"
           kubectl -n "$NAMESPACE" rollout status "deployment/$APP_DEPLOYMENT" --timeout=10m
+          kubectl -n "$NAMESPACE" rollout status "deployment/$WORKER_DEPLOYMENT" --timeout=10m
 
       - name: Smoke check
         if: ${{ !inputs.dry_run }}
@@ -586,8 +704,11 @@ jobs:
           echo "Inspect:"
           echo "  kubectl -n $NAMESPACE get pods,deploy,jobs"
           echo "  kubectl -n $NAMESPACE rollout history deployment/$APP_DEPLOYMENT"
+          echo "  kubectl -n $NAMESPACE rollout history deployment/$WORKER_DEPLOYMENT"
           echo "Roll back the image:"
           echo "  kubectl -n $NAMESPACE rollout undo deployment/$APP_DEPLOYMENT"
+          echo "  kubectl -n $NAMESPACE rollout undo deployment/$WORKER_DEPLOYMENT"
           echo "  kubectl -n $NAMESPACE rollout status deployment/$APP_DEPLOYMENT --timeout=10m"
+          echo "  kubectl -n $NAMESPACE rollout status deployment/$WORKER_DEPLOYMENT --timeout=10m"
           echo "Migrations are forward-only: a previous image may be incompatible with the current schema."
           kubectl -n "$NAMESPACE" get pods -o wide || true

@@ -6,40 +6,20 @@ import (
 	"time"
 )
 
-// day is the unit for *_RETENTION_DAYS settings.
+// day is the unit for *_RETENTION settings.
 const day = 24 * time.Hour
 
 // SchedulerConfig controls the optional PostgreSQL-leader scheduler. Interval
 // and cron schedules execute in UTC; the default is disabled so a deployment
 // only runs schedules after an explicit opt-in.
 type SchedulerConfig struct {
-	Enabled       bool   `env:"SCHEDULER_ENABLED" envDefault:"false"`
-	LeaseTTLSecs  int    `env:"SCHEDULER_LEASE_TTL_SECS" envDefault:"30"`
-	HeartbeatSecs int    `env:"SCHEDULER_HEARTBEAT_SECS" envDefault:"10"`
-	PollSecs      int    `env:"SCHEDULER_POLL_SECS" envDefault:"15"`
-	Catchup       string `env:"SCHEDULER_CATCHUP" envDefault:"latest"`
-	CatchupLimit  int    `env:"SCHEDULER_CATCHUP_LIMIT" envDefault:"100"`
-	RetentionDays int    `env:"SCHEDULER_RETENTION_DAYS" envDefault:"30"`
-}
-
-// LeaseTTL returns the configured lease duration.
-func (s SchedulerConfig) LeaseTTL() time.Duration {
-	return time.Duration(s.LeaseTTLSecs) * time.Second
-}
-
-// HeartbeatInterval returns the configured lease heartbeat interval.
-func (s SchedulerConfig) HeartbeatInterval() time.Duration {
-	return time.Duration(s.HeartbeatSecs) * time.Second
-}
-
-// PollInterval returns the configured schedule evaluation interval.
-func (s SchedulerConfig) PollInterval() time.Duration {
-	return time.Duration(s.PollSecs) * time.Second
-}
-
-// Retention returns the configured scheduler_runs retention window.
-func (s SchedulerConfig) Retention() time.Duration {
-	return time.Duration(s.RetentionDays) * day
+	Enabled           bool          `env:"SCHEDULER_ENABLED" envDefault:"false"`
+	LeaseTTL          time.Duration `env:"SCHEDULER_LEASE_TTL" envDefault:"30s"`
+	HeartbeatInterval time.Duration `env:"SCHEDULER_HEARTBEAT_INTERVAL" envDefault:"10s"`
+	PollInterval      time.Duration `env:"SCHEDULER_POLL_INTERVAL" envDefault:"15s"`
+	Catchup           string        `env:"SCHEDULER_CATCHUP" envDefault:"latest"`
+	CatchupLimit      int           `env:"SCHEDULER_CATCHUP_LIMIT" envDefault:"100"`
+	Retention         time.Duration `env:"SCHEDULER_RETENTION" envDefault:"720h"`
 }
 
 // Validate checks scheduler timing and catch-up settings. The defaults are
@@ -51,17 +31,17 @@ func (s SchedulerConfig) Validate() error {
 	if s == (SchedulerConfig{}) {
 		return nil
 	}
-	if s.LeaseTTLSecs < 1 {
-		return fmt.Errorf("SCHEDULER_LEASE_TTL_SECS must be at least 1")
+	if s.LeaseTTL < time.Second {
+		return fmt.Errorf("SCHEDULER_LEASE_TTL must be at least 1s")
 	}
-	if s.HeartbeatSecs < 1 {
-		return fmt.Errorf("SCHEDULER_HEARTBEAT_SECS must be at least 1")
+	if s.HeartbeatInterval < time.Second {
+		return fmt.Errorf("SCHEDULER_HEARTBEAT_INTERVAL must be at least 1s")
 	}
-	if s.HeartbeatSecs >= s.LeaseTTLSecs {
-		return fmt.Errorf("SCHEDULER_HEARTBEAT_SECS (%d) must be less than SCHEDULER_LEASE_TTL_SECS (%d)", s.HeartbeatSecs, s.LeaseTTLSecs)
+	if s.HeartbeatInterval >= s.LeaseTTL {
+		return fmt.Errorf("SCHEDULER_HEARTBEAT_INTERVAL (%s) must be less than SCHEDULER_LEASE_TTL (%s)", s.HeartbeatInterval, s.LeaseTTL)
 	}
-	if s.PollSecs < 1 {
-		return fmt.Errorf("SCHEDULER_POLL_SECS must be at least 1")
+	if s.PollInterval < time.Second {
+		return fmt.Errorf("SCHEDULER_POLL_INTERVAL must be at least 1s")
 	}
 	switch strings.ToLower(strings.TrimSpace(s.Catchup)) {
 	case "none", "latest", "all":
@@ -71,8 +51,8 @@ func (s SchedulerConfig) Validate() error {
 	if s.CatchupLimit < 1 {
 		return fmt.Errorf("SCHEDULER_CATCHUP_LIMIT must be at least 1")
 	}
-	if s.RetentionDays < 1 {
-		return fmt.Errorf("SCHEDULER_RETENTION_DAYS must be at least 1")
+	if s.Retention < day {
+		return fmt.Errorf("SCHEDULER_RETENTION must be at least 24h")
 	}
 	return nil
 }

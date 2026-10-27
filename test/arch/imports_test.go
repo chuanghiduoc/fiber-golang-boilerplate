@@ -111,7 +111,7 @@ func TestModuleBoundaries(t *testing.T) {
 		checkForbiddenImports(t, filepath.Join(root, "internal", "app"), []string{"internal/modules/"})
 	})
 
-	t.Run("contracts stay stdlib-only", func(t *testing.T) {
+	t.Run("contracts stay stdlib-only plus google/uuid", func(t *testing.T) {
 		checkStdlibOnly(t, filepath.Join(root, "internal", "contracts"))
 	})
 
@@ -121,7 +121,7 @@ func TestModuleBoundaries(t *testing.T) {
 			"internal/modules/files",
 			"internal/sqlc",
 			"pkg/storage",
-			"pkg/database",
+			"internal/database",
 			"internal/platform/session",
 		})
 	})
@@ -153,7 +153,8 @@ func checkForbiddenImports(t *testing.T, dir string, forbidden []string) {
 
 // checkStdlibOnly rejects any import whose first path segment contains a dot,
 // which is how Go distinguishes standard-library packages from external or
-// module-local ones.
+// module-local ones. Contracts may use exactly one external module:
+// github.com/google/uuid, because every contract id is a UUID.
 func checkStdlibOnly(t *testing.T, dir string) {
 	t.Helper()
 	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
@@ -164,6 +165,9 @@ func checkStdlibOnly(t *testing.T, dir string) {
 			return nil
 		}
 		for _, imp := range parseImports(t, path) {
+			if imp == "github.com/google/uuid" {
+				continue
+			}
 			first := strings.SplitN(imp, "/", 2)[0]
 			if strings.Contains(first, ".") {
 				t.Errorf("%s must stay stdlib-only, found import %s", path, imp)

@@ -5,20 +5,26 @@ kind: Kustomization
 # reference this directory directly; the top-level ../kustomization.yaml is a
 # convenience wrapper for `kubectl apply -k deploy/k8s`.
 #
+# The default split is one api Deployment (HTTP only, HPA on CPU) and one
+# worker Deployment (job worker + scheduler, no Service/Ingress). See
+# base/worker/ and README.md#process-model.
+#
 # IMPORTANT: migration/job.yaml is intentionally NOT listed here. It must be
 # applied explicitly and awaited BEFORE this kustomization creates the app;
 # `kubectl apply -k` has no cross-resource ordering guarantee. See README.md
 # for the only safe flow.
 namespace: fiber-boilerplate
 
-# The real Secret is created out of band (or via External Secrets / Sealed
-# Secrets). secret.example.yaml is intentionally NOT listed and must never be
-# committed with real values.
+# The real Secret is created out of band or by the optional ExternalSecrets
+# component (components/external-secrets). secret.example.yaml is intentionally
+# NOT listed and must never be committed with real values.
 resources:
   # Namespace and ConfigMap are separate so a deploy can apply them before the
   # migration Job without creating the Deployment.
   - ../prereqs
+  - serviceaccount.yaml
   - deployment.yaml
+  - worker
   - service.yaml
   - hpa.yaml
   - pdb.yaml
@@ -29,7 +35,8 @@ resources:
 # overlays and the deploy workflow: keep it exactly as-is, and set newName to
 # your repository plus newTag to the release tag. The raw migration Job is
 # outside this kustomization; overlays/<env>/migration/kustomization.yaml sets
-# its image with the same source key.
+# its image with the same source key. base/worker/deployment.yaml uses the same
+# key, so the transformer rewrites both Deployments.
 images:
   - name: ghcr.io/OWNER/REPO
     newName: ghcr.io/OWNER/REPO

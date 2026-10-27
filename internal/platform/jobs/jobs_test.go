@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/google/uuid"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,9 +22,10 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -35,9 +37,9 @@ func TestJobNormalize(t *testing.T) {
 	t.Run("applies defaults", func(t *testing.T) {
 		t.Parallel()
 
-		job, err := Job{Kind: "email.send"}.normalize(now)
+		job, err := Job{Kind: "email.send.encrypted"}.normalize(now)
 		require.NoError(t, err)
-		assert.Equal(t, "email.send", job.Kind)
+		assert.Equal(t, "email.send.encrypted", job.Kind)
 		assert.JSONEq(t, `{}`, string(job.Payload))
 		assert.Equal(t, now, job.RunAt)
 		assert.Equal(t, DefaultMaxAttempts, job.MaxAttempts)
@@ -48,7 +50,7 @@ func TestJobNormalize(t *testing.T) {
 
 		runAt := now.Add(time.Hour)
 		job, err := Job{
-			Kind:        "email.send",
+			Kind:        "email.send.encrypted",
 			Payload:     json.RawMessage(`{"to":"user@example.com"}`),
 			RunAt:       runAt,
 			MaxAttempts: 3,
@@ -72,25 +74,25 @@ func TestJobNormalize(t *testing.T) {
 	t.Run("rejects invalid payload", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := Job{Kind: "email.send", Payload: json.RawMessage(`{`)}.normalize(now)
+		_, err := Job{Kind: "email.send.encrypted", Payload: json.RawMessage(`{`)}.normalize(now)
 		require.ErrorIs(t, err, ErrInvalidPayload)
 	})
 
 	t.Run("rejects negative attempts", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := Job{Kind: "email.send", MaxAttempts: -1}.normalize(now)
+		_, err := Job{Kind: "email.send.encrypted", MaxAttempts: -1}.normalize(now)
 		require.ErrorIs(t, err, ErrInvalidMaxAttempts)
 	})
 
 	t.Run("normalizes idempotency key", func(t *testing.T) {
 		t.Parallel()
 
-		job, err := Job{Kind: "email.send", IdempotencyKey: "  event:1  "}.normalize(now)
+		job, err := Job{Kind: "email.send.encrypted", IdempotencyKey: "  event:1  "}.normalize(now)
 		require.NoError(t, err)
 		assert.Equal(t, "event:1", job.IdempotencyKey)
 
-		_, err = Job{Kind: "email.send", IdempotencyKey: strings.Repeat("x", 513)}.normalize(now)
+		_, err = Job{Kind: "email.send.encrypted", IdempotencyKey: strings.Repeat("x", 513)}.normalize(now)
 		require.ErrorIs(t, err, ErrInvalidIdempotencyKey)
 	})
 }
@@ -103,31 +105,31 @@ func TestPrepareJobTenant(t *testing.T) {
 		name    string
 		ctx     context.Context
 		job     Job
-		want    int64
+		want    uuid.UUID
 		wantErr error
 	}{
 		{
-			name: "empty context falls back to default tenant",
-			ctx:  context.Background(),
-			job:  Job{Kind: "email.send"},
-			want: tenant.DefaultID,
+			name:    "empty context has no tenant",
+			ctx:     context.Background(),
+			job:     Job{Kind: "email.send.encrypted"},
+			wantErr: ErrInvalidTenant,
 		},
 		{
 			name: "context tenant is inherited",
-			ctx:  tenant.WithID(context.Background(), 2),
-			job:  Job{Kind: "email.send"},
-			want: 2,
+			ctx:  tenant.WithID(context.Background(), testID(2)),
+			job:  Job{Kind: "email.send.encrypted"},
+			want: testID(2),
 		},
 		{
 			name: "explicit tenant is preserved",
-			ctx:  tenant.WithID(context.Background(), 2),
-			job:  Job{Kind: "email.send", TenantID: 3},
-			want: 3,
+			ctx:  tenant.WithID(context.Background(), testID(2)),
+			job:  Job{Kind: "email.send.encrypted", TenantID: testID(3)},
+			want: testID(3),
 		},
 		{
 			name:    "non-positive tenant is rejected",
 			ctx:     context.Background(),
-			job:     Job{Kind: "email.send", TenantID: -1},
+			job:     Job{Kind: "email.send.encrypted", TenantID: uuid.Nil},
 			wantErr: ErrInvalidTenant,
 		},
 	}
@@ -188,14 +190,15 @@ func TestProcessJobSucceeds(t *testing.T) {
 	})
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          7,
+		TenantID:    testID(2),
+		ID:          testID(7),
 		Kind:        "ok",
 		Payload:     json.RawMessage(`{"value":1}`),
 		Attempts:    1,
 		MaxAttempts: 3,
 	}))
 
-	assert.Equal(t, []int64{7}, fake.succeededIDs())
+	assert.Equal(t, []uuid.UUID{testID(7)}, fake.succeededIDs())
 	assert.Empty(t, fake.failures)
 }
 
@@ -206,48 +209,51 @@ func TestProcessJobPropagatesTenantToHandler(t *testing.T) {
 	worker := NewWorker(nil, "test-worker")
 	worker.store = fake
 
-	var seen int64
+	var seen uuid.UUID
 	worker.Register("tenant", func(ctx context.Context, _ json.RawMessage) error {
 		seen = tenant.IDFromContext(ctx)
 		return nil
 	})
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          21,
-		TenantID:    2,
+		ID:          testID(21),
+		TenantID:    testID(2),
 		Kind:        "tenant",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
 		MaxAttempts: 3,
 	}))
 
-	assert.Equal(t, int64(2), seen, "handler must run under the job tenant")
-	assert.Equal(t, []int64{21}, fake.succeededIDs())
+	assert.Equal(t, testID(2), seen, "handler must run under the job tenant")
+	assert.Equal(t, []uuid.UUID{testID(21)}, fake.succeededIDs())
 }
 
-func TestProcessJobDefaultsMissingTenantToDefault(t *testing.T) {
+func TestProcessJobDeadLettersMissingTenant(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeStore{}
 	worker := NewWorker(nil, "test-worker")
 	worker.store = fake
-
-	var seen int64
-	worker.Register("tenant", func(ctx context.Context, _ json.RawMessage) error {
-		seen = tenant.IDFromContext(ctx)
+	ran := false
+	worker.Register("tenant", func(context.Context, json.RawMessage) error {
+		ran = true
 		return nil
 	})
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          22,
+		ID:          testID(22),
 		Kind:        "tenant",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
 		MaxAttempts: 3,
 	}))
 
-	assert.Equal(t, tenant.DefaultID, seen,
-		"a claimed job without a tenant must run under the compatibility tenant")
+	assert.False(t, ran, "a job without a tenant must never run")
+	assert.Empty(t, fake.succeededIDs())
+	require.Len(t, fake.failures, 1)
+	assert.Nil(t, fake.failures[0].retryAt, "a missing tenant is a permanent failure")
+	assert.Contains(t, fake.failures[0].reason, "no tenant")
+	assert.Contains(t, fake.failures[0].reason, "permanent failure (not retried)")
 }
 
 func TestProcessJobRetriesWithBackoff(t *testing.T) {
@@ -264,7 +270,8 @@ func TestProcessJobRetriesWithBackoff(t *testing.T) {
 
 	before := time.Now()
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          8,
+		TenantID:    testID(2),
+		ID:          testID(8),
 		Kind:        "boom",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    2,
@@ -273,7 +280,7 @@ func TestProcessJobRetriesWithBackoff(t *testing.T) {
 
 	require.Len(t, fake.failures, 1)
 	failure := fake.failures[0]
-	assert.Equal(t, int64(8), failure.id)
+	assert.Equal(t, testID(8), failure.id)
 	assert.Equal(t, "test-worker", failure.workerID)
 	assert.Equal(t, 2, failure.attempts, "the claim attempt must be passed as the fence")
 	assert.Contains(t, failure.reason, "temporary failure")
@@ -293,7 +300,8 @@ func TestProcessJobMarksDeadAfterMaxAttempts(t *testing.T) {
 	})
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          9,
+		TenantID:    testID(2),
+		ID:          testID(9),
 		Kind:        "boom",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    3,
@@ -317,7 +325,8 @@ func TestProcessJobRecoversPanic(t *testing.T) {
 	})
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          10,
+		TenantID:    testID(2),
+		ID:          testID(10),
 		Kind:        "panic",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
@@ -343,7 +352,8 @@ func TestProcessJobUnknownKindRetriesUntilExhausted(t *testing.T) {
 		worker.retryMax = time.Second
 
 		require.NoError(t, worker.processJob(context.Background(), claimedJob{
-			ID:          11,
+			TenantID:    testID(2),
+			ID:          testID(11),
 			Kind:        "missing",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
@@ -364,7 +374,8 @@ func TestProcessJobUnknownKindRetriesUntilExhausted(t *testing.T) {
 		worker.store = fake
 
 		require.NoError(t, worker.processJob(context.Background(), claimedJob{
-			ID:          11,
+			TenantID:    testID(2),
+			ID:          testID(11),
 			Kind:        "missing",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    3,
@@ -390,7 +401,8 @@ func TestProcessJobUsesAttemptFence(t *testing.T) {
 		worker.Register("ok", func(context.Context, json.RawMessage) error { return nil })
 
 		require.NoError(t, worker.processJob(context.Background(), claimedJob{
-			ID:          30,
+			TenantID:    testID(2),
+			ID:          testID(30),
 			Kind:        "ok",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    3,
@@ -412,7 +424,8 @@ func TestProcessJobUsesAttemptFence(t *testing.T) {
 		})
 
 		require.NoError(t, worker.processJob(context.Background(), claimedJob{
-			ID:          31,
+			TenantID:    testID(2),
+			ID:          testID(31),
 			Kind:        "boom",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    3,
@@ -440,7 +453,8 @@ func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 
 		start := time.Now()
 		require.NoError(t, processJobWithWatchdog(t, worker, context.Background(), claimedJob{
-			ID:          32,
+			TenantID:    testID(2),
+			ID:          testID(32),
 			Kind:        "blocking",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
@@ -466,14 +480,15 @@ func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 		})
 
 		require.NoError(t, processJobWithWatchdog(t, worker, context.Background(), claimedJob{
-			ID:          33,
+			TenantID:    testID(2),
+			ID:          testID(33),
 			Kind:        "ignores-context",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
 			MaxAttempts: 3,
 		}))
 
-		assert.Equal(t, []int64{33}, fake.succeededIDs(),
+		assert.Equal(t, []uuid.UUID{testID(33)}, fake.succeededIDs(),
 			"a handler that returns nil after its deadline already ran its side effects; it must be marked succeeded")
 		assert.Empty(t, fake.failures,
 			"recording a failure would re-run a handler that reported success")
@@ -494,14 +509,15 @@ func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 		defer cancel()
 
 		require.NoError(t, processJobWithWatchdog(t, worker, ctx, claimedJob{
-			ID:          34,
+			TenantID:    testID(2),
+			ID:          testID(34),
 			Kind:        "blocking",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
 			MaxAttempts: 3,
 		}))
 
-		assert.Equal(t, []int64{34}, fake.succeededIDs(),
+		assert.Equal(t, []uuid.UUID{testID(34)}, fake.succeededIDs(),
 			"a disabled job timeout must not turn a successful handler into a timeout failure")
 		assert.Empty(t, fake.failures,
 			"a disabled timeout must not produce a handler exceeded the 0s job timeout failure")
@@ -522,14 +538,15 @@ func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 		require.ErrorIs(t, parent.Err(), context.DeadlineExceeded)
 
 		require.NoError(t, processJobWithWatchdog(t, worker, parent, claimedJob{
-			ID:          35,
+			TenantID:    testID(2),
+			ID:          testID(35),
 			Kind:        "ok",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
 			MaxAttempts: 3,
 		}))
 
-		assert.Equal(t, []int64{35}, fake.succeededIDs(),
+		assert.Equal(t, []uuid.UUID{testID(35)}, fake.succeededIDs(),
 			"an already-expired parent deadline must not be mislabeled as a job timeout")
 		for _, failure := range fake.failures {
 			assert.NotContains(t, failure.reason, "job timeout")
@@ -558,7 +575,8 @@ func TestProcessJobShutdownReleasesWithoutConsumingAttempt(t *testing.T) {
 	defer cancel()
 
 	require.NoError(t, processJobWithWatchdog(t, worker, ctx, claimedJob{
-		ID:          36,
+		TenantID:    testID(2),
+		ID:          testID(36),
 		Kind:        "blocking",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    3,
@@ -568,7 +586,7 @@ func TestProcessJobShutdownReleasesWithoutConsumingAttempt(t *testing.T) {
 	assert.Empty(t, fake.failures, "a shutdown interruption must not dead-letter the job")
 	assert.Empty(t, fake.succeededIDs())
 	require.Len(t, fake.releases, 1)
-	assert.Equal(t, int64(36), fake.releases[0].id)
+	assert.Equal(t, testID(36), fake.releases[0].id)
 	assert.Equal(t, 3, fake.releases[0].attempts, "the release is fenced by the claimed attempt")
 	assert.Contains(t, fake.releases[0].reason, "interrupted by worker shutdown")
 }
@@ -593,8 +611,8 @@ func processJobWithWatchdog(t *testing.T, worker *Worker, ctx context.Context, j
 func TestWorkerRunProcessesAndStops(t *testing.T) {
 	t.Parallel()
 
-	fake := &fakeStore{claimed: []claimedJob{{
-		ID:          12,
+	fake := &fakeStore{claimed: []claimedJob{{TenantID: testID(2),
+		ID:          testID(12),
 		Kind:        "ok",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
@@ -630,7 +648,7 @@ func TestWorkerRunProcessesAndStops(t *testing.T) {
 	}
 
 	assert.Equal(t, int32(1), processed.Load())
-	assert.Equal(t, []int64{12}, fake.succeededIDs())
+	assert.Equal(t, []uuid.UUID{testID(12)}, fake.succeededIDs())
 	assert.GreaterOrEqual(t, fake.claimCalls, 1)
 }
 
@@ -653,8 +671,8 @@ func TestWorkerRunRetriesClaimError(t *testing.T) {
 
 	fake := &fakeStore{
 		claimErrs: []error{errors.New("database unavailable")},
-		claimed: []claimedJob{{
-			ID:          16,
+		claimed: []claimedJob{{TenantID: testID(2),
+			ID:          testID(16),
 			Kind:        "ok",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
@@ -689,14 +707,14 @@ func TestWorkerRunRetriesClaimError(t *testing.T) {
 	}
 
 	assert.GreaterOrEqual(t, fake.claimCalls, 2, "the failed claim must be retried")
-	assert.Equal(t, []int64{16}, fake.succeededIDs())
+	assert.Equal(t, []uuid.UUID{testID(16)}, fake.succeededIDs())
 }
 
 func TestWorkerRunPassesAttemptFence(t *testing.T) {
 	t.Parallel()
 
-	fake := &fakeStore{claimed: []claimedJob{{
-		ID:          17,
+	fake := &fakeStore{claimed: []claimedJob{{TenantID: testID(2),
+		ID:          testID(17),
 		Kind:        "slow",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    3,
@@ -816,13 +834,59 @@ func TestWorkerOptions(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, worker.leaseDuration)
 }
 
-// metricValue reads a Prometheus counter's current value without pulling in
-// prometheus/testutil (and its test-only dependencies).
-func metricValue(t *testing.T, counter prometheus.Counter) float64 {
+// TestMain installs the metric provider so the job instruments behind the
+// package-level wrappers are live for the whole package run.
+func TestMain(m *testing.M) {
+	provider, err := metrics.Setup(metrics.Options{})
+	if err != nil {
+		panic(err)
+	}
+	pgtest.Start()
+	code := m.Run()
+	pgtest.Stop()
+	_ = provider.Shutdown(context.Background())
+	os.Exit(code)
+}
+
+// metricValue reads a current counter or gauge value from the Prometheus
+// registry without pulling in prometheus/testutil. labels are key/value pairs.
+func metricValue(t *testing.T, name string, labels ...string) float64 {
 	t.Helper()
-	var m dto.Metric
-	require.NoError(t, counter.Write(&m))
-	return m.GetCounter().GetValue()
+	if len(labels)%2 != 0 {
+		t.Fatalf("metricValue(%q): labels must be key/value pairs", name)
+	}
+	families, err := metrics.Registry().Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			if !metricLabelsMatch(m, labels) {
+				continue
+			}
+			switch {
+			case m.GetCounter() != nil:
+				return m.GetCounter().GetValue()
+			case m.GetGauge() != nil:
+				return m.GetGauge().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+func metricLabelsMatch(metric *dto.Metric, labels []string) bool {
+	want := make(map[string]string, len(labels)/2)
+	for i := 0; i < len(labels); i += 2 {
+		want[labels[i]] = labels[i+1]
+	}
+	for _, pair := range metric.GetLabel() {
+		if value, ok := want[pair.GetName()]; ok && value == pair.GetValue() {
+			delete(want, pair.GetName())
+		}
+	}
+	return len(want) == 0
 }
 
 // TestWorkerMetrics checks that the job lifecycle counters move exactly once
@@ -833,8 +897,8 @@ func TestWorkerMetrics(t *testing.T) {
 		const kind = "metrics.claim.success"
 		fake := &fakeStore{
 			claimErrs: []error{errors.New("database unavailable")},
-			claimed: []claimedJob{{
-				ID:          100,
+			claimed: []claimedJob{{TenantID: testID(2),
+				ID:          testID(100),
 				Kind:        kind,
 				Payload:     json.RawMessage(`{}`),
 				Attempts:    1,
@@ -850,9 +914,9 @@ func TestWorkerMetrics(t *testing.T) {
 			return nil
 		})
 
-		claimedBefore := metricValue(t, metrics.JobsClaimedTotal.WithLabelValues(kind))
-		succeededBefore := metricValue(t, metrics.JobsSucceededTotal.WithLabelValues(kind))
-		claimErrorsBefore := metricValue(t, metrics.JobsClaimErrorsTotal)
+		claimedBefore := metricValue(t, "jobs_claimed_total", "kind", kind)
+		succeededBefore := metricValue(t, "jobs_succeeded_total", "kind", kind)
+		claimErrorsBefore := metricValue(t, "jobs_claim_errors_total")
 
 		ctx, cancel := context.WithCancel(context.Background())
 		errCh := make(chan error, 1)
@@ -873,10 +937,10 @@ func TestWorkerMetrics(t *testing.T) {
 		}
 
 		assert.Equal(t, claimedBefore+1,
-			metricValue(t, metrics.JobsClaimedTotal.WithLabelValues(kind)))
+			metricValue(t, "jobs_claimed_total", "kind", kind))
 		assert.Equal(t, succeededBefore+1,
-			metricValue(t, metrics.JobsSucceededTotal.WithLabelValues(kind)))
-		assert.Equal(t, claimErrorsBefore+1, metricValue(t, metrics.JobsClaimErrorsTotal))
+			metricValue(t, "jobs_succeeded_total", "kind", kind))
+		assert.Equal(t, claimErrorsBefore+1, metricValue(t, "jobs_claim_errors_total"))
 	})
 
 	t.Run("retried", func(t *testing.T) {
@@ -890,11 +954,12 @@ func TestWorkerMetrics(t *testing.T) {
 			return errors.New("temporary failure")
 		})
 
-		retriedBefore := metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind))
-		deadBefore := metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind))
+		retriedBefore := metricValue(t, "jobs_retried_total", "kind", kind)
+		deadBefore := metricValue(t, "jobs_dead_total", "kind", kind)
 
 		require.NoError(t, worker.processJob(context.Background(), claimedJob{
-			ID:          101,
+			TenantID:    testID(2),
+			ID:          testID(101),
 			Kind:        kind,
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
@@ -902,9 +967,9 @@ func TestWorkerMetrics(t *testing.T) {
 		}))
 
 		assert.Equal(t, retriedBefore+1,
-			metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind)))
+			metricValue(t, "jobs_retried_total", "kind", kind))
 		assert.Equal(t, deadBefore,
-			metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind)))
+			metricValue(t, "jobs_dead_total", "kind", kind))
 	})
 
 	t.Run("dead", func(t *testing.T) {
@@ -916,11 +981,12 @@ func TestWorkerMetrics(t *testing.T) {
 			return errors.New("permanent failure")
 		})
 
-		retriedBefore := metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind))
-		deadBefore := metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind))
+		retriedBefore := metricValue(t, "jobs_retried_total", "kind", kind)
+		deadBefore := metricValue(t, "jobs_dead_total", "kind", kind)
 
 		require.NoError(t, worker.processJob(context.Background(), claimedJob{
-			ID:          102,
+			TenantID:    testID(2),
+			ID:          testID(102),
 			Kind:        kind,
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    3,
@@ -928,9 +994,9 @@ func TestWorkerMetrics(t *testing.T) {
 		}))
 
 		assert.Equal(t, retriedBefore,
-			metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind)))
+			metricValue(t, "jobs_retried_total", "kind", kind))
 		assert.Equal(t, deadBefore+1,
-			metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind)))
+			metricValue(t, "jobs_dead_total", "kind", kind))
 	})
 
 	t.Run("bookkeeping failure is not counted", func(t *testing.T) {
@@ -940,10 +1006,11 @@ func TestWorkerMetrics(t *testing.T) {
 		worker.store = fake
 		worker.Register(kind, func(context.Context, json.RawMessage) error { return nil })
 
-		succeededBefore := metricValue(t, metrics.JobsSucceededTotal.WithLabelValues(kind))
+		succeededBefore := metricValue(t, "jobs_succeeded_total", "kind", kind)
 
 		err := worker.processJob(context.Background(), claimedJob{
-			ID:          103,
+			TenantID:    testID(2),
+			ID:          testID(103),
 			Kind:        kind,
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
@@ -952,7 +1019,7 @@ func TestWorkerMetrics(t *testing.T) {
 		require.Error(t, err)
 
 		assert.Equal(t, succeededBefore,
-			metricValue(t, metrics.JobsSucceededTotal.WithLabelValues(kind)),
+			metricValue(t, "jobs_succeeded_total", "kind", kind),
 			"a failed success write must not count as a succeeded outcome")
 	})
 
@@ -965,11 +1032,12 @@ func TestWorkerMetrics(t *testing.T) {
 			return errors.New("handler failure")
 		})
 
-		retriedBefore := metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind))
-		deadBefore := metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind))
+		retriedBefore := metricValue(t, "jobs_retried_total", "kind", kind)
+		deadBefore := metricValue(t, "jobs_dead_total", "kind", kind)
 
 		err := worker.processJob(context.Background(), claimedJob{
-			ID:          104,
+			TenantID:    testID(2),
+			ID:          testID(104),
 			Kind:        kind,
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
@@ -978,9 +1046,9 @@ func TestWorkerMetrics(t *testing.T) {
 		require.Error(t, err)
 
 		assert.Equal(t, retriedBefore,
-			metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind)))
+			metricValue(t, "jobs_retried_total", "kind", kind))
 		assert.Equal(t, deadBefore,
-			metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind)))
+			metricValue(t, "jobs_dead_total", "kind", kind))
 	})
 }
 
@@ -993,7 +1061,7 @@ func TestWorkerRunPurgesTerminalJobsOnInterval(t *testing.T) {
 	)
 	worker.store = fake
 
-	before := metricValue(t, metrics.JobsPurgedTotal)
+	before := metricValue(t, "jobs_purged_total")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -1016,7 +1084,7 @@ func TestWorkerRunPurgesTerminalJobsOnInterval(t *testing.T) {
 	calls := fake.purgeCallCount()
 	require.GreaterOrEqual(t, calls, 2)
 	assert.Equal(t, time.Hour, fake.retentionSeen())
-	assert.Equal(t, before+float64(calls)*3, metricValue(t, metrics.JobsPurgedTotal))
+	assert.Equal(t, before+float64(calls)*3, metricValue(t, "jobs_purged_total"))
 }
 
 func TestWorkerRunPurgesImmediatelyOnStartup(t *testing.T) {
@@ -1028,7 +1096,7 @@ func TestWorkerRunPurgesImmediatelyOnStartup(t *testing.T) {
 	)
 	worker.store = fake
 
-	before := metricValue(t, metrics.JobsPurgedTotal)
+	before := metricValue(t, "jobs_purged_total")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -1050,7 +1118,7 @@ func TestWorkerRunPurgesImmediatelyOnStartup(t *testing.T) {
 	calls := fake.purgeCallCount()
 	require.GreaterOrEqual(t, calls, 1)
 	assert.Equal(t, 30*24*time.Hour, fake.retentionSeen())
-	assert.Equal(t, before+float64(calls)*2, metricValue(t, metrics.JobsPurgedTotal))
+	assert.Equal(t, before+float64(calls)*2, metricValue(t, "jobs_purged_total"))
 }
 
 func TestWorkerRunPurgeFailureIsLoggedAndRetried(t *testing.T) {
@@ -1065,7 +1133,7 @@ func TestWorkerRunPurgeFailureIsLoggedAndRetried(t *testing.T) {
 	)
 	worker.store = fake
 
-	before := metricValue(t, metrics.JobsPurgedTotal)
+	before := metricValue(t, "jobs_purged_total")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -1084,7 +1152,7 @@ func TestWorkerRunPurgeFailureIsLoggedAndRetried(t *testing.T) {
 	}
 
 	calls := fake.purgeCallCount()
-	assert.Equal(t, before+float64(calls)*2, metricValue(t, metrics.JobsPurgedTotal),
+	assert.Equal(t, before+float64(calls)*2, metricValue(t, "jobs_purged_total"),
 		"rows deleted before a batch failure must still be counted")
 }
 
@@ -1119,8 +1187,8 @@ func TestWorkerRunRetentionDisabled(t *testing.T) {
 func TestWorkerRunPassesLeaseDurationToClaim(t *testing.T) {
 	t.Parallel()
 
-	fake := &fakeStore{claimed: []claimedJob{{
-		ID:          13,
+	fake := &fakeStore{claimed: []claimedJob{{TenantID: testID(2),
+		ID:          testID(13),
 		Kind:        "ok",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
@@ -1169,7 +1237,8 @@ func TestWorkerRunProcessesMoreThanConcurrencyAndStops(t *testing.T) {
 	pending := make([]claimedJob, total)
 	for i := range pending {
 		pending[i] = claimedJob{
-			ID:          int64(i + 1),
+			TenantID:    testID(2),
+			ID:          testID(i + 1),
 			Kind:        "ok",
 			Payload:     json.RawMessage(`{}`),
 			Attempts:    1,
@@ -1232,7 +1301,8 @@ func TestProcessJobHeartbeatsWhileHandlerRuns(t *testing.T) {
 	})
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          14,
+		TenantID:    testID(2),
+		ID:          testID(14),
 		Kind:        "slow",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
@@ -1242,7 +1312,7 @@ func TestProcessJobHeartbeatsWhileHandlerRuns(t *testing.T) {
 	heartbeats := fake.lastHeartbeats()
 	require.NotEmpty(t, heartbeats, "a blocked handler must renew its lease")
 	for _, hb := range heartbeats {
-		assert.Equal(t, int64(14), hb.id)
+		assert.Equal(t, testID(14), hb.id)
 		assert.Equal(t, "heartbeat-worker", hb.workerID)
 		assert.Equal(t, 1, hb.attempts)
 	}
@@ -1250,7 +1320,7 @@ func TestProcessJobHeartbeatsWhileHandlerRuns(t *testing.T) {
 	before := fake.heartbeatCount()
 	time.Sleep(20 * time.Millisecond)
 	assert.Equal(t, before, fake.heartbeatCount(), "heartbeat must stop before processJob returns")
-	assert.Equal(t, []int64{14}, fake.succeededIDs())
+	assert.Equal(t, []uuid.UUID{testID(14)}, fake.succeededIDs())
 	assert.Empty(t, fake.failures)
 }
 
@@ -1274,7 +1344,8 @@ func TestProcessJobHeartbeatFailureDoesNotFailJob(t *testing.T) {
 	})
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          15,
+		TenantID:    testID(2),
+		ID:          testID(15),
 		Kind:        "slow",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
@@ -1282,7 +1353,7 @@ func TestProcessJobHeartbeatFailureDoesNotFailJob(t *testing.T) {
 	}))
 
 	assert.GreaterOrEqual(t, fake.heartbeatCount(), 1)
-	assert.Equal(t, []int64{15}, fake.succeededIDs(), "a transient heartbeat error before lease expiry must not change the outcome")
+	assert.Equal(t, []uuid.UUID{testID(15)}, fake.succeededIDs(), "a transient heartbeat error before lease expiry must not change the outcome")
 	assert.Empty(t, fake.failures)
 }
 
@@ -1300,7 +1371,7 @@ func TestProcessJobLeaseLostCancelsHandler(t *testing.T) {
 	)
 	worker.store = fake
 
-	before := metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind))
+	before := metricValue(t, "jobs_lease_lost_total", "kind", kind)
 	cause := make(chan error, 1)
 	worker.Register(kind, func(ctx context.Context, _ json.RawMessage) error {
 		<-ctx.Done()
@@ -1309,7 +1380,8 @@ func TestProcessJobLeaseLostCancelsHandler(t *testing.T) {
 	})
 
 	require.NoError(t, processJobWithWatchdog(t, worker, context.Background(), claimedJob{
-		ID:          21,
+		TenantID:    testID(2),
+		ID:          testID(21),
 		Kind:        kind,
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
@@ -1325,7 +1397,7 @@ func TestProcessJobLeaseLostCancelsHandler(t *testing.T) {
 	assert.Empty(t, fake.succeededIDs(), "a lost lease must not record success")
 	assert.Empty(t, fake.failures, "a lost lease must not record a handler failure")
 	assert.Empty(t, fake.releases, "a lost lease must not release the new owner's job")
-	assert.Equal(t, before+1, metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind)))
+	assert.Equal(t, before+1, metricValue(t, "jobs_lease_lost_total", "kind", kind))
 }
 
 // TestProcessJobHeartbeatDeadlineCancelsHandler proves repeated transient
@@ -1353,7 +1425,7 @@ func TestProcessJobHeartbeatDeadlineCancelsHandler(t *testing.T) {
 	worker.now = clock.Now
 	require.Equal(t, 4995*time.Millisecond, worker.leaseCancelMargin())
 
-	before := metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind))
+	before := metricValue(t, "jobs_lease_lost_total", "kind", kind)
 	cause := make(chan error, 1)
 	worker.Register(kind, func(ctx context.Context, _ json.RawMessage) error {
 		<-ctx.Done()
@@ -1362,7 +1434,8 @@ func TestProcessJobHeartbeatDeadlineCancelsHandler(t *testing.T) {
 	})
 
 	require.NoError(t, processJobWithWatchdog(t, worker, context.Background(), claimedJob{
-		ID:          22,
+		TenantID:    testID(2),
+		ID:          testID(22),
 		Kind:        kind,
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
@@ -1380,7 +1453,7 @@ func TestProcessJobHeartbeatDeadlineCancelsHandler(t *testing.T) {
 	assert.Empty(t, fake.succeededIDs())
 	assert.Empty(t, fake.failures)
 	assert.Empty(t, fake.releases)
-	assert.Equal(t, before+1, metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind)))
+	assert.Equal(t, before+1, metricValue(t, "jobs_lease_lost_total", "kind", kind))
 }
 
 // TestWorkerLeaseCancelMargin pins the margin formula and its degenerate-lease
@@ -1434,7 +1507,7 @@ func TestWorkerCountsLeaseExpiredDeadLetters(t *testing.T) {
 	t.Parallel()
 
 	const kind = "lease.dead"
-	fake := &fakeStore{leaseDead: []leaseExpiredJob{{ID: 31, TenantID: 2, Kind: kind}}}
+	fake := &fakeStore{leaseDead: []leaseExpiredJob{{ID: testID(31), TenantID: testID(2), Kind: kind}}}
 	worker := NewWorker(nil, "dead-letter-worker", WithPollInterval(time.Millisecond))
 	worker.store = fake
 
@@ -1444,13 +1517,13 @@ func TestWorkerCountsLeaseExpiredDeadLetters(t *testing.T) {
 		return nil
 	})
 
-	before := metricValue(t, metrics.JobsLeaseDeadTotal.WithLabelValues(kind))
+	before := metricValue(t, "jobs_lease_dead_total", "kind", kind)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- worker.Run(ctx) }()
 
 	require.Eventually(t, func() bool {
-		return metricValue(t, metrics.JobsLeaseDeadTotal.WithLabelValues(kind)) == before+1
+		return metricValue(t, "jobs_lease_dead_total", "kind", kind) == before+1
 	}, time.Second, time.Millisecond)
 
 	cancel()
@@ -1472,7 +1545,7 @@ func TestPGStoreHeartbeatRequiresPool(t *testing.T) {
 	t.Parallel()
 
 	store := newPGStore(nil)
-	err := store.Heartbeat(context.Background(), 1, "worker", 1, time.Minute)
+	err := store.Heartbeat(context.Background(), testID(1), "worker", 1, time.Minute)
 	require.ErrorIs(t, err, ErrNoPool)
 
 	_, err = store.Claim(context.Background(), "worker", 1, time.Second)
@@ -1519,36 +1592,40 @@ func TestQueueValidationBeforeDatabase(t *testing.T) {
 	t.Parallel()
 
 	queue := NewQueue(nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
-	_, err := queue.Enqueue(context.Background(), Job{})
+	_, err := queue.Enqueue(ctx, Job{})
 	require.ErrorIs(t, err, ErrEmptyKind)
 
-	_, err = queue.Enqueue(context.Background(), Job{Kind: "ok", Payload: json.RawMessage(`not-json`)})
+	_, err = queue.Enqueue(ctx, Job{Kind: "ok", Payload: json.RawMessage(`not-json`)})
 	require.ErrorIs(t, err, ErrInvalidPayload)
 
-	_, err = queue.Enqueue(context.Background(), Job{Kind: "ok"})
+	_, err = queue.Enqueue(ctx, Job{Kind: "ok"})
 	require.ErrorIs(t, err, ErrNoPool)
 
-	_, err = queue.EnqueueTx(context.Background(), nil, Job{Kind: "ok"})
+	_, err = queue.EnqueueTx(ctx, nil, Job{Kind: "ok"})
 	require.ErrorIs(t, err, ErrNoTx)
 
-	_, _, err = queue.EnqueueOnce(context.Background(), Job{Kind: "ok"})
+	_, _, err = queue.EnqueueOnce(ctx, Job{Kind: "ok"})
 	require.ErrorIs(t, err, ErrEmptyIdempotencyKey)
 
-	_, _, err = queue.EnqueueOnce(context.Background(), Job{Kind: "ok", IdempotencyKey: " k "})
+	_, _, err = queue.EnqueueOnce(ctx, Job{Kind: "ok", IdempotencyKey: " k "})
 	require.ErrorIs(t, err, ErrNoPool)
 
-	_, _, err = queue.EnqueueOnceTx(context.Background(), nil, Job{Kind: "ok", IdempotencyKey: "k"})
+	_, _, err = queue.EnqueueOnceTx(ctx, nil, Job{Kind: "ok", IdempotencyKey: "k"})
 	require.ErrorIs(t, err, ErrNoTx)
 }
 
 func TestQueuedSenderSendRequiresPool(t *testing.T) {
 	t.Parallel()
 
-	sender := NewQueuedSender(NewQueue(nil))
+	codec, codecErr := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, codecErr)
+	sender := NewQueuedSender(NewQueue(nil), codec)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	var err error
 	require.NotPanics(t, func() {
-		err = sender.Send(context.Background(), email.Message{
+		err = sender.Send(ctx, email.Message{
 			To:      []string{"user@example.com"},
 			Subject: "Verify Your Email Address",
 		})
@@ -1557,7 +1634,7 @@ func TestQueuedSenderSendRequiresPool(t *testing.T) {
 
 	// A nil sender or queue must fail cleanly instead of panicking.
 	require.NotPanics(t, func() {
-		err = (*QueuedSender)(nil).Send(context.Background(), email.Message{})
+		err = (*QueuedSender)(nil).Send(ctx, email.Message{})
 	})
 	require.Error(t, err)
 }
@@ -1565,7 +1642,9 @@ func TestQueuedSenderSendRequiresPool(t *testing.T) {
 func TestQueuedSenderSendTxRequiresTransaction(t *testing.T) {
 	t.Parallel()
 
-	sender := NewQueuedSender(NewQueue(nil))
+	codec, codecErr := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, codecErr)
+	sender := NewQueuedSender(NewQueue(nil), codec)
 	var err error
 	require.NotPanics(t, func() {
 		err = sender.SendTx(context.Background(), nil, email.Message{
@@ -1655,13 +1734,13 @@ type fakeStore struct {
 }
 
 type fakeSuccess struct {
-	id       int64
+	id       uuid.UUID
 	workerID string
 	attempts int
 }
 
 type fakeFailure struct {
-	id       int64
+	id       uuid.UUID
 	workerID string
 	attempts int
 	reason   string
@@ -1669,7 +1748,7 @@ type fakeFailure struct {
 }
 
 type fakeHeartbeat struct {
-	id       int64
+	id       uuid.UUID
 	workerID string
 	attempts int
 }
@@ -1694,14 +1773,14 @@ func (f *fakeStore) Claim(_ context.Context, _ string, _ int, staleAfter time.Du
 	return batch, nil
 }
 
-func (f *fakeStore) Succeed(_ context.Context, id int64, workerID string, attempts int) error {
+func (f *fakeStore) Succeed(_ context.Context, id uuid.UUID, workerID string, attempts int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.succeeded = append(f.succeeded, fakeSuccess{id: id, workerID: workerID, attempts: attempts})
 	return f.succeedErr
 }
 
-func (f *fakeStore) Fail(_ context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error {
+func (f *fakeStore) Fail(_ context.Context, id uuid.UUID, workerID string, attempts int, reason string, retryAt *time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failures = append(f.failures, fakeFailure{
@@ -1714,7 +1793,7 @@ func (f *fakeStore) Fail(_ context.Context, id int64, workerID string, attempts 
 	return f.failErr
 }
 
-func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string, attempts int, _ time.Duration) error {
+func (f *fakeStore) Heartbeat(_ context.Context, id uuid.UUID, workerID string, attempts int, _ time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.heartbeats = append(f.heartbeats, fakeHeartbeat{id: id, workerID: workerID, attempts: attempts})
@@ -1726,7 +1805,7 @@ func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string, atte
 	return f.heartbeatErr
 }
 
-func (f *fakeStore) Release(_ context.Context, id int64, workerID string, attempts int, reason string) error {
+func (f *fakeStore) Release(_ context.Context, id uuid.UUID, workerID string, attempts int, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.releases = append(f.releases, fakeFailure{id: id, workerID: workerID, attempts: attempts, reason: reason})
@@ -1759,10 +1838,10 @@ func (f *fakeStore) retentionSeen() time.Duration {
 	return f.lastRetention
 }
 
-func (f *fakeStore) succeededIDs() []int64 {
+func (f *fakeStore) succeededIDs() []uuid.UUID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	ids := make([]int64, len(f.succeeded))
+	ids := make([]uuid.UUID, len(f.succeeded))
 	for i, success := range f.succeeded {
 		ids[i] = success.id
 	}
@@ -1814,8 +1893,8 @@ func TestProcessJobSpanOmitsRawErrors(t *testing.T) {
 	})
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          11,
-		TenantID:    2,
+		ID:          testID(11),
+		TenantID:    testID(2),
 		Kind:        "fail",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
@@ -1825,15 +1904,19 @@ func TestProcessJobSpanOmitsRawErrors(t *testing.T) {
 	ended := recorder.Ended()
 	require.Len(t, ended, 1)
 	span := ended[0]
-	assert.Equal(t, "job.process", span.Name())
+	assert.Equal(t, "fail process", span.Name())
 	assert.Equal(t, codes.Error, span.Status().Code)
 	assert.Empty(t, span.Status().Description)
 	assert.Empty(t, span.Events(), "raw error messages must not become span events")
 	assert.Equal(t, "application_error", jobsAttrString(span.Attributes(), semconv.ErrorTypeKey))
+	assert.Equal(t, "job_queue", jobsAttrString(span.Attributes(), semconv.MessagingSystemKey))
+	assert.Equal(t, "process", jobsAttrString(span.Attributes(), semconv.MessagingOperationTypeKey))
+	assert.Equal(t, testID(11).String(), jobsAttrString(span.Attributes(), semconv.MessagingMessageIDKey))
+	assert.Equal(t, "fail", jobsAttrString(span.Attributes(), semconv.MessagingDestinationNameKey))
 	assert.Equal(t, "retried", jobsAttrString(span.Attributes(), attribute.Key("job.outcome")))
-	assert.Equal(t, int64(11), jobsAttrInt(span.Attributes(), attribute.Key("job.id")))
+	assert.Equal(t, testID(11).String(), jobsAttrString(span.Attributes(), attribute.Key("job.id")))
 	assert.Equal(t, "fail", jobsAttrString(span.Attributes(), attribute.Key("job.kind")))
-	assert.Equal(t, int64(2), jobsAttrInt(span.Attributes(), attribute.Key("job.tenant_id")))
+	assert.Equal(t, testID(2).String(), jobsAttrString(span.Attributes(), attribute.Key("job.tenant_id")))
 	assert.Equal(t, int64(1), jobsAttrInt(span.Attributes(), attribute.Key("job.attempt")))
 	assert.Equal(t, int64(3), jobsAttrInt(span.Attributes(), attribute.Key("job.max_attempts")))
 
@@ -1854,7 +1937,7 @@ func TestProcessJobSpanOutcomeAttributes(t *testing.T) {
 		worker.Register("ok", func(context.Context, json.RawMessage) error { return nil })
 
 		require.NoError(t, worker.processJob(context.Background(), claimedJob{
-			ID: 12, TenantID: 1, Kind: "ok", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
+			ID: testID(12), TenantID: testID(1), Kind: "ok", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
 		}))
 
 		ended := recorder.Ended()
@@ -1873,7 +1956,7 @@ func TestProcessJobSpanOutcomeAttributes(t *testing.T) {
 		})
 
 		require.NoError(t, worker.processJob(context.Background(), claimedJob{
-			ID: 13, TenantID: 1, Kind: "fail", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
+			ID: testID(13), TenantID: testID(1), Kind: "fail", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
 		}))
 
 		ended := recorder.Ended()
@@ -1902,14 +1985,14 @@ func TestProcessJobSpanLinksEnqueueTraceAsNewRoot(t *testing.T) {
 	worker.Register("ok", func(context.Context, json.RawMessage) error { return nil })
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID: 14, TenantID: 1, Kind: "ok", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
+		ID: testID(14), TenantID: testID(1), Kind: "ok", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
 		TraceParent: traceparent,
 	}))
 
 	ended := recorder.Ended()
 	require.Len(t, ended, 2)
 	jobSpan := ended[1]
-	require.Equal(t, "job.process", jobSpan.Name())
+	require.Equal(t, "ok process", jobSpan.Name())
 	assert.False(t, jobSpan.Parent().IsValid(), "each attempt is a new root")
 	require.Len(t, jobSpan.Links(), 1)
 	assert.Equal(t, enqueueSpanCtx.TraceID(), jobSpan.Links()[0].SpanContext.TraceID())
@@ -1925,7 +2008,7 @@ func TestProcessJobSpanWithoutTraceParentHasNoLink(t *testing.T) {
 	worker.Register("ok", func(context.Context, json.RawMessage) error { return nil })
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID: 15, TenantID: 1, Kind: "ok", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
+		ID: testID(15), TenantID: testID(1), Kind: "ok", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
 		TraceParent: "corrupt-value",
 	}))
 
@@ -1972,4 +2055,9 @@ func jobsAttrBool(attrs []attribute.KeyValue, key attribute.Key) bool {
 		}
 	}
 	return false
+}
+
+// testID returns a deterministic UUID for a small fixture number.
+func testID(n int) uuid.UUID {
+	return uuid.MustParse(fmt.Sprintf("0192c9b0-7e4a-7000-8000-%012d", n))
 }

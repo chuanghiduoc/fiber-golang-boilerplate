@@ -1,8 +1,9 @@
-# Dedicated job worker (APP_ROLE=worker): the durable job worker, the optional
+# Dedicated job worker (APP_ROLE=worker): the durable job worker, the
 # scheduler, and module background loops, plus /healthz, /readyz (database and
-# cache), and /metrics on 8080. It mounts no /api route and no Service selects
-# it. Replicas are safe to scale: jobs are claimed with FOR UPDATE SKIP LOCKED
-# and the scheduler elects one leader through scheduler_leases.
+# cache), and /metrics on 8080. It mounts no /api route, has no Service, and no
+# Ingress selects it. Replicas are safe to scale: jobs are claimed with
+# FOR UPDATE SKIP LOCKED and the scheduler elects one leader through
+# scheduler_leases.
 #
 # For bulkheads, copy this Deployment under another name and set
 # JOBS_WORKER_KINDS on the copy and JOBS_WORKER_EXCLUDE_KINDS here (same
@@ -18,7 +19,11 @@ metadata:
     app.kubernetes.io/part-of: fiber-boilerplate
     app.kubernetes.io/component: worker
 spec:
-  replicas: 1
+  # Two replicas keep the scheduler lease and job claims available during a
+  # rolling update or node drain. The PDB permits one voluntary disruption.
+  # When the optional KEDA component manages this Deployment, remove
+  # spec.replicas so the two controllers do not fight over it.
+  replicas: 2
   revisionHistoryLimit: 3
   progressDeadlineSeconds: 600
   strategy:
@@ -38,17 +43,21 @@ spec:
         app.kubernetes.io/part-of: fiber-boilerplate
         app.kubernetes.io/component: worker
     spec:
+      serviceAccountName: fiber-boilerplate-worker
       automountServiceAccountToken: false
       enableServiceLinks: false
-      # The worker shares the API's 20s shutdown budget (job drain, scheduler,
-      # span flush, pool close) plus margin. It receives no traffic, so it
-      # needs no preStop delay.
-      terminationGracePeriodSeconds: 30
+      # The worker drains a claimed job inside the same 20s shutdown budget as
+      # the API, then exits. The remaining grace covers a handler that ignores
+      # cancellation and keeps heartbeating: the kubelet kills the pod at 300s,
+      # which is also the default job lease duration, so another worker can
+      # reclaim the job at about the same time. Keep this at or below
+      # JOBS lease duration if you change either.
+      terminationGracePeriodSeconds: 300
       securityContext:
         runAsNonRoot: true
-        runAsUser: 100
-        runAsGroup: 101
-        fsGroup: 101
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
@@ -64,11 +73,35 @@ spec:
           envFrom:
             - configMapRef:
                 name: fiber-boilerplate-config
-            - secretRef:
-                name: fiber-boilerplate-secrets
           env:
             - name: APP_ROLE
               value: worker
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: worker
+                  resource: limits.memory
+                  divisor: "1"
+            - name: JWT_SECRET_FILE
+              value: /var/run/secrets/fiber-boilerplate/JWT_SECRET
+            - name: DB_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate/DB_PASSWORD
+            - name: DB_BYPASS_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate/DB_BYPASS_PASSWORD
+            - name: DATA_ENCRYPTION_KEY_FILE
+              value: /var/run/secrets/fiber-boilerplate/DATA_ENCRYPTION_KEY
+            - name: WEBHOOK_SECRET_ENCRYPTION_KEY_FILE
+              value: /var/run/secrets/fiber-boilerplate/WEBHOOK_SECRET_ENCRYPTION_KEY
+            - name: OAUTH_STATE_KEY_FILE
+              value: /var/run/secrets/fiber-boilerplate/OAUTH_STATE_KEY
+            - name: METRICS_AUTH_TOKEN_FILE
+              value: /var/run/secrets/fiber-boilerplate/METRICS_AUTH_TOKEN
+            - name: REDIS_URL_FILE
+              value: /var/run/secrets/fiber-boilerplate/REDIS_URL
+            - name: STORAGE_S3_SECRET_KEY_FILE
+              value: /var/run/secrets/fiber-boilerplate/STORAGE_S3_SECRET_KEY
+            - name: SMTP_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate/SMTP_PASSWORD
           resources:
             requests:
               cpu: 250m
@@ -78,8 +111,8 @@ spec:
               memory: 512Mi
           securityContext:
             runAsNonRoot: true
-            runAsUser: 100
-            runAsGroup: 101
+            runAsUser: 65532
+            runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -96,7 +129,7 @@ spec:
             httpGet:
               path: /readyz
               port: http
-            periodSeconds: 10
+            periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
           livenessProbe:
@@ -109,7 +142,14 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: secrets
+              mountPath: /var/run/secrets/fiber-boilerplate
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 512Mi
+        - name: secrets
+          secret:
+            secretName: fiber-boilerplate-secrets
+            defaultMode: 0440

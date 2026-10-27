@@ -2,17 +2,10 @@ package handler
 
 import (
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
-	"strings"
 	"testing"
 
-	"github.com/gofiber/fiber/v3"
-
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
-	"{{.M.ModulePath}}/pkg/apperror/apperrorhttp"
 )
 
 // TestMain registers the module catalog so error codes render with their
@@ -23,34 +16,4 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	os.Exit(m.Run())
-}
-
-// newTestApp returns a Fiber app with the production error renderer. Routes
-// are mounted without auth: these tests cover binding, mapping, and status
-// codes; module_test.go and test/arch cover the middleware chain.
-func newTestApp() *fiber.App {
-	return fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
-}
-
-// do sends one request and returns the status and body.
-func do(t *testing.T, app *fiber.App, method, target, body string) (status int, payload string) {
-	t.Helper()
-	var reader io.Reader = http.NoBody
-	if body != "" {
-		reader = strings.NewReader(body)
-	}
-	req := httptest.NewRequest(method, target, reader)
-	if body != "" {
-		req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
-	}
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("%s %s: %v", method, target, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	return resp.StatusCode, string(raw)
 }

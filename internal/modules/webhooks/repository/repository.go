@@ -10,15 +10,16 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	webhooksvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 const (
@@ -43,7 +44,7 @@ var (
 // repository tests independent of a live queue while preserving atomic
 // delivery+job commits.
 type JobQueue interface {
-	EnqueueTx(ctx context.Context, tx pgx.Tx, job jobs.Job) (int64, error)
+	EnqueueTx(ctx context.Context, tx pgx.Tx, job jobs.Job) (uuid.UUID, error)
 }
 
 // Postgres implements every webhooks persistence interface.
@@ -52,6 +53,7 @@ type Postgres struct {
 	tx    *database.TxManager
 	q     *webhooksqlc.Queries
 	queue JobQueue
+	audit audit.TxRecorder
 }
 
 var (
@@ -64,8 +66,12 @@ var (
 // New returns a repository backed by db for single statements and tx for
 // multi-statement work. queue may be nil only for reads and non-job writes;
 // delivery creation and retry scheduling fail with ErrNoQueue.
-func New(db database.DBTX, tx *database.TxManager, queue JobQueue) *Postgres {
-	return &Postgres{db: db, tx: tx, q: webhooksqlc.New(db), queue: queue}
+func New(db database.DBTX, tx *database.TxManager, queue JobQueue, recorders ...audit.TxRecorder) *Postgres {
+	var recorder audit.TxRecorder
+	if len(recorders) > 0 {
+		recorder = recorders[0]
+	}
+	return &Postgres{db: db, tx: tx, q: webhooksqlc.New(db), queue: queue, audit: recorder}
 }
 
 func (r *Postgres) withTx(ctx context.Context, fn func(tx pgx.Tx, q *webhooksqlc.Queries) error) error {
@@ -75,11 +81,6 @@ func (r *Postgres) withTx(ctx context.Context, fn func(tx pgx.Tx, q *webhooksqlc
 	return r.tx.WithTx(ctx, func(tx pgx.Tx) error {
 		return fn(tx, r.q.WithTx(tx))
 	})
-}
-
-// tenantID returns the tenant every scoped query must use.
-func tenantID(ctx context.Context) int64 {
-	return tenant.EffectiveID(ctx)
 }
 
 func mapNotFound(err error) error {
@@ -96,23 +97,34 @@ func mapInboundConflict(err error) error {
 	return err
 }
 
-func timestamp(t time.Time) pgtype.Timestamptz {
-	return pgtype.Timestamptz{Time: t.UTC(), Valid: !t.IsZero()}
-}
-
-func nullableInt8(value int64) pgtype.Int8 {
-	if value == 0 {
-		return pgtype.Int8{}
+func nullableUUID(value *uuid.UUID) uuid.NullUUID {
+	if value == nil || *value == uuid.Nil {
+		return uuid.NullUUID{}
 	}
-	return pgtype.Int8{Int64: value, Valid: true}
+	return uuid.NullUUID{UUID: *value, Valid: true}
 }
 
-func timePtr(value pgtype.Timestamptz) *time.Time {
+// parseActorID converts the event envelope's string actor id into the nullable
+// UUID webhook_events stores. A system actor has no id; any other actor must
+// name a valid UUID.
+func parseActorID(value string) (uuid.NullUUID, error) {
+	if value == "" {
+		return uuid.NullUUID{}, nil
+	}
+	id, err := uuid.Parse(value)
+	if err != nil || id == uuid.Nil {
+		return uuid.NullUUID{}, fmt.Errorf("webhooks: invalid actor id %q", value)
+	}
+	return uuid.NullUUID{UUID: id, Valid: true}, nil
+}
+
+// uuidString renders a nullable UUID for the event envelope, where a system
+// actor has an empty id.
+func uuidString(value uuid.NullUUID) string {
 	if !value.Valid {
-		return nil
+		return ""
 	}
-	t := value.Time
-	return &t
+	return value.UUID.String()
 }
 
 func intPtr(value pgtype.Int4) *int {
@@ -123,20 +135,20 @@ func intPtr(value pgtype.Int4) *int {
 	return &v
 }
 
-func int64Ptr(value pgtype.Int8) *int64 {
+func uuidPtr(value uuid.NullUUID) *uuid.UUID {
 	if !value.Valid {
 		return nil
 	}
-	v := value.Int64
+	v := value.UUID
 	return &v
 }
 
-func jobPayload(deliveryID int64) json.RawMessage {
+func jobPayload(deliveryID uuid.UUID) json.RawMessage {
 	payload, _ := json.Marshal(webhooksvc.DeliveryJobPayload{DeliveryID: deliveryID})
 	return payload
 }
 
-func enqueueDeliveryJob(ctx context.Context, tx pgx.Tx, queue JobQueue, tenantID, deliveryID int64, runAt time.Time) error {
+func enqueueDeliveryJob(ctx context.Context, tx pgx.Tx, queue JobQueue, tenantID, deliveryID uuid.UUID, runAt time.Time) error {
 	if queue == nil {
 		return ErrNoQueue
 	}
@@ -151,4 +163,32 @@ func enqueueDeliveryJob(ctx context.Context, tx pgx.Tx, queue JobQueue, tenantID
 		return fmt.Errorf("webhooks: enqueue delivery job: %w", err)
 	}
 	return nil
+}
+
+// mapConditionalUpdate turns a conditional UPDATE's no-row result into 412
+// when the row still exists, or 404 when it was deleted concurrently. A
+// missing precondition is the caller's concern; this helper is only reached
+// from the conditional branch.
+func mapConditionalUpdate(
+	_ context.Context,
+	_ *webhooksqlc.Queries,
+	err error,
+	exists func() error,
+) error {
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return mapNotFound(err)
+	}
+	switch existsErr := exists(); {
+	case existsErr == nil:
+		return apperror.NewPreconditionFailed("the resource has changed since it was read; refresh and retry")
+	case errors.Is(existsErr, pgx.ErrNoRows):
+		return apperror.ErrNotFound
+	default:
+		return existsErr
+	}
+}
+
+// timestamptzValue wraps a non-zero time for a conditional statement.
+func timestamptzValue(t time.Time) pgtype.Timestamptz {
+	return pgtype.Timestamptz{Time: t, Valid: true}
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -16,20 +17,21 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
 
-// The security notification's email.send job is written on the change's
+// The security notification's encrypted email job is written on the change's
 // transaction: it commits with the change and disappears when a later step
 // (the audit row) fails and the transaction rolls back.
 func TestChangePassword_NotificationJobRollsBackWithChange(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	member := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "job-notify@example.com",
-		testutil.MemberOptions{Password: "Password1!", Role: identityservice.RoleMember})
+		testutil.MemberOptions{Password: testPassphrase, Role: identityservice.RoleMember})
 
-	queue := jobs.NewQueue(testutil.Scoped(e.pool))
-	sender := jobs.NewQueuedSender(queue)
+	queue := jobs.NewQueue(e.fx.Scoped())
+	codec, err := jobs.NewPayloadCodec("identity-notification-encryption-key")
+	require.NoError(t, err)
+	sender := jobs.NewQueuedSender(queue, codec)
 	security := identityservice.NewSecurityNotifier(e.stores.Tenants, nil)
 	newUsers := func(tx *identityrepo.Transactor) identityservice.UserService {
 		return identityservice.NewUserService(identityservice.UserDeps{
@@ -37,13 +39,13 @@ func TestChangePassword_NotificationJobRollsBackWithChange(t *testing.T) {
 		})
 	}
 	jobCount := func() int64 {
-		return scalar[int64](t, e.pool, `SELECT count(*) FROM jobs WHERE kind = 'email.send' AND tenant_id = $1`, tenant.DefaultID)
+		return scalar[int64](t, e.pool, `SELECT count(*) FROM jobs WHERE kind = 'email.send.encrypted' AND tenant_id = $1`, tenant.DefaultID)
 	}
 
 	okTx := identityrepo.NewTransactorWithQueue(
-		testutil.NewTxManager(e.pool), audit.NewPostgresRecorder(testutil.Scoped(e.pool)), sender, nil, queue)
+		e.fx.Tx(), audit.NewPostgresRecorder(e.fx.Scoped()), sender, nil, queue, testutil.BanHasher(t))
 	require.NoError(t, newUsers(okTx).ChangePassword(ctx, member.UserID, identityservice.ChangePasswordInput{
-		CurrentPassword: "Password1!", NewPassword: "Password2!",
+		CurrentPassword: testPassphrase, NewPassword: testNewPassword,
 	}))
 	require.Equal(t, int64(1), jobCount(), "the email job must commit with the password change")
 
@@ -51,9 +53,9 @@ func TestChangePassword_NotificationJobRollsBackWithChange(t *testing.T) {
 	// notification was enqueued; the whole transaction, including the job,
 	// must roll back.
 	brokenTx := identityrepo.NewTransactorWithQueue(
-		testutil.NewTxManager(e.pool), nil, sender, nil, queue)
-	err := newUsers(brokenTx).ChangePassword(ctx, member.UserID, identityservice.ChangePasswordInput{
-		CurrentPassword: "Password2!", NewPassword: "Password3!",
+		e.fx.Tx(), nil, sender, nil, queue, testutil.BanHasher(t))
+	err = newUsers(brokenTx).ChangePassword(ctx, member.UserID, identityservice.ChangePasswordInput{
+		CurrentPassword: testNewPassword, NewPassword: testAnotherPassword,
 	})
 	require.Error(t, err)
 	assert.Equal(t, string(apperror.CodeSystemAuditUnavailable), appCode(err))

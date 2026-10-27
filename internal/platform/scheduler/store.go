@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 var (
@@ -30,7 +31,7 @@ const (
 // Queue is the durable jobs surface used by the scheduler. *jobs.Queue
 // implements it.
 type Queue interface {
-	EnqueueOnceTx(ctx context.Context, tx pgx.Tx, job jobs.Job) (int64, bool, error)
+	EnqueueOnceTx(ctx context.Context, tx pgx.Tx, job jobs.Job) (uuid.UUID, bool, error)
 }
 
 type runRecord struct {
@@ -192,7 +193,7 @@ func (s *pgStore) EnqueueRun(ctx context.Context, queue Queue, run runRecord, jo
 	ctx = database.WithRLSBypass(ctx) // Schedules enqueue global platform jobs, not a tenant's.
 	enqueued := false
 	err := s.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		var runID int64
+		var runID uuid.UUID
 		err := tx.QueryRow(ctx, insertRunSQL, run.Schedule, run.ScheduledFor, run.Status, run.Error).Scan(&runID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -223,7 +224,7 @@ func (s *pgStore) SkipRun(ctx context.Context, run runRecord) (bool, error) {
 	}
 	skipped := false
 	err := s.tx.WithTx(ctx, func(tx pgx.Tx) error {
-		var runID int64
+		var runID uuid.UUID
 		err := tx.QueryRow(ctx, insertRunSQL, run.Schedule, run.ScheduledFor, run.Status, run.Error).Scan(&runID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil

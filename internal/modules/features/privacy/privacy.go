@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
+
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 )
 
@@ -21,8 +23,8 @@ type Target struct {
 
 // Store is the module's privacy persistence port.
 type Store interface {
-	List(ctx context.Context, tenantID, userID int64) ([]Target, error)
-	DeleteAll(ctx context.Context, tenantID, userID int64) error
+	List(ctx context.Context, tenantID, userID uuid.UUID) ([]Target, error)
+	DeleteAll(ctx context.Context, tenantID, userID uuid.UUID) error
 }
 
 // Provider implements privacy.Exporter and privacy.Eraser.
@@ -32,7 +34,7 @@ type Provider struct {
 
 func New(store Store) *Provider { return &Provider{store: store} }
 
-func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacycontracts.Section, error) {
+func (p *Provider) Export(ctx context.Context, tenantID, userID uuid.UUID) (privacycontracts.Section, error) {
 	targets, err := p.store.List(ctx, tenantID, userID)
 	if err != nil {
 		return privacycontracts.Section{}, err
@@ -56,6 +58,6 @@ func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacyc
 	return privacycontracts.Section{Name: "features", Data: raw}, nil
 }
 
-func (p *Provider) Erase(ctx context.Context, tenantID, userID int64) error {
+func (p *Provider) Erase(ctx context.Context, tenantID, userID uuid.UUID) error {
 	return p.store.DeleteAll(ctx, tenantID, userID)
 }

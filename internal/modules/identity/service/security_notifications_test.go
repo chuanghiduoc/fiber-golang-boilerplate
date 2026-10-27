@@ -7,13 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/totp"
+	"github.com/google/uuid"
 )
 
 // captureEmails records notifications; it implements both service.Mailer (the
@@ -54,9 +53,9 @@ func notifierFor(db *memDB, sender email.Sender) *SecurityNotifier {
 	return NewSecurityNotifier(db.stores().Tenants, sender)
 }
 
-func seedNotifiableUser(t *testing.T, db *memDB, id int64, emailAddr string) *Member {
+func seedNotifiableUser(t *testing.T, db *memDB, id uuid.UUID, emailAddr string) *Member {
 	t.Helper()
-	hash, err := bcrypt.GenerateFromPassword([]byte("Password1!"), bcrypt.MinCost)
+	hash, err := hashPassword(testPassphrase)
 	if err != nil {
 		t.Fatalf("hash: %v", err)
 	}
@@ -64,12 +63,12 @@ func seedNotifiableUser(t *testing.T, db *memDB, id int64, emailAddr string) *Me
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	db.users[id] = &User{ID: id, Email: emailAddr, Name: "Notify User", Status: UserStatusActive, CreatedAt: now, UpdatedAt: now}
-	db.passwords[id] = string(hash)
-	db.memberships[[2]int64{tenant.DefaultID, id}] = &Membership{
+	db.passwords[id] = hash
+	db.memberships[[2]uuid.UUID{tenant.DefaultID, id}] = &Membership{
 		ID: db.id(), TenantID: tenant.DefaultID, UserID: id, Role: RoleMember,
 		Roles: []string{RoleMember}, Status: MembershipStatusActive, CreatedAt: now, UpdatedAt: now,
 	}
-	return &Member{User: *db.users[id], Membership: *db.memberships[[2]int64{tenant.DefaultID, id}]}
+	return &Member{User: *db.users[id], Membership: *db.memberships[[2]uuid.UUID{tenant.DefaultID, id}]}
 }
 
 // The notifier localizes every event, includes the UTC time and request
@@ -79,7 +78,7 @@ func TestSecurityNotifications_BuildLocalizedEmails(t *testing.T) {
 	mail := &captureEmails{}
 	db.mail = mail
 	n := notifierFor(db, nil)
-	ctx := audit.WithRequestMeta(context.Background(), "req-1", "203.0.113.9", "TestBrowser/1.0")
+	ctx := audit.WithRequestMeta(testTenantCtx(), "req-1", "203.0.113.9", "TestBrowser/1.0")
 	at := time.Date(2026, 10, 26, 9, 30, 0, 0, time.UTC)
 
 	for _, event := range []SecurityEvent{
@@ -93,7 +92,7 @@ func TestSecurityNotifications_BuildLocalizedEmails(t *testing.T) {
 	} {
 		mail.msgs = nil
 		err := n.Deliver(ctx, TxRepos{Mail: mail}, SecurityNotice{
-			Event: event, UserID: 7, Name: "Nguyen Van A", Email: "new@example.com",
+			Event: event, UserID: testID(7), Name: "Nguyen Van A", Email: "new@example.com",
 			PreviousEmail: "old@example.com", OccurredAt: at,
 		})
 		if err != nil {
@@ -141,8 +140,8 @@ func TestSecurityNotifications_UsesTenantLocale(t *testing.T) {
 	db.mail = mail
 	n := notifierFor(db, nil)
 
-	if err := n.Deliver(context.Background(), TxRepos{Mail: mail}, SecurityNotice{
-		Event: SecurityEventPasswordChanged, UserID: 1, Name: "A", Email: "a@example.com",
+	if err := n.Deliver(testTenantCtx(), TxRepos{Mail: mail}, SecurityNotice{
+		Event: SecurityEventPasswordChanged, UserID: testID(1), Name: "A", Email: "a@example.com",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -163,8 +162,8 @@ func TestSecurityNotifications_AfterCommitFallback(t *testing.T) {
 	n := notifierFor(db, sender)
 
 	var afterCommit func()
-	if err := n.Deliver(context.Background(), TxRepos{AfterCommit: func(f func()) { afterCommit = f }}, SecurityNotice{
-		Event: SecurityEventPasswordChanged, UserID: 1, Name: "A", Email: "a@example.com",
+	if err := n.Deliver(testTenantCtx(), TxRepos{AfterCommit: func(f func()) { afterCommit = f }}, SecurityNotice{
+		Event: SecurityEventPasswordChanged, UserID: testID(1), Name: "A", Email: "a@example.com",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -186,8 +185,8 @@ func TestSecurityNotifications_EnqueueFailureAborts(t *testing.T) {
 	db := newMemDB()
 	mail := &captureEmails{fail: context.DeadlineExceeded}
 	n := notifierFor(db, nil)
-	if err := n.Deliver(context.Background(), TxRepos{Mail: mail}, SecurityNotice{
-		Event: SecurityEventPasswordChanged, UserID: 1, Name: "A", Email: "a@example.com",
+	if err := n.Deliver(testTenantCtx(), TxRepos{Mail: mail}, SecurityNotice{
+		Event: SecurityEventPasswordChanged, UserID: testID(1), Name: "A", Email: "a@example.com",
 	}); err == nil {
 		t.Fatal("expected the enqueue failure to surface")
 	}
@@ -200,14 +199,14 @@ func TestChangePassword_EnqueuesSecurityNotification(t *testing.T) {
 	db := newMemDB()
 	mail := &captureEmails{}
 	db.mail = mail
-	seedNotifiableUser(t, db, 10, "change@example.com")
+	seedNotifiableUser(t, db, testID(10), "change@example.com")
 	users := NewUserService(UserDeps{
 		Stores: db.stores(), Tx: memTx{db}, Cache: cache.NewMemoryCache(),
 		Security: notifierFor(db, nil),
 	})
 
-	if err := users.ChangePassword(context.Background(), 10, ChangePasswordInput{
-		CurrentPassword: "Password1!", NewPassword: "Password2!",
+	if err := users.ChangePassword(testTenantCtx(), testID(10), ChangePasswordInput{
+		CurrentPassword: testPassphrase, NewPassword: testNewPassword,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -218,13 +217,13 @@ func TestChangePassword_EnqueuesSecurityNotification(t *testing.T) {
 	if !strings.Contains(msgs[0].Subject, "password was changed") || msgs[0].To[0] != "change@example.com" {
 		t.Fatalf("unexpected notification: %+v", msgs[0])
 	}
-	if strings.Contains(msgs[0].Body, "Password2!") {
+	if strings.Contains(msgs[0].Body, testNewPassword) {
 		t.Error("the notification leaked the new password")
 	}
 
 	before := mail.count()
-	if err := users.ChangePassword(context.Background(), 10, ChangePasswordInput{
-		CurrentPassword: "wrong-password", NewPassword: "Password3!",
+	if err := users.ChangePassword(testTenantCtx(), testID(10), ChangePasswordInput{
+		CurrentPassword: testWrongPassword, NewPassword: testAnotherPassword,
 	}); err == nil {
 		t.Fatal("expected a wrong current password to fail")
 	}
@@ -237,9 +236,9 @@ func TestResetPassword_EnqueuesSecurityNotification(t *testing.T) {
 	db := newMemDB()
 	mail := &captureEmails{}
 	db.mail = mail
-	seedNotifiableUser(t, db, 11, "reset-notify@example.com")
+	seedNotifiableUser(t, db, testID(11), "reset-notify@example.com")
 	stores := db.stores()
-	if created, err := stores.Resets.Create(context.Background(), 11, "reset-notify@example.com", hashToken("reset-token"), time.Now().Add(time.Hour)); err != nil || !created {
+	if created, err := stores.Resets.Create(testTenantCtx(), testID(11), "reset-notify@example.com", hashToken("reset-token"), time.Now().Add(time.Hour)); err != nil || !created {
 		t.Fatalf("create reset token: created=%v err=%v", created, err)
 	}
 	resets := NewPasswordResetService(ResetDeps{
@@ -247,8 +246,8 @@ func TestResetPassword_EnqueuesSecurityNotification(t *testing.T) {
 		Security: notifierFor(db, nil),
 	})
 
-	ctx := WithUserAgent(WithClientIP(context.Background(), "198.51.100.7"), "ResetBrowser/2.0")
-	if err := resets.ResetPassword(ctx, ResetPasswordInput{Token: "reset-token", Password: "Password2@"}); err != nil {
+	ctx := WithUserAgent(WithClientIP(testTenantCtx(), "198.51.100.7"), "ResetBrowser/2.0")
+	if err := resets.ResetPassword(ctx, ResetPasswordInput{Token: "reset-token", Password: testNewPassword}); err != nil {
 		t.Fatal(err)
 	}
 	msgs := mail.messages()
@@ -262,7 +261,7 @@ func TestResetPassword_EnqueuesSecurityNotification(t *testing.T) {
 	}
 
 	before := mail.count()
-	if err := resets.ResetPassword(ctx, ResetPasswordInput{Token: "reset-token", Password: "Password3#"}); err == nil {
+	if err := resets.ResetPassword(ctx, ResetPasswordInput{Token: "reset-token", Password: testAnotherPassword}); err == nil {
 		t.Fatal("expected the consumed token to fail")
 	}
 	if mail.count() != before {
@@ -274,14 +273,14 @@ func TestEmailChange_NotifiesOldAndNewAddresses(t *testing.T) {
 	db := newMemDB()
 	mail := &captureEmails{}
 	db.mail = mail
-	seedNotifiableUser(t, db, 12, "old-address@example.com")
+	seedNotifiableUser(t, db, testID(12), "old-address@example.com")
 	users := NewUserService(UserDeps{
 		Stores: db.stores(), Tx: memTx{db}, Cache: cache.NewMemoryCache(),
 		Security: notifierFor(db, nil),
 	})
 
 	name := "Renamed"
-	if _, err := users.Update(context.Background(), 12, UpdateProfileInput{Name: &name}); err != nil {
+	if _, err := users.Update(testTenantCtx(), testID(12), UpdateProfileInput{Name: &name}); err != nil {
 		t.Fatal(err)
 	}
 	if mail.count() != 0 {
@@ -289,7 +288,7 @@ func TestEmailChange_NotifiesOldAndNewAddresses(t *testing.T) {
 	}
 
 	newAddress := "new-address@example.com"
-	if _, err := users.Update(context.Background(), 12, UpdateProfileInput{Email: &newAddress}); err != nil {
+	if _, err := users.Update(testTenantCtx(), testID(12), UpdateProfileInput{Email: &newAddress}); err != nil {
 		t.Fatal(err)
 	}
 	msgs := mail.messages()
@@ -306,10 +305,10 @@ func TestEmailChange_NotifiesOldAndNewAddresses(t *testing.T) {
 		t.Fatalf("the old address must be told both addresses:\n%s", msgs[1].Body)
 	}
 
-	seedNotifiableUser(t, db, 13, "taken@example.com")
+	seedNotifiableUser(t, db, testID(13), "taken@example.com")
 	before := mail.count()
 	taken := "taken@example.com"
-	if _, err := users.Update(context.Background(), 12, UpdateProfileInput{Email: &taken}); err == nil {
+	if _, err := users.Update(testTenantCtx(), testID(12), UpdateProfileInput{Email: &taken}); err == nil {
 		t.Fatal("expected an address already in use to fail")
 	}
 	if mail.count() != before {
@@ -319,7 +318,7 @@ func TestEmailChange_NotifiesOldAndNewAddresses(t *testing.T) {
 
 func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 	h := newMFAHarness(t)
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	mail := &captureEmails{}
 	h.db.mail = mail
 	h.svc = NewMFAService(MFADeps{
@@ -334,7 +333,7 @@ func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 	}
 
 	h.clock.at = h.clock.at.Add(totp.Period)
-	if _, err := h.svc.RegenerateRecoveryCodes(ctx, 100, codes[0]); err != nil {
+	if _, err := h.svc.RegenerateRecoveryCodes(ctx, testID(100), codes[0]); err != nil {
 		t.Fatal(err)
 	}
 	if msgs := mail.messages(); len(msgs) != 2 || !strings.Contains(msgs[1].Subject, "recovery codes were regenerated") {
@@ -343,7 +342,7 @@ func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 
 	h.clock.at = h.clock.at.Add(totp.Period)
 	code, _ := totp.Code(secret, h.clock.at)
-	if err := h.svc.Disable(ctx, 100, 1, code); err != nil {
+	if err := h.svc.Disable(ctx, testID(100), testID(1), code); err != nil {
 		t.Fatal(err)
 	}
 	if msgs := mail.messages(); len(msgs) != 3 || !strings.Contains(msgs[2].Subject, "two-factor authentication was disabled") {
@@ -351,7 +350,7 @@ func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 	}
 
 	before := mail.count()
-	if err := h.svc.Disable(ctx, 100, 1, code); err == nil {
+	if err := h.svc.Disable(ctx, testID(100), testID(1), code); err == nil {
 		t.Fatal("expected disabling without a factor to fail")
 	}
 	if mail.count() != before {
@@ -366,7 +365,7 @@ func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 		Sealer: reversibleSealer{}, Sessions: reset.sessions, Now: reset.clock.now,
 		Security: notifierFor(reset.db, nil),
 	})
-	if err := reset.svc.ResetTOTP(ctx, 100); err != nil {
+	if err := reset.svc.ResetTOTP(ctx, testID(100)); err != nil {
 		t.Fatal(err)
 	}
 	if msgs := resetMail.messages(); len(msgs) != 1 || !strings.Contains(msgs[0].Subject, "two-factor authentication was reset") {

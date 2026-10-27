@@ -3,9 +3,13 @@ package repository
 import (
 	"context"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
+	"github.com/google/uuid"
 )
 
 // InvitationRepository implements service.InvitationRepository.
@@ -19,44 +23,68 @@ func NewInvitationRepository(db identitysqlc.DBTX) *InvitationRepository {
 	return &InvitationRepository{q: identitysqlc.New(db)}
 }
 
-func toInvitation(row identitysqlc.Invitation) identityservice.Invitation {
-	inv := identityservice.Invitation{
+func toInvitation(row identitysqlc.Invitation, role string) identityservice.Invitation {
+	return identityservice.Invitation{
 		ID:         row.ID,
 		TenantID:   row.TenantID,
 		Email:      row.EmailNormalized,
-		Role:       row.Role,
+		Role:       role,
 		InvitedBy:  row.InvitedBy,
 		ExpiresAt:  row.ExpiresAt.Time,
-		AcceptedAt: timePtr(row.AcceptedAt),
+		AcceptedAt: database.TimePtr(row.AcceptedAt),
+		AcceptedBy: row.AcceptedBy,
 		CreatedAt:  row.CreatedAt.Time,
 		UpdatedAt:  row.UpdatedAt.Time,
 	}
-	if row.AcceptedBy.Valid {
-		by := row.AcceptedBy.Int64
-		inv.AcceptedBy = &by
-	}
-	return inv
 }
 
 func (r *InvitationRepository) Upsert(ctx context.Context, invitation identityservice.NewInvitation) (*identityservice.Invitation, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
+	role, err := r.q.GetRoleByKey(ctx, identitysqlc.GetRoleByKeyParams{Key: invitation.Role, TenantID: tenantID})
+	if err != nil {
+		if isNotFound(wrapErr(err)) {
+			return nil, apperror.NewBadRequest("unknown role")
+		}
+		return nil, wrapErr(err)
+	}
 	row, err := r.q.UpsertInvitation(ctx, identitysqlc.UpsertInvitationParams{
-		TenantID:        tenantID(ctx),
+		TenantID:        tenantID,
 		EmailNormalized: invitation.Email,
-		Role:            invitation.Role,
+		RoleID:          role.ID,
 		TokenHash:       invitation.TokenHash,
 		InvitedBy:       invitation.InvitedBy,
-		ExpiresAt:       timestamptz(invitation.ExpiresAt),
+		ExpiresAt:       database.Timestamptz(invitation.ExpiresAt),
 	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	inv := toInvitation(row)
+	inv := toInvitation(row, invitation.Role)
+	return &inv, nil
+}
+
+func (r *InvitationRepository) Get(ctx context.Context, id uuid.UUID) (*identityservice.Invitation, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
+	row, err := r.q.GetInvitation(ctx, identitysqlc.GetInvitationParams{TenantID: tenantID, ID: id})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	inv := toInvitation(row.Invitation, row.Role)
 	return &inv, nil
 }
 
 func (r *InvitationRepository) ListPendingCursor(ctx context.Context, cur pagination.DBCursor) ([]identityservice.Invitation, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.q.ListPendingInvitationsCursor(ctx, identitysqlc.ListPendingInvitationsCursorParams{
-		TenantID:        tenantID(ctx),
+		TenantID:        tenantID,
 		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
@@ -66,28 +94,32 @@ func (r *InvitationRepository) ListPendingCursor(ctx context.Context, cur pagina
 	}
 	out := make([]identityservice.Invitation, len(rows))
 	for i := range rows {
-		out[i] = toInvitation(rows[i])
+		out[i] = toInvitation(rows[i].Invitation, rows[i].Role)
 	}
 	return out, nil
 }
 
-func (r *InvitationRepository) DeletePending(ctx context.Context, id int64) (bool, error) {
-	n, err := r.q.DeletePendingInvitation(ctx, identitysqlc.DeletePendingInvitationParams{TenantID: tenantID(ctx), ID: id})
+func (r *InvitationRepository) DeletePending(ctx context.Context, id uuid.UUID) (bool, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.q.DeletePendingInvitation(ctx, identitysqlc.DeletePendingInvitationParams{TenantID: tenantID, ID: id})
 	if err != nil {
 		return false, wrapErr(err)
 	}
 	return n > 0, nil
 }
 
-func (r *InvitationRepository) TenantByTokenHash(ctx context.Context, tokenHash string) (int64, error) {
-	tenant, err := r.q.GetInvitationTenantByTokenHash(ctx, tokenHash)
+func (r *InvitationRepository) TenantByTokenHash(ctx context.Context, tokenHash []byte) (uuid.UUID, error) {
+	tenantID, err := r.q.GetInvitationTenantByTokenHash(ctx, tokenHash)
 	if err != nil {
-		return 0, wrapErr(err)
+		return uuid.Nil, wrapErr(err)
 	}
-	return tenant, nil
+	return tenantID, nil
 }
 
-func (r *InvitationRepository) GetByTokenHashForUpdate(ctx context.Context, tenantID int64, tokenHash string) (*identityservice.Invitation, error) {
+func (r *InvitationRepository) GetByTokenHashForUpdate(ctx context.Context, tenantID uuid.UUID, tokenHash []byte) (*identityservice.Invitation, error) {
 	row, err := r.q.GetInvitationByTokenHashForUpdate(ctx, identitysqlc.GetInvitationByTokenHashForUpdateParams{
 		TenantID:  tenantID,
 		TokenHash: tokenHash,
@@ -95,15 +127,15 @@ func (r *InvitationRepository) GetByTokenHashForUpdate(ctx context.Context, tena
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	inv := toInvitation(row)
+	inv := toInvitation(row.Invitation, row.Role)
 	return &inv, nil
 }
 
-func (r *InvitationRepository) MarkAccepted(ctx context.Context, tenant, id, userID int64) (bool, error) {
+func (r *InvitationRepository) MarkAccepted(ctx context.Context, scopedTenantID, id, userID uuid.UUID) (bool, error) {
 	n, err := r.q.MarkInvitationAccepted(ctx, identitysqlc.MarkInvitationAcceptedParams{
-		TenantID:   tenant,
+		TenantID:   scopedTenantID,
 		ID:         id,
-		AcceptedBy: pgInt8(userID),
+		AcceptedBy: uuid.NullUUID{UUID: userID, Valid: true},
 	})
 	if err != nil {
 		return false, wrapErr(err)

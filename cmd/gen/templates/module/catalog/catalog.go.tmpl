@@ -9,24 +9,10 @@ package catalog
 import (
 	"embed"
 	"io/fs"
-
-	"{{.M.ModulePath}}/internal/platform/authz"
-	"{{.M.ModulePath}}/pkg/apperror"
 )
 
 // Owner is the module name (Module.Name()) that owns these entries.
 const Owner = "{{.M.Name}}"
-
-// Register adds this catalog to the process-wide catalogs. At startup
-// app.RegisterCatalogs does the same through the module provider hooks;
-// handler/service unit tests that do not build the app call it directly.
-// Repeating it is a no-op.
-func Register() error {
-	if err := authz.Register(Owner, Permissions()...); err != nil {
-		return err
-	}
-	return apperror.Register(Owner, ErrorCodes())
-}
 
 //go:embed locales/*.json
 var localesFS embed.FS

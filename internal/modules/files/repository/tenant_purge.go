@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -27,7 +29,7 @@ func NewTenantPurger(db filesqlc.DBTX, store storage.Storage) *TenantPurger {
 }
 
 // PurgeTenant processes one bounded page at a time until no file row remains.
-func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID int64) error {
+func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	ctx = tenant.WithID(ctx, tenantID)
 	for {
 		rows, err := p.q.ListTenantFilesForPurge(ctx, filesqlc.ListTenantFilesForPurgeParams{
@@ -40,7 +42,7 @@ func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID int64) error {
 		if len(rows) == 0 {
 			return nil
 		}
-		ids := make([]int64, len(rows))
+		ids := make([]uuid.UUID, len(rows))
 		for i, row := range rows {
 			ids[i] = row.ID
 			if err := p.storage.Delete(ctx, row.StoragePath); err != nil && !errors.Is(err, storage.ErrNotFound) {

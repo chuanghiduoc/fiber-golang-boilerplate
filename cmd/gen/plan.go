@@ -9,7 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -57,7 +57,7 @@ func (p *plan) paths() []string {
 	for _, op := range p.ops {
 		out = append(out, op.path)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 

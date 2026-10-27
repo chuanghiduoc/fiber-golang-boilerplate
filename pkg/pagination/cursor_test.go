@@ -2,26 +2,26 @@ package pagination
 
 import (
 	"encoding/base64"
-	"math"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func TestNextCursor(t *testing.T) {
 	type row struct {
 		at time.Time
-		id int64
+		id uuid.UUID
 	}
-	key := func(r row) (time.Time, int64) { return r.at, r.id }
+	key := func(r row) (time.Time, uuid.UUID) { return r.at, r.id }
 
 	if got := NextCursor([]row(nil), key); got != "" {
 		t.Fatalf("empty page cursor = %q, want empty", got)
 	}
 	last := time.Date(2026, 4, 30, 22, 28, 27, 356_000_000, time.UTC)
-	rows := []row{{at: last.Add(time.Hour), id: 9}, {at: last, id: 7}}
-	if got, want := NextCursor(rows, key), EncodeCursor(last, 7); got != want {
+	rows := []row{{at: last.Add(time.Hour), id: testID(9)}, {at: last, id: testID(7)}}
+	if got, want := NextCursor(rows, key), EncodeCursor(last, testID(7)); got != want {
 		t.Fatalf("cursor = %q, want last row's %q", got, want)
 	}
 }
@@ -35,7 +35,7 @@ func TestEncodeDecodeCursor_RoundTrip(t *testing.T) {
 	// Microsecond precision (PostgreSQL timestamptz granularity) with a colon-rich
 	// timestamp to exercise the LastIndex(":") split.
 	ts := time.Date(2026, 4, 30, 22, 28, 27, 356_000_000, time.UTC)
-	cursor := EncodeCursor(ts, 12345)
+	cursor := EncodeCursor(ts, testID(12345))
 
 	gotTS, gotID, err := DecodeCursor(cursor)
 	if err != nil {
@@ -44,7 +44,7 @@ func TestEncodeDecodeCursor_RoundTrip(t *testing.T) {
 	if !gotTS.Equal(ts) {
 		t.Errorf("timestamp = %v, want %v", gotTS, ts)
 	}
-	if gotID != 12345 {
+	if gotID != testID(12345) {
 		t.Errorf("id = %d, want 12345", gotID)
 	}
 }
@@ -52,7 +52,7 @@ func TestEncodeDecodeCursor_RoundTrip(t *testing.T) {
 func TestEncodeCursor_NormalisesToUTC(t *testing.T) {
 	loc := time.FixedZone("UTC+7", 7*3600)
 	ts := time.Date(2026, 4, 30, 22, 28, 27, 0, loc)
-	_, _, err := DecodeCursor(EncodeCursor(ts, 1))
+	_, _, err := DecodeCursor(EncodeCursor(ts, testID(1)))
 	if err != nil {
 		t.Fatalf("cursor from non-UTC time should decode: %v", err)
 	}
@@ -103,16 +103,16 @@ func TestDBCursorParams(t *testing.T) {
 	if at := first.CreatedAtParam(); !at.Valid || at.InfinityModifier != pgtype.Infinity {
 		t.Fatalf("first page CreatedAtParam = %+v, want valid +infinity", at)
 	}
-	if id := first.IDParam(); id != math.MaxInt64 {
+	if id := first.IDParam(); id != MaxUUID {
 		t.Fatalf("first page IDParam = %d, want MaxInt64", id)
 	}
 
 	at := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
-	next := DBCursor{HasCursor: true, CreatedAt: at, ID: 42}
+	next := DBCursor{HasCursor: true, CreatedAt: at, ID: testID(42)}
 	if got := next.CreatedAtParam(); !got.Valid || got.InfinityModifier != pgtype.Finite || !got.Time.Equal(at) {
 		t.Fatalf("cursor CreatedAtParam = %+v, want %v", got, at)
 	}
-	if id := next.IDParam(); id != 42 {
+	if id := next.IDParam(); id != testID(42) {
 		t.Fatalf("cursor IDParam = %d, want 42", id)
 	}
 }

@@ -9,9 +9,9 @@ metadata:
     app.kubernetes.io/component: seed
 spec:
   # One-shot admin seed. Account creation is a Job, never API startup: the
-  # ADMIN_* credentials live only in fiber-boilerplate-seed-secrets, which the
-  # API and worker pods do not mount. cmd/seed only creates a missing admin and
-  # never re-promotes or re-adds an existing account, so re-running is safe.
+  # ADMIN_PASSWORD lives only in fiber-boilerplate-seed-secrets, which no API or
+  # worker pod mounts. cmd/seed only creates a missing admin and never
+  # re-promotes or re-adds an existing account, so re-running is safe.
   #
   # This Job is intentionally NOT part of the app kustomization. Apply it after
   # the migration Job (the schema must exist) and, optionally, before the app
@@ -32,6 +32,7 @@ spec:
         app.kubernetes.io/component: seed
     spec:
       restartPolicy: Never
+      serviceAccountName: fiber-boilerplate-seed
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: 30
@@ -39,11 +40,10 @@ spec:
       # imagePullSecrets:
       #   - name: ghcr-pull
       securityContext:
-        # Match the Docker image user: appuser is UID 100 / GID 101.
         runAsNonRoot: true
-        runAsUser: 100
-        runAsGroup: 101
-        fsGroup: 101
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -59,13 +59,17 @@ spec:
           envFrom:
             - configMapRef:
                 name: fiber-boilerplate-config
-            # Database credentials only: cmd/seed validates DB_* and ADMIN_*,
-            # not the JWT/SMTP/storage settings the API also loads.
-            - secretRef:
-                name: fiber-boilerplate-secrets
-            # ADMIN_EMAIL / ADMIN_PASSWORD / ADMIN_NAME only.
-            - secretRef:
-                name: fiber-boilerplate-seed-secrets
+          env:
+            # ADMIN_EMAIL / ADMIN_NAME are not secrets and come from the
+            # per-environment ConfigMap. The password is a mounted file.
+            - name: DB_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate/DB_PASSWORD
+            - name: DB_BYPASS_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate/DB_BYPASS_PASSWORD
+            - name: DATA_ENCRYPTION_KEY_FILE
+              value: /var/run/secrets/fiber-boilerplate/DATA_ENCRYPTION_KEY
+            - name: ADMIN_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate-seed/ADMIN_PASSWORD
           resources:
             requests:
               cpu: 100m
@@ -75,10 +79,28 @@ spec:
               memory: 256Mi
           securityContext:
             runAsNonRoot: true
-            runAsUser: 100
-            runAsGroup: 101
+            runAsUser: 65532
+            runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
+          volumeMounts:
+            # cmd/seed reads the database settings from the application Secret
+            # and the admin password from its own Secret.
+            - name: app-secrets
+              mountPath: /var/run/secrets/fiber-boilerplate
+              readOnly: true
+            - name: seed-secrets
+              mountPath: /var/run/secrets/fiber-boilerplate-seed
+              readOnly: true
+      volumes:
+        - name: app-secrets
+          secret:
+            secretName: fiber-boilerplate-secrets
+            defaultMode: 0440
+        - name: seed-secrets
+          secret:
+            secretName: fiber-boilerplate-seed-secrets
+            defaultMode: 0440

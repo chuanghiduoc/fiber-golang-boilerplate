@@ -1,41 +1,29 @@
+// Package admin is the back-office facade. Every former /admin route now lives
+// with the module that owns its data: /members, /roles, /invitations, and
+// /stats are identity operations, /files is the files module, and self-service
+// API keys are apikeys operations. The canonical route map therefore assigns
+// this module no HTTP operations, and its handler, DTOs, and service are gone.
+//
+// The module stays registered so the composition root keeps an explicit record
+// of the retired facade and the route-less shape is covered by test/arch.
 package admin
 
 import (
-	"github.com/gofiber/fiber/v3"
-
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 )
 
-// Module owns the back-office surface. Its services compose narrow
-// identity/files contracts and never import those modules' internals.
-type Module struct {
-	admin *adminhandler.Handler
-}
+// Module owns no routes. It exists only so the retired back-office facade has a
+// named, reviewed place in the module registry.
+type Module struct{}
 
-func New(admin *adminhandler.Handler) *Module {
-	return &Module{admin: admin}
-}
+// New returns the route-less facade module.
+func New() *Module { return &Module{} }
 
+// Name identifies the module in the registry.
 func (m *Module) Name() string { return "admin" }
 
-func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	auth := deps.Authenticate()
-	limit := deps.Limiters.Normal
-	// The group carries no middleware on purpose: Fiber registers group
-	// middleware as Use("/admin"), which would also run on /admin/features/*
-	// and /admin/api-keys/* owned by other modules (double auth, double
-	// rate-limit counting). Auth and the limiter are attached per route.
-	adminGroup := v1.Group("/admin")
-	adminGroup.Get("/stats", auth, limit, authzhttp.Require(authz.PermissionAdminStatsRead), m.admin.GetStats)
-	adminGroup.Get("/users", auth, limit, authzhttp.Require(authz.PermissionAdminUsersRead), m.admin.ListUsers)
-	adminGroup.Put("/users/:id/role", auth, limit, authzhttp.Require(authz.PermissionAdminUsersRole), deps.Idempotency, m.admin.UpdateRole)
-	adminGroup.Post("/users/:id/ban", auth, limit, authzhttp.Require(authz.PermissionAdminUsersBan), deps.Idempotency, m.admin.BanUser)
-	adminGroup.Post("/users/:id/unban", auth, limit, authzhttp.Require(authz.PermissionAdminUsersBan), deps.Idempotency, m.admin.UnbanUser)
-	adminGroup.Get("/files", auth, limit, authzhttp.Require(authz.PermissionAdminFilesRead), m.admin.ListFiles)
-	adminGroup.Get("/files/:id/download", auth, limit, authzhttp.Require(authz.PermissionAdminFilesRead), m.admin.DownloadFile)
-	adminGroup.Delete("/files/:id", auth, limit, authzhttp.Require(authz.PermissionAdminFilesDelete), deps.Idempotency, m.admin.DeleteFile)
-	adminGroup.Post("/files/:id/restore", auth, limit, authzhttp.Require(authz.PermissionAdminFilesRestore), deps.Idempotency, m.admin.RestoreFile)
-}
+// RegisterRoutes implements app.RouteProvider. The route map assigns this
+// module no operations; test/arch requires every module to declare its routes,
+// even an empty set.
+func (m *Module) RegisterRoutes(*httpapi.API, app.Deps) {}

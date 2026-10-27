@@ -5,34 +5,35 @@
 package sqlc
 
 import (
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type WebhookDelivery struct {
-	ID               int64              `json:"id"`
-	TenantID         int64              `json:"tenant_id"`
-	EndpointID       int64              `json:"endpoint_id"`
-	EventID          string             `json:"event_id"`
-	Url              string             `json:"url"`
-	SecretCiphertext string             `json:"secret_ciphertext"`
-	Status           string             `json:"status"`
-	Attempts         int32              `json:"attempts"`
-	MaxAttempts      int32              `json:"max_attempts"`
-	TimeoutMs        int32              `json:"timeout_ms"`
-	NextAttemptAt    pgtype.Timestamptz `json:"next_attempt_at"`
-	LastStatusCode   pgtype.Int4        `json:"last_status_code"`
-	LastError        pgtype.Text        `json:"last_error"`
-	DeliveredAt      pgtype.Timestamptz `json:"delivered_at"`
-	ReplayedFromID   pgtype.Int8        `json:"replayed_from_id"`
-	IsReplay         bool               `json:"is_replay"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	EndpointID     uuid.UUID          `json:"endpoint_id"`
+	EventID        uuid.UUID          `json:"event_id"`
+	SecretID       uuid.UUID          `json:"secret_id"`
+	Url            string             `json:"url"`
+	Status         string             `json:"status"`
+	Attempts       int32              `json:"attempts"`
+	MaxAttempts    int32              `json:"max_attempts"`
+	TimeoutMs      int32              `json:"timeout_ms"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	LastStatusCode pgtype.Int4        `json:"last_status_code"`
+	LastError      pgtype.Text        `json:"last_error"`
+	DeliveredAt    pgtype.Timestamptz `json:"delivered_at"`
+	ReplayedFromID uuid.NullUUID      `json:"replayed_from_id"`
+	IsReplay       bool               `json:"is_replay"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
 type WebhookDeliveryAttempt struct {
-	ID         int64              `json:"id"`
-	TenantID   int64              `json:"tenant_id"`
-	DeliveryID int64              `json:"delivery_id"`
+	ID         uuid.UUID          `json:"id"`
+	TenantID   uuid.UUID          `json:"tenant_id"`
+	DeliveryID uuid.UUID          `json:"delivery_id"`
 	Attempt    int32              `json:"attempt"`
 	StatusCode pgtype.Int4        `json:"status_code"`
 	DurationMs int32              `json:"duration_ms"`
@@ -41,8 +42,8 @@ type WebhookDeliveryAttempt struct {
 }
 
 type WebhookEndpoint struct {
-	ID          int64              `json:"id"`
-	TenantID    int64              `json:"tenant_id"`
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
 	Url         string             `json:"url"`
 	Description string             `json:"description"`
 	Status      string             `json:"status"`
@@ -54,32 +55,33 @@ type WebhookEndpoint struct {
 }
 
 type WebhookEndpointSecret struct {
-	ID               int64              `json:"id"`
-	TenantID         int64              `json:"tenant_id"`
-	EndpointID       int64              `json:"endpoint_id"`
+	ID               uuid.UUID          `json:"id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	EndpointID       uuid.UUID          `json:"endpoint_id"`
 	Version          int32              `json:"version"`
 	SecretCiphertext string             `json:"secret_ciphertext"`
 	Active           bool               `json:"active"`
 	GraceExpiresAt   pgtype.Timestamptz `json:"grace_expires_at"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 }
 
 type WebhookEvent struct {
-	TenantID    int64              `json:"tenant_id"`
-	EventID     string             `json:"event_id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	EventID     uuid.UUID          `json:"event_id"`
 	EventType   string             `json:"event_type"`
 	DataVersion int32              `json:"data_version"`
 	ActorType   string             `json:"actor_type"`
-	ActorID     pgtype.Text        `json:"actor_id"`
+	ActorID     uuid.NullUUID      `json:"actor_id"`
 	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
 	Payload     []byte             `json:"payload"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
 type WebhookInboundEvent struct {
-	ID              int64              `json:"id"`
-	TenantID        int64              `json:"tenant_id"`
-	SourceID        int64              `json:"source_id"`
+	ID              uuid.UUID          `json:"id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	SourceID        uuid.UUID          `json:"source_id"`
 	ExternalEventID string             `json:"external_event_id"`
 	EventType       string             `json:"event_type"`
 	Signature       string             `json:"signature"`
@@ -88,15 +90,24 @@ type WebhookInboundEvent struct {
 }
 
 type WebhookInboundSource struct {
-	ID                       int64              `json:"id"`
-	TenantID                 int64              `json:"tenant_id"`
-	Name                     string             `json:"name"`
-	Slug                     string             `json:"slug"`
-	SecretCiphertext         string             `json:"secret_ciphertext"`
-	PreviousSecretCiphertext pgtype.Text        `json:"previous_secret_ciphertext"`
-	PreviousSecretExpiresAt  pgtype.Timestamptz `json:"previous_secret_expires_at"`
-	Status                   string             `json:"status"`
-	CreatedAt                pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
-	DeletedAt                pgtype.Timestamptz `json:"deleted_at"`
+	ID        uuid.UUID          `json:"id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	Name      string             `json:"name"`
+	Slug      string             `json:"slug"`
+	Status    string             `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
+}
+
+type WebhookInboundSourceSecret struct {
+	ID               uuid.UUID          `json:"id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	SourceID         uuid.UUID          `json:"source_id"`
+	Version          int32              `json:"version"`
+	SecretCiphertext string             `json:"secret_ciphertext"`
+	Active           bool               `json:"active"`
+	GraceExpiresAt   pgtype.Timestamptz `json:"grace_expires_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 }

@@ -7,14 +7,12 @@ package apperrorhttp
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
-	"time"
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -28,73 +26,87 @@ type Localizer interface {
 	Localize(c fiber.Ctx, key string, params map[string]any) string
 }
 
-// FiberErrorHandler renders any error as an application/problem+json document.
-// It is the nil-localizer path: titles/details and validation messages are
-// emitted exactly as callers supplied them.
-func FiberErrorHandler(c fiber.Ctx, err error) error {
-	return handleError(c, err, nil)
-}
-
-// FiberErrorHandlerWithLocalizer returns an error handler that localizes
-// catalog titles and opted-in details. Code, type, status, instance, and the
-// errors[] shape are unchanged; a nil localizer is equivalent to
-// FiberErrorHandler.
-func FiberErrorHandlerWithLocalizer(localizer Localizer) fiber.ErrorHandler {
+// New returns the injected-catalog error handler. The catalog is authoritative
+// for status, title, and type; a nil catalog falls back to the platform-only
+// catalog and a nil localizer keeps English titles/details.
+func New(catalog *apperror.Catalog, localizer Localizer) fiber.ErrorHandler {
+	if catalog == nil {
+		catalog = apperror.PlatformCatalog()
+	}
 	return func(c fiber.Ctx, err error) error {
-		return handleError(c, err, localizer)
+		return handleError(c, err, catalog, localizer)
 	}
 }
 
-func handleError(c fiber.Ctx, err error, localizer Localizer) error {
+// FiberErrorHandler renders any error with the platform-only catalog. It is
+// the nil-catalog/nil-localizer path for tests and edge callers; application
+// wiring must use New so module codes resolve.
+func FiberErrorHandler(c fiber.Ctx, err error) error {
+	return handleError(c, err, apperror.PlatformCatalog(), nil)
+}
+
+// FiberErrorHandlerWithLocalizer is the platform-only catalog with
+// localization. Application wiring uses New instead.
+func FiberErrorHandlerWithLocalizer(localizer Localizer) fiber.ErrorHandler {
+	return New(apperror.PlatformCatalog(), localizer)
+}
+
+func handleError(c fiber.Ctx, err error, catalog *apperror.Catalog, localizer Localizer) error {
 	var appErr *apperror.AppError
 	if errors.As(err, &appErr) {
-		return writeProblem(c, appErr, localizer)
+		return writeProblem(c, appErr, catalog, localizer)
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
-		return writeProblem(c, newError(fiber.StatusGatewayTimeout, "gateway_timeout", "Gateway Timeout", "request timed out"), localizer)
+		return writeProblem(c, apperror.NewCode(apperror.CodeSystemTimeout, "request timed out"), catalog, localizer)
 	}
 
 	if errors.Is(err, context.Canceled) {
 		// The client went away; the body is most likely never delivered.
 		slog.Info("request canceled by client", slog.String("path", c.Path()))
-		return writeProblem(c, newError(apperror.StatusClientClosedRequest, "client_closed_request", "Client Closed Request", "request canceled by client"), localizer)
+		return writeProblem(c, apperror.NewForStatus(apperror.StatusClientClosedRequest, "request canceled by client"), catalog, localizer)
 	}
 
 	var fiberErr *fiber.Error
 	if errors.As(err, &fiberErr) {
-		return writeProblem(c, fromStatus(fiberErr.Code, fiberErr.Message), localizer)
+		detail := fiberErr.Message
+		// Fiber rejects bodies over APP_BODY_LIMIT before any middleware runs.
+		// Render that 413 with the same code/detail as BodyLimit so clients see
+		// one payload-too-large contract.
+		if fiberErr.Code == fiber.StatusRequestEntityTooLarge &&
+			(detail == "" || detail == http.StatusText(fiberErr.Code)) {
+			detail = "request body too large"
+		}
+		return writeProblem(c, apperror.NewForStatus(fiberErr.Code, detail), catalog, localizer)
 	}
 
-	slog.Error("unhandled error in error handler",
-		slog.String("error", err.Error()),
-		slog.String("type", fmt.Sprintf("%T", err)),
-		slog.String("path", c.Path()),
-	)
-	return writeProblem(c, apperror.NewInternal("Internal Server Error"), localizer)
+	return writeProblem(c, apperror.Internal(err, "Internal Server Error"), catalog, localizer)
 }
 
-func writeProblem(c fiber.Ctx, e *apperror.AppError, localizer Localizer) error {
-	docPath := "/errors/" + strings.ReplaceAll(e.Code, "_", "-")
-	if spec, ok := apperror.SpecFor(apperror.Code(e.Code)); ok {
-		docPath = spec.DocPath
-	}
+// logServerError records every 5xx with its internal cause. The cause is never
+// copied into the problem document.
+func logServerError(ctx context.Context, path string, err error) {
+	slog.ErrorContext(ctx, "request failed with an internal error",
+		slog.String("path", path),
+		slog.String("request_id", requestctx.RequestID(ctx)),
+		slog.Any("cause", err),
+	)
+}
 
-	title := e.Title
-	detail := e.Detail
-	fields := e.Errors
+func writeProblem(c fiber.Ctx, e *apperror.AppError, catalog *apperror.Catalog, localizer Localizer) error {
+	doc := catalog.Problem(e, getRequestID(c), c.Path())
 	if localizer != nil {
-		if localized := localizer.Localize(c, "errors."+e.Code+".title", nil); localized != "" {
-			title = localized
+		if localized := localizer.Localize(c, "errors."+doc.Code+".title", nil); localized != "" {
+			doc.Title = localized
 		}
 		if e.DetailKey != "" {
 			if localized := localizer.Localize(c, e.DetailKey, e.DetailParams); localized != "" {
-				detail = localized
+				doc.Detail = localized
 			}
 		}
-		if len(e.Errors) > 0 {
-			fields = make([]apperror.FieldError, len(e.Errors))
-			for i, field := range e.Errors {
+		if len(doc.Errors) > 0 {
+			fields := make([]apperror.FieldError, len(doc.Errors))
+			for i, field := range doc.Errors {
 				params := make(map[string]any, len(field.Params)+1)
 				params["path"] = field.Path
 				for key, value := range field.Params {
@@ -105,53 +117,25 @@ func writeProblem(c fiber.Ctx, e *apperror.AppError, localizer Localizer) error 
 				}
 				fields[i] = field
 			}
+			doc.Errors = fields
 		}
 	}
 
-	doc := apperror.ProblemDetails{
-		Type:      apperror.DocsBaseURL + docPath,
-		Title:     title,
-		Status:    e.Status,
-		Code:      e.Code,
-		Detail:    detail,
-		Instance:  c.Path(),
-		RequestID: requestID(c),
-		Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00"),
-		Errors:    fields,
-	}
-	return c.Status(e.Status).JSON(doc, problemContentType)
-}
-
-func newError(status int, code, title, detail string) *apperror.AppError {
-	return &apperror.AppError{Status: status, Code: code, Title: title, Detail: detail}
-}
-
-// fromStatus derives an AppError from a bare HTTP status (e.g. a fiber.Error).
-func fromStatus(status int, detail string) *apperror.AppError {
-	// Fiber rejects bodies over APP_BODY_LIMIT before any middleware runs.
-	// Render that 413 with the same code as the BodyLimit middleware so
-	// clients see one payload_too_large contract, not request_entity_too_large.
-	if status == fiber.StatusRequestEntityTooLarge {
-		if detail == "" || detail == http.StatusText(status) {
-			detail = "request body too large"
+	if doc.Status >= http.StatusInternalServerError {
+		cause := e.Cause
+		if cause == nil {
+			cause = e
 		}
-		return apperror.NewPayloadTooLarge(detail)
+		logServerError(c.Context(), c.Path(), cause)
 	}
-	title := http.StatusText(status)
-	if title == "" {
-		title = "Error"
-	}
-	code := strings.ReplaceAll(strings.ToLower(title), " ", "_")
-	if detail == "" {
-		detail = title
-	}
-	return newError(status, code, title, detail)
+
+	return c.Status(doc.Status).JSON(doc, problemContentType)
 }
 
-// requestID returns the correlation ID installed by the request-ID middleware.
-// It deliberately does not fall back to the client's X-Request-Id header: an
-// error rendered before that middleware ran must not echo an untrusted value
-// into the problem document.
-func requestID(c fiber.Ctx) string {
-	return fiber.Locals[string](c, "request_id")
+// getRequestID returns the correlation ID installed by the request-ID
+// middleware. It deliberately does not fall back to the client's X-Request-Id
+// header: an error rendered before that middleware ran must not echo an
+// untrusted value into the problem document.
+func getRequestID(c fiber.Ctx) string {
+	return requestctx.RequestID(c.Context())
 }

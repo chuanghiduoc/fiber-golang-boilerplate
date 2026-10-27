@@ -13,27 +13,41 @@ import (
 
 	"github.com/caarlos0/env/v11"
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 type pingModule struct{}
 
 func (pingModule) Name() string { return "ping" }
-func (pingModule) RegisterRoutes(v1 fiber.Router, _ app.Deps) {
-	v1.Get("/ping", func(c fiber.Ctx) error { return c.SendString("pong") })
+func (pingModule) RegisterRoutes(api *httpapi.API, _ app.Deps) {
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/ping", OperationID: "getPing",
+		Tags: []string{"test"}, Summary: "Ping",
+	}, httpapi.Policy{Public: true}, func(context.Context, *struct{}) (*pingOutput, error) {
+		return &pingOutput{Body: "pong"}, nil
+	})
+}
+
+type pingOutput struct {
+	Body string
 }
 
 type flagModule struct {
@@ -50,34 +64,129 @@ func (m flagModule) FeatureFlags() []features.Definition {
 
 const testFlagKey features.Key = "app_test_flag"
 
-func (m flagModule) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	v1.Get("/flag", func(c fiber.Ctx) error {
-		if m.enabled(deps) {
-			return c.SendString("true")
-		}
-		return c.SendString("false")
+func (m flagModule) RegisterRoutes(api *httpapi.API, deps app.Deps) {
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/flag", OperationID: "getFlag",
+		Tags: []string{"test"}, Summary: "Flag",
+	}, httpapi.Policy{Public: true}, func(context.Context, *struct{}) (*flagOutput, error) {
+		return &flagOutput{Body: m.enabled(deps)}, nil
 	})
+}
+
+type flagOutput struct {
+	Body bool
+}
+
+type idempotentModule struct {
+	calls *int
+}
+
+func (idempotentModule) Name() string { return "idempotent" }
+
+func (m idempotentModule) RegisterRoutes(api *httpapi.API, _ app.Deps) {
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/idem", OperationID: "createIdem",
+		Tags: []string{"test"}, Summary: "Idempotent write",
+	}, httpapi.Policy{Public: true, Idempotent: true, NoStore: true}, func(context.Context, *struct{}) (*pingOutput, error) {
+		(*m.calls)++
+		return &pingOutput{Body: "created"}, nil
+	})
+}
+
+func TestHumaOperationReplaysIdempotentResponse(t *testing.T) {
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+	calls := 0
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}, Cache: cache.NewMemoryCache()})
+	application.Register(idempotentModule{calls: &calls})
+
+	first, err := http.NewRequest(http.MethodPost, "/api/v1/idem", http.NoBody)
+	require.NoError(t, err)
+	first.Header.Set("Idempotency-Key", "app-idem-1")
+	resp, err := application.Fiber().Test(first)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	assert.Equal(t, "no-store", resp.Header.Get(fiber.HeaderCacheControl))
+	firstBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	second, err := http.NewRequest(http.MethodPost, "/api/v1/idem", http.NoBody)
+	require.NoError(t, err)
+	second.Header.Set("Idempotency-Key", "app-idem-1")
+	resp, err = application.Fiber().Test(second)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	assert.Equal(t, "true", resp.Header.Get("Idempotent-Replayed"))
+	assert.Equal(t, "no-store", resp.Header.Get(fiber.HeaderCacheControl), "replays must keep no-store")
+	secondBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, string(firstBody), string(secondBody))
+	assert.Equal(t, 1, calls, "the replay must not run the handler twice")
 }
 
 type staticTenantResolver struct{}
 
 func (staticTenantResolver) Resolve(_ context.Context, slug string) (tenant.Tenant, error) {
 	if slug == "default" {
-		return tenant.Tenant{ID: 1, Slug: "default", Name: "Default"}, nil
+		return tenant.Tenant{ID: tenant.DefaultID, Slug: "default", Name: "Default"}, nil
 	}
 	return tenant.Tenant{}, apperror.ErrNotFound
+}
+
+// TestMetricsEndpointExposesSemconvHTTPServerHistogram scrapes the real
+// infrastructure route: the removed request counter must be gone and the OTel
+// HTTP server-duration histogram must carry the semantic-convention labels.
+func TestMetricsEndpointExposesSemconvHTTPServerHistogram(t *testing.T) {
+	provider, err := metrics.Setup(metrics.Options{ServiceVersion: "test"})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
+	application.Register(pingModule{})
+
+	ping, _ := http.NewRequest(http.MethodGet, "/api/v1/ping", http.NoBody)
+	resp, err := application.Fiber().Test(ping)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	scrape, _ := http.NewRequest(http.MethodGet, "/metrics", http.NoBody)
+	resp, err = application.Fiber().Test(scrape)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	text := string(body)
+
+	assert.Contains(t, text, "# TYPE http_server_request_duration_seconds histogram")
+	assert.Contains(t, text, `http_request_method="GET"`)
+	assert.Contains(t, text, `http_route="/api/v1/ping"`)
+	assert.Contains(t, text, `http_response_status_code="200"`)
+	assert.NotContains(t, text, "http_requests_total")
 }
 
 func TestModuleRegistryMountsRoutes(t *testing.T) {
 	cfg := &config.Config{
 		// production disables the Swagger file loader, which resolves relative
 		// to the process working directory (the package dir during go test).
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
-	application := app.New(cfg, app.Deps{})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
 	application.Register(pingModule{})
 
 	req, _ := http.NewRequest("GET", "/api/v1/ping", http.NoBody)
@@ -88,13 +197,13 @@ func TestModuleRegistryMountsRoutes(t *testing.T) {
 
 func TestAppProvidesNilSafeFeatureEvaluator(t *testing.T) {
 	cfg := &config.Config{
-		App:          config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
-		CORS:         config.CORSConfig{AllowOrigins: "*"},
-		RateLimit:    config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		App:          config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS:         config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit:    config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		Tenant:       config.TenantConfig{DefaultSlug: "default"},
-		FeatureFlags: config.FeatureFlagsConfig{Flags: "app_test_flag=false"},
+		FeatureFlags: config.FeatureFlagsConfig{Flags: []string{"app_test_flag=false"}},
 	}
-	application := app.New(cfg, app.Deps{})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
 	application.Register(flagModule{enabled: func(deps app.Deps) bool {
 		if deps.Flags == nil {
 			t.Fatal("app.New must install a default feature evaluator")
@@ -107,8 +216,7 @@ func TestAppProvidesNilSafeFeatureEvaluator(t *testing.T) {
 	require.NoError(t, err)
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	assert.Equal(t, "false", string(body), "FEATURE_FLAGS must apply when Deps.Flags is nil")
-	assert.True(t, features.IsKnown(testFlagKey), "Register must add FlagProvider keys to the catalog")
+	assert.Equal(t, "false", strings.TrimSpace(string(body)), "FEATURE_FLAGS must apply when Deps.Flags is nil")
 }
 
 // catalogModule exercises every catalog provider hook.
@@ -120,20 +228,19 @@ type catalogModule struct {
 	locales    fstest.MapFS
 }
 
-func (m catalogModule) Name() string                          { return m.name }
-func (m catalogModule) RegisterRoutes(fiber.Router, app.Deps) {}
+func (m catalogModule) Name() string { return m.name }
 func (m catalogModule) Permissions() []authz.Grant {
 	return []authz.Grant{{Permission: m.permission, Roles: []string{authz.RoleMember}}}
 }
-func (m catalogModule) ErrorCodes() map[apperror.Code]apperror.Spec {
-	return map[apperror.Code]apperror.Spec{m.code: {Status: 409, Title: "Gadget busy", DocPath: "/errors/gadget-busy"}}
+func (m catalogModule) Errors() []apperror.Spec {
+	return []apperror.Spec{{Code: m.code, Status: 409, Title: "Gadget busy", DocPath: "/errors/gadget-busy"}}
 }
 func (m catalogModule) FeatureFlags() []features.Definition {
 	return []features.Definition{{Key: m.flag, Description: "gadget flag"}}
 }
 func (m catalogModule) Locales() fs.FS { return m.locales }
 
-func TestRegisterCatalogsWiresEveryProvider(t *testing.T) {
+func TestBuildCatalogsWiresEveryProvider(t *testing.T) {
 	module := catalogModule{
 		name:       "gadgets",
 		permission: "gadgets:read",
@@ -144,51 +251,42 @@ func TestRegisterCatalogsWiresEveryProvider(t *testing.T) {
 			"vi.json": {Data: []byte(`{"errors.gadget.busy.title": "Thiết bị bận"}`)},
 		},
 	}
-	require.NoError(t, app.RegisterCatalogs(module))
-	require.NoError(t, app.RegisterCatalogs(module), "re-registering the same module is a no-op")
+	catalogs, err := app.BuildCatalogs(module)
+	require.NoError(t, err)
 
-	assert.True(t, authz.Has(authz.RoleMember, "gadgets:read"))
-	assert.True(t, authz.Has(authz.RoleAdmin, "gadgets:read"), "admins receive every permission")
-	spec, ok := apperror.SpecFor("gadget.busy")
+	assert.True(t, catalogs.Permissions.Has(authz.RoleMember, "gadgets:read"))
+	assert.True(t, catalogs.Permissions.Has(authz.RoleAdmin, "gadgets:read"), "admins receive every permission")
+	spec, ok := catalogs.Errors.SpecFor("gadget.busy")
 	require.True(t, ok)
 	assert.Equal(t, 409, spec.Status)
-	assert.True(t, features.IsKnown("gadgets_beta"))
+	assert.True(t, catalogs.Features.IsKnown("gadgets_beta"))
 
 	bundle, err := i18n.New("en", app.LocaleSources(module)...)
 	require.NoError(t, err)
 	assert.Equal(t, "Thiết bị bận", bundle.Translate("vi", "errors.gadget.busy.title", nil))
 }
 
-func TestRegisterCatalogsRejectsConflicts(t *testing.T) {
+func TestBuildCatalogsRejectsConflicts(t *testing.T) {
 	owner := catalogModule{name: "owner_mod", permission: "ownermod:read", code: "ownermod.busy", flag: "ownermod_beta"}
-	require.NoError(t, app.RegisterCatalogs(owner))
-
 	thief := owner
 	thief.name = "thief_mod"
-	err := app.RegisterCatalogs(thief)
+	err := app.NewCatalogs().Register(owner, thief)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already owned")
 
-	err = app.RegisterCatalogs(pingModule{}, pingModule{})
+	err = app.NewCatalogs().Register(pingModule{}, pingModule{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "registered twice")
-
-	application := app.New(&config.Config{
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
-		Tenant:    config.TenantConfig{DefaultSlug: "default"},
-	}, app.Deps{})
-	assert.Panics(t, func() { application.Register(thief) }, "a catalog conflict at Register is a programming error")
 }
 
 func TestTenantMiddlewareRejectsUnknownHeader(t *testing.T) {
 	cfg := &config.Config{
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
-	application := app.New(cfg, app.Deps{TenantResolver: staticTenantResolver{}, Health: health.NewChecker(nil, nil)})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}, TenantResolver: staticTenantResolver{}, Health: health.NewChecker(nil, nil)})
 	application.Register(pingModule{})
 
 	withHeader, _ := http.NewRequest("GET", "/api/v1/ping", http.NoBody)
@@ -211,12 +309,12 @@ func TestTenantMiddlewareRejectsUnknownHeader(t *testing.T) {
 
 func TestTenantMiddlewareRequiresHeaderWhenConfigured(t *testing.T) {
 	cfg := &config.Config{
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		Tenant:    config.TenantConfig{DefaultSlug: "default", RequireHeader: true},
 	}
-	application := app.New(cfg, app.Deps{TenantResolver: staticTenantResolver{}})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}, TenantResolver: staticTenantResolver{}})
 	application.Register(pingModule{})
 
 	withoutHeader, _ := http.NewRequest("GET", "/api/v1/ping", http.NoBody)
@@ -236,14 +334,14 @@ func TestCORSPreflightAllowsIdempotencyKey(t *testing.T) {
 	t.Setenv("CORS_EXPOSE_HEADERS", "")
 	var corsCfg config.CORSConfig
 	require.NoError(t, env.Parse(&corsCfg))
-	corsCfg.AllowOrigins = "https://app.example.com"
+	corsCfg.AllowOrigins = []string{"https://app.example.com"}
 
 	cfg := &config.Config{
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
 		CORS:      corsCfg,
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 	}
-	application := app.New(cfg, app.Deps{})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
 	application.Register(pingModule{})
 
 	preflight, err := http.NewRequest(http.MethodOptions, "/api/v1/ping", http.NoBody)
@@ -269,6 +367,40 @@ func TestCORSPreflightAllowsIdempotencyKey(t *testing.T) {
 	)
 }
 
+// Credentialed CORS is enabled only by the refresh-cookie transport; JSON
+// mode must never advertise credentials with a wildcard-capable client.
+func TestCORSAllowCredentialsOnlyInCookieMode(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		cookieMode bool
+		wantCreds  string
+	}{
+		{name: "json mode", cookieMode: false, wantCreds: ""},
+		{name: "cookie mode", cookieMode: true, wantCreds: "true"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &config.Config{
+				App:  config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+				CORS: config.CORSConfig{AllowOrigins: []string{"https://app.example.com"}},
+				JWT:  config.JWTConfig{RefreshCookie: test.cookieMode},
+				RateLimit: config.RateLimitConfig{
+					StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second,
+					RelaxedMax: 120, RelaxedWindow: 60 * time.Second,
+				},
+			}
+			application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
+			application.Register(pingModule{})
+
+			req, err := http.NewRequest(http.MethodGet, "/api/v1/ping", http.NoBody)
+			require.NoError(t, err)
+			req.Header.Set(fiber.HeaderOrigin, "https://app.example.com")
+			resp, err := application.Fiber().Test(req)
+			require.NoError(t, err)
+			assert.Equal(t, test.wantCreds, resp.Header.Get(fiber.HeaderAccessControlAllowCredentials))
+		})
+	}
+}
+
 type providerModule struct {
 	events    int
 	jobs      int
@@ -276,9 +408,19 @@ type providerModule struct {
 }
 
 func (m *providerModule) Name() string { return "provider" }
-func (m *providerModule) RegisterRoutes(v1 fiber.Router, _ app.Deps) {
-	v1.Get("/provider", func(c fiber.Ctx) error { return c.SendString("ok") })
+func (m *providerModule) RegisterRoutes(api *httpapi.API, _ app.Deps) {
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/provider", OperationID: "getProvider",
+		Tags: []string{"test"}, Summary: "Provider",
+	}, httpapi.Policy{Public: true}, func(context.Context, *struct{}) (*providerOutput, error) {
+		return &providerOutput{Body: "ok"}, nil
+	})
 }
+
+type providerOutput struct {
+	Body string
+}
+
 func (m *providerModule) RegisterEvents(bus *events.Bus) {
 	m.events++
 	_ = bus.SubscribeDurable("provider.changed", "refresh", func(context.Context, events.Event) error {
@@ -311,9 +453,9 @@ func (r *recordingRegistrar) Register(kind string, _ jobs.Handler) {
 
 func TestOptionalModuleProviders(t *testing.T) {
 	cfg := &config.Config{
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
 	registry := scheduler.NewRegistry()
@@ -321,6 +463,7 @@ func TestOptionalModuleProviders(t *testing.T) {
 	module := &providerModule{}
 
 	application := app.New(cfg, app.Deps{
+		Sessions:  allowAllSessions{},
 		Events:    events.New(nil),
 		Jobs:      registrar,
 		Schedules: registry,
@@ -337,13 +480,13 @@ func TestOptionalModuleProviders(t *testing.T) {
 
 func TestOptionalModuleProvidersAreNilSafe(t *testing.T) {
 	cfg := &config.Config{
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
 	module := &providerModule{}
-	application := app.New(cfg, app.Deps{})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
 	require.NotPanics(t, func() { application.Register(module) })
 	assert.Equal(t, 0, module.events)
 	assert.Equal(t, 0, module.jobs)
@@ -353,9 +496,9 @@ func TestOptionalModuleProvidersAreNilSafe(t *testing.T) {
 // APP_ROLE=worker: providers register, but no /api route is mounted.
 func TestRegisterBackgroundRegistersProvidersWithoutRoutes(t *testing.T) {
 	cfg := &config.Config{
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5, Role: config.RoleWorker},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second, Role: config.RoleWorker},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
 	registry := scheduler.NewRegistry()
@@ -363,6 +506,7 @@ func TestRegisterBackgroundRegistersProvidersWithoutRoutes(t *testing.T) {
 	module := &providerModule{}
 
 	application := app.New(cfg, app.Deps{
+		Sessions:  allowAllSessions{},
 		Events:    events.New(nil),
 		Jobs:      registrar,
 		Schedules: registry,
@@ -385,3 +529,14 @@ func TestRegisterBackgroundRegistersProvidersWithoutRoutes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "worker role keeps the health endpoints")
 }
+
+// allowAllSessions is a permissive session store for tests that exercise the
+// HTTP foundation rather than session validation.
+type allowAllSessions struct{}
+
+func (allowAllSessions) Validate(context.Context, session.Claims) (session.State, error) {
+	return session.State{Active: true, TenantActive: true}, nil
+}
+
+func (allowAllSessions) Invalidate(context.Context, uuid.UUID) error { return nil }
+func (allowAllSessions) InvalidatePermissions(context.Context) error { return nil }

@@ -13,12 +13,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -81,8 +82,8 @@ func verifyStandardWebhook(secret string, header http.Header, body []byte, now t
 // send for the fixed event below: the versioned envelope with the
 // data stored as JSONB (keys normalized by PostgreSQL, numbers kept verbatim,
 // "<", "&", ">" HTML-escaped by encoding/json).
-const wireGoldenBody = `{"id":"evt_wire_golden_1","type":"file.uploaded","dataVersion":1,` +
-	`"occurredAt":"2026-10-24T11:59:30.123456Z","tenantId":1,"actor":{"type":"user","id":"42"},` +
+const wireGoldenBody = `{"id":"0192c9b0-7e4a-7000-8000-00000000e001","type":"file.uploaded","dataVersion":1,` +
+	`"occurredAt":"2026-10-24T11:59:30.123456Z","tenantId":"0192c9b0-7e4a-7000-8000-000000000001","actor":{"type":"user","id":"0192c9b0-7e4a-7000-8000-00000000e002"},` +
 	`"data":{"big":12345678901234567890,"zeta":1,"alpha":{"nested":[1,2.50,"x"]},"unicode":"héllo \u003c\u0026\u003e"}}`
 
 // wireGoldenHeaders are the headers besides webhook-timestamp and
@@ -92,7 +93,7 @@ var wireGoldenHeaders = []string{
 	"Content-Length: " + strconv.Itoa(len(wireGoldenBody)),
 	"Content-Type: application/json",
 	"User-Agent: fiber-golang-boilerplate-webhooks/2.0",
-	"Webhook-Id: evt_wire_golden_1",
+	"Webhook-Id: 0192c9b0-7e4a-7000-8000-00000000e001",
 }
 
 // TestWebhookDeliveryWireFormatIsStable feeds a fixed event (exactly as the
@@ -101,9 +102,8 @@ var wireGoldenHeaders = []string{
 // it with the golden Standard Webhooks request.
 func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	ctx := context.Background()
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := testutil.NewFixture(t)
+	pool := fx.Bypass
 
 	captured := make(chan capturedRequest, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,8 +113,8 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	queue := jobs.NewQueue(testutil.Scoped(pool))
-	repo := webhookrepo.New(testutil.Scoped(pool), testutil.NewTxManager(pool), queue)
+	queue := jobs.NewQueue(fx.Scoped())
+	repo := webhookrepo.New(fx.Scoped(), fx.Tx(), queue)
 	codec, err := webhookservice.NewSecretCodec("webhook-wire-encryption-key")
 	require.NoError(t, err)
 
@@ -125,24 +125,24 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 		Status:      "active",
 		MaxAttempts: 3,
 		TimeoutMS:   2000,
-		SealSecret: func(endpointID int64) (string, error) {
+		SealSecret: func(endpointID uuid.UUID) (string, error) {
 			return codec.Seal(webhookservice.EndpointSecretBinding(tenant.DefaultID, endpointID), []byte(wireSecret))
 		},
 	})
 	require.NoError(t, err)
 
 	dispatcher := webhookservice.NewDispatcher(repo)
-	jobPayload := `{"id":"evt_wire_golden_1","type":"file.uploaded","dataVersion":1,` +
-		`"occurredAt":"2026-10-24T11:59:30.123456789Z","tenantId":1,"actor":{"type":"user","id":"42"},` +
+	jobPayload := `{"id":"0192c9b0-7e4a-7000-8000-00000000e001","type":"file.uploaded","dataVersion":1,` +
+		`"occurredAt":"2026-10-24T11:59:30.123456789Z","tenantId":"0192c9b0-7e4a-7000-8000-000000000001","actor":{"type":"user","id":"0192c9b0-7e4a-7000-8000-00000000e002"},` +
 		`"data":{"zeta":1,"alpha":{"nested":[1,2.50,"x"]},"unicode":"héllo <&>","big":12345678901234567890},` +
 		`"requestId":"req-internal"}`
 	var event events.Event
 	require.NoError(t, json.Unmarshal([]byte(jobPayload), &event))
 	require.NoError(t, dispatcher.HandleEvent(tenantCtx, event))
 
-	var deliveryID int64
+	var deliveryID uuid.UUID
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT id FROM webhook_deliveries WHERE tenant_id = $1 AND endpoint_id = $2 AND event_id = 'evt_wire_golden_1'`,
+		`SELECT id FROM webhook_deliveries WHERE tenant_id = $1 AND endpoint_id = $2 AND event_id = '0192c9b0-7e4a-7000-8000-00000000e001'`,
 		tenant.DefaultID, endpoint.ID,
 	).Scan(&deliveryID))
 
@@ -175,7 +175,7 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 		}
 		headers = append(headers, name+": "+strings.Join(values, ","))
 	}
-	sort.Strings(headers)
+	slices.Sort(headers)
 	assert.Equal(t, wireGoldenHeaders, headers)
 	require.NoError(t, verifyStandardWebhook(wireSecret, got.header, got.body, time.Now()))
 
@@ -183,7 +183,7 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	// webhook-id, body id, and occurredAt stay the original ones so the
 	// receiver can deduplicate it, and the envelope bytes are unchanged.
 	svc := webhookservice.New(repo, repo, repo, codec, nil, webhookservice.Options{})
-	replayed, err := svc.ReplayDelivery(tenantCtx, 0, deliveryID)
+	replayed, err := svc.ReplayDelivery(tenantCtx, uuid.Nil, deliveryID)
 	require.NoError(t, err)
 	require.NotEqual(t, deliveryID, replayed.ID, "a replay gets its own delivery row")
 	replayJob, err := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: replayed.ID})
@@ -196,7 +196,7 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 		t.Fatal("receiver got no replay request")
 	}
 	assert.Equal(t, wireGoldenBody, string(replay.body), "replay must resend the original envelope bytes")
-	assert.Equal(t, "evt_wire_golden_1", replay.header.Get(webhook.HeaderID),
+	assert.Equal(t, "0192c9b0-7e4a-7000-8000-00000000e001", replay.header.Get(webhook.HeaderID),
 		"the message id is stable across replays")
 	require.NoError(t, verifyStandardWebhook(wireSecret, replay.header, replay.body, time.Now()))
 }

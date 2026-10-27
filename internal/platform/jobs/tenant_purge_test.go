@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,7 +25,7 @@ func TestPurgeTenantDeletesNonRunningJobsInBoundedBatches(t *testing.T) {
 			return pgconn.CommandTag{}, fmt.Errorf("purge must leave running jobs: %s", sql)
 		}
 		require.Len(t, args, 2)
-		require.Equal(t, int64(7), args[0])
+		require.Equal(t, testID(7), args[0])
 		require.Equal(t, purgeBatchSize, args[1])
 		if len(db.ExecCalls) == 1 {
 			return fakedb.Deleted(int64(purgeBatchSize)), nil
@@ -32,19 +33,19 @@ func TestPurgeTenantDeletesNonRunningJobsInBoundedBatches(t *testing.T) {
 		return fakedb.Deleted(2), nil
 	}
 
-	require.NoError(t, NewTenantPurger(db).PurgeTenant(context.Background(), 7))
+	require.NoError(t, NewTenantPurger(db).PurgeTenant(context.Background(), testID(7)))
 	assert.Len(t, db.ExecCalls, 2, "a full page is followed by another delete")
 }
 
 func TestPurgeTenantRejectsInvalidTenant(t *testing.T) {
 	db := &fakedb.DB{}
-	err := PurgeTenant(context.Background(), db, 0)
+	err := PurgeTenant(context.Background(), db, uuid.Nil)
 	require.ErrorIs(t, err, ErrInvalidTenant)
 	assert.Empty(t, db.ExecCalls, "an invalid tenant must not reach the database")
 }
 
 func TestPurgeTenantRequiresDatabase(t *testing.T) {
-	err := PurgeTenant(context.Background(), nil, 7)
+	err := PurgeTenant(context.Background(), nil, testID(7))
 	require.True(t, errors.Is(err, ErrNoPool), "err = %v", err)
 }
 
@@ -55,7 +56,7 @@ func TestPurgeTenantStopsOnCancellation(t *testing.T) {
 	db.ExecFn = func(context.Context, string, ...any) (pgconn.CommandTag, error) {
 		return fakedb.Deleted(int64(purgeBatchSize)), nil
 	}
-	err := PurgeTenant(ctx, db, 7)
+	err := PurgeTenant(ctx, db, testID(7))
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Empty(t, db.ExecCalls)
 }

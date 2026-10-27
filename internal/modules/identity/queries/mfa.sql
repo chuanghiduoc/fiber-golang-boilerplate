@@ -57,7 +57,7 @@ WHERE user_id = @user_id;
 
 -- name: CreateRecoveryCodes :exec
 INSERT INTO mfa_recovery_codes (user_id, code_hash)
-SELECT @user_id, unnest(@code_hashes::text[]);
+SELECT @user_id, unnest(@code_hashes::bytea[]);
 
 -- name: UseRecoveryCode :execrows
 -- Single use: only the first concurrent request can claim a code.

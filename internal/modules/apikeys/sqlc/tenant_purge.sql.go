@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const deleteTenantAPIKeysBatch = `-- name: DeleteTenantAPIKeysBatch :execrows
@@ -14,14 +16,14 @@ const deleteTenantAPIKeysBatch = `-- name: DeleteTenantAPIKeysBatch :execrows
 DELETE FROM api_keys
 WHERE id IN (
     SELECT id FROM api_keys
-    WHERE tenant_id = $1::bigint
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantAPIKeysBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 // Tenant purge. A deleted tenant's API keys are erased in bounded id batches;

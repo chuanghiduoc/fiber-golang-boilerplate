@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const deleteFileForPrivacy = `-- name: DeleteFileForPrivacy :execrows
@@ -15,9 +17,9 @@ WHERE id = $1 AND tenant_id = $2 AND user_id = $3
 `
 
 type DeleteFileForPrivacyParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) DeleteFileForPrivacy(ctx context.Context, arg DeleteFileForPrivacyParams) (int64, error) {
@@ -36,8 +38,8 @@ ORDER BY id
 `
 
 type ListFilesForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 // Privacy export/erasure. Both queries are scoped to the explicit tenant/user

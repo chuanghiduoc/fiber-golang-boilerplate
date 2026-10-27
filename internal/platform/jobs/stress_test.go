@@ -9,8 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
 const (
@@ -25,9 +28,9 @@ const (
 type stressStore struct {
 	mu         sync.Mutex
 	pending    []claimedJob
-	claimed    []int64
-	succeeded  map[int64]int
-	failed     map[int64]int
+	claimed    []uuid.UUID
+	succeeded  map[uuid.UUID]int
+	failed     map[uuid.UUID]int
 	heartbeats int
 	claimCalls int
 }
@@ -35,12 +38,13 @@ type stressStore struct {
 func newStressStore(total int) *stressStore {
 	store := &stressStore{
 		pending:   make([]claimedJob, 0, total),
-		succeeded: make(map[int64]int, total),
-		failed:    make(map[int64]int, total),
+		succeeded: make(map[uuid.UUID]int, total),
+		failed:    make(map[uuid.UUID]int, total),
 	}
 	for i := 0; i < total; i++ {
 		store.pending = append(store.pending, claimedJob{
-			ID:          int64(i + 1),
+			ID:          testID(i + 1),
+			TenantID:    tenant.DefaultID,
 			Kind:        "stress.ok",
 			Payload:     json.RawMessage(fmt.Sprintf(`{"seq":%d}`, i)),
 			Attempts:    1,
@@ -70,21 +74,21 @@ func (s *stressStore) Claim(_ context.Context, _ string, limit int, _ time.Durat
 	return claimResult{Jobs: batch}, nil
 }
 
-func (s *stressStore) Succeed(_ context.Context, id int64, _ string, _ int) error {
+func (s *stressStore) Succeed(_ context.Context, id uuid.UUID, _ string, _ int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.succeeded[id]++
 	return nil
 }
 
-func (s *stressStore) Fail(_ context.Context, id int64, _ string, _ int, _ string, _ *time.Time) error {
+func (s *stressStore) Fail(_ context.Context, id uuid.UUID, _ string, _ int, _ string, _ *time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failed[id]++
 	return nil
 }
 
-func (s *stressStore) Heartbeat(_ context.Context, _ int64, _ string, _ int, _ time.Duration) error {
+func (s *stressStore) Heartbeat(_ context.Context, _ uuid.UUID, _ string, _ int, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.heartbeats++
@@ -92,7 +96,7 @@ func (s *stressStore) Heartbeat(_ context.Context, _ int64, _ string, _ int, _ t
 }
 
 // Release is counted as a recorded outcome alongside failures.
-func (s *stressStore) Release(_ context.Context, id int64, _ string, _ int, _ string) error {
+func (s *stressStore) Release(_ context.Context, id uuid.UUID, _ string, _ int, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failed[id]++
@@ -108,19 +112,19 @@ type stressSnapshot struct {
 	claimed    int
 	claimCalls int
 	heartbeats int
-	succeeded  map[int64]int
-	failed     map[int64]int
+	succeeded  map[uuid.UUID]int
+	failed     map[uuid.UUID]int
 }
 
 func (s *stressStore) snapshot() stressSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	succeeded := make(map[int64]int, len(s.succeeded))
+	succeeded := make(map[uuid.UUID]int, len(s.succeeded))
 	for id, count := range s.succeeded {
 		succeeded[id] = count
 	}
-	failed := make(map[int64]int, len(s.failed))
+	failed := make(map[uuid.UUID]int, len(s.failed))
 	for id, count := range s.failed {
 		failed[id] = count
 	}
@@ -148,7 +152,7 @@ func TestWorkerRunStressProcessesEachJobOnce(t *testing.T) {
 
 	var (
 		handledMu sync.Mutex
-		handled   = make(map[int64]int, stressJobCount)
+		handled   = make(map[uuid.UUID]int, stressJobCount)
 		processed atomic.Int32
 	)
 	started := make(chan struct{}, stressJobCount)
@@ -162,7 +166,7 @@ func TestWorkerRunStressProcessesEachJobOnce(t *testing.T) {
 		if err := json.Unmarshal(payload, &item); err != nil {
 			return err
 		}
-		id := int64(item.Seq + 1)
+		id := testID(int(item.Seq) + 1)
 
 		handledMu.Lock()
 		handled[id]++

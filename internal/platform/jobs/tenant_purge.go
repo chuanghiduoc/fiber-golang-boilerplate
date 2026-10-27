@@ -5,8 +5,9 @@ import (
 	"fmt"
 
 	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/google/uuid"
 )
 
 // purgeTenantJobsSQL deletes one bounded page of a deleted tenant's jobs. A
@@ -31,12 +32,12 @@ WHERE id IN (
 // scoped to tenantID explicitly so the tenant_isolation policy admits exactly
 // that tenant's rows. Running rows are retained. It is idempotent: a repeated
 // call finds nothing to delete.
-func PurgeTenant(ctx context.Context, db database.DBTX, tenantID int64) error {
+func PurgeTenant(ctx context.Context, db database.DBTX, tenantID uuid.UUID) error {
 	if db == nil {
 		return ErrNoPool
 	}
-	if tenantID <= 0 {
-		return fmt.Errorf("jobs: purge tenant %d: %w", tenantID, ErrInvalidTenant)
+	if tenantID == uuid.Nil {
+		return fmt.Errorf("jobs: purge tenant %s: %w", tenantID, ErrInvalidTenant)
 	}
 	ctx = tenant.WithID(ctx, tenantID)
 	for {
@@ -45,7 +46,7 @@ func PurgeTenant(ctx context.Context, db database.DBTX, tenantID int64) error {
 		}
 		tag, err := db.Exec(ctx, purgeTenantJobsSQL, tenantID, purgeBatchSize)
 		if err != nil {
-			return fmt.Errorf("jobs: purge tenant %d jobs: %w", tenantID, err)
+			return fmt.Errorf("jobs: purge tenant %s jobs: %w", tenantID, err)
 		}
 		if tag.RowsAffected() < int64(purgeBatchSize) {
 			return nil
@@ -71,6 +72,6 @@ func NewTenantPurger(db database.DBTX) *TenantPurger {
 }
 
 // PurgeTenant implements tenancy.Purger.
-func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID int64) error {
+func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	return PurgeTenant(ctx, p.db, tenantID)
 }

@@ -1,11 +1,9 @@
 # Makefile for the API, the migrator, and developer tooling.
 -include .env
 
-# Tool versions. Keep SWAG_VERSION and SQLC_VERSION in sync with
-# .github/workflows/ci.yml so generated code matches the CI drift checks.
-SWAG_VERSION ?= v1.16.6
-SQLC_VERSION ?= v1.31.1
-AIR_VERSION ?= v1.67.4
+# Go tool versions live in go.mod `tool` directives (go get -tool), so the
+# Makefile, CI, and Dependabot all agree on one pinned version. Invoke them
+# with `go tool <name>`; no `go run pkg@version` or global install.
 
 # Build outputs. Windows executables need the .exe suffix.
 ifeq ($(OS),Windows_NT)
@@ -25,14 +23,21 @@ build:
 	@go build -o $(SERVER_BIN) ./cmd/api
 	@go build -o $(MIGRATE_BIN) ./cmd/migrate
 
-# Run the application (schema first, then API)
+# Local-only build: the dev tag loads .env at runtime. Release builds (make
+# build, Docker) omit it, so the shipped binaries never read a .env file.
+build-dev:
+	@echo "Building $(SERVER_BIN) and $(MIGRATE_BIN) with .env support..."
+	@go build -tags dev -o $(SERVER_BIN) ./cmd/api
+	@go build -tags dev -o $(MIGRATE_BIN) ./cmd/migrate
+
+# Run the application (schema first, then API) with .env loaded by the dev build tag.
 run: migrate-run
-	@go run ./cmd/api
+	@go run -tags dev ./cmd/api
 
 # Apply pending migrations and verify the schema through cmd/migrate, the only
-# schema initializer/migrator.
+# schema initializer/migrator. The dev build tag loads .env; release builds never do.
 migrate-run:
-	@go run ./cmd/migrate
+	@go run -tags dev ./cmd/migrate
 
 # Start the Compose stack (migrate job, then API)
 docker-run:
@@ -74,7 +79,7 @@ clean:
 # Live reload: rebuilds and restarts the API on change
 watch:
 	@echo "Watching..."
-	@go run github.com/air-verse/air@$(AIR_VERSION) -build.cmd "$(MAKE) build" -build.entrypoint "$(SERVER_BIN)"
+	@go tool air -build.cmd "$(MAKE) build-dev" -build.entrypoint "$(SERVER_BIN)"
 
 # golang-migrate CLI helpers. Applying migrations goes through migrate-run;
 # these are for authoring and for disposable local databases only.
@@ -101,15 +106,13 @@ migrate-create:
 	@test -n "$(module)" -a -n "$(name)" || { echo "usage: make migrate-create module=<module|platform> name=<purpose>"; exit 1; }
 	@migrate create -ext sql -dir migrations -format 20060102150405 -tz UTC $(module)_$(name)
 
-# sqlc needs cgo, so it stays an external binary instead of `go run`. Each
+# sqlc is a pinned go.mod tool, so its version matches CI by construction. Each
 # module owns internal/modules/<name>/sqlc.yaml (paths relative to it); this
 # runs every one and stops at the first failure.
 sqlc-generate:
-	@command -v sqlc >/dev/null 2>&1 || { echo "sqlc not found; install $(SQLC_VERSION) (the CI version): go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)"; exit 1; }
-	@sqlc version | grep -qx "$(SQLC_VERSION)" || echo "warning: sqlc $$(sqlc version) differs from $(SQLC_VERSION) used in CI; generated code may drift"
 	@for config in internal/modules/*/sqlc.yaml; do \
 		echo "sqlc generate -f $$config"; \
-		sqlc generate -f "$$config" || exit 1; \
+		go tool sqlc generate -f "$$config" || exit 1; \
 	done
 
 # Code generator (cmd/gen, layered module layout). It writes the files, then runs
@@ -140,13 +143,15 @@ lint:
 # Seed the admin user (schema must already exist; migrate-run is a dependency)
 seed: migrate-run
 	@echo "Seeding database..."
-	@go run ./cmd/seed
+	@go run -tags dev ./cmd/seed
 
-swagger:
-	@go run github.com/swaggo/swag/cmd/swag@$(SWAG_VERSION) init -g cmd/api/main.go -o docs
+# Regenerate the committed OpenAPI 3.1 document from the registered huma
+# operations. No database or network access is required.
+openapi:
+	@go run ./cmd/openapi
 
 # Rename the module path (usage: make rename-module mod=github.com/yourname/yourproject)
 rename-module:
 	@bash scripts/rename-module.sh $(mod)
 
-.PHONY: all build run migrate-run docker-run docker-down check vet arch test test-race test-integration clean watch migrate-down migrate-create sqlc-generate gen lint seed swagger rename-module
+.PHONY: all build run migrate-run docker-run docker-down check vet arch test test-race test-integration clean watch migrate-down migrate-create sqlc-generate gen lint seed openapi rename-module

@@ -6,8 +6,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
-// Error codes owned by identity. user.last_admin stays in pkg/apperror until
-// the identity repository that returns it is migrated to this catalog.
+// Error codes owned by identity.
 const (
 	CodeAuthInvalidCredentials apperror.Code = "auth.invalid_credentials"
 	CodeAuthEmailNotVerified   apperror.Code = "auth.email_not_verified"
@@ -17,6 +16,10 @@ const (
 	// session stays valid; the caller should retry with the token it already
 	// holds or the one from the winning response.
 	CodeAuthRefreshConcurrent apperror.Code = "auth.refresh_concurrent"
+	// CodeAuthCSRFFailed: a cookie-authenticated refresh/logout was not
+	// same-origin and did not carry a matching Origin plus the custom CSRF
+	// header.
+	CodeAuthCSRFFailed apperror.Code = "auth.csrf_failed"
 	// CodeAuthMFAChallengeInvalid: the challenge expired, was already used,
 	// or belongs to another tenant.
 	CodeAuthMFAChallengeInvalid apperror.Code = "auth.mfa_challenge_invalid"
@@ -32,6 +35,19 @@ const (
 	// CodeAuthMFAReauthRequired: a passwordless account must sign in again
 	// (the session is older than the re-authentication window).
 	CodeAuthMFAReauthRequired apperror.Code = "auth.mfa_reauth_required"
+	// CodeAuthPasskeyInvalid: the WebAuthn ceremony is unknown, expired,
+	// already used, belongs to another tenant/user, or the assertion failed.
+	CodeAuthPasskeyInvalid apperror.Code = "auth.passkey_invalid"
+	// CodeAuthPasskeyAlreadyRegistered: the credential id is already bound.
+	CodeAuthPasskeyAlreadyRegistered apperror.Code = "auth.passkey_already_registered"
+	// CodeAuthPasskeyNotFound: the caller has no passkey with that id.
+	CodeAuthPasskeyNotFound apperror.Code = "auth.passkey_not_found"
+	// CodeAuthPasskeySignCount: the authenticator's signature counter did not
+	// advance, which is a clone / replay signal.
+	CodeAuthPasskeySignCount apperror.Code = "auth.passkey_sign_count_invalid"
+	// CodeAuthPasskeyNameInvalid: the requested passkey label is empty after
+	// trimming or longer than 64 characters / contains control characters.
+	CodeAuthPasskeyNameInvalid apperror.Code = "auth.passkey_name_invalid"
 	// CodeAuthOAuthUpstreamUnavailable: Google's token or userinfo endpoint
 	// failed in a way the client cannot fix (5xx, timeout, network).
 	CodeAuthOAuthUpstreamUnavailable apperror.Code = "auth.oauth_upstream_unavailable"
@@ -48,6 +64,10 @@ const (
 
 	CodeUserEmailTaken apperror.Code = "user.email_taken"
 	CodeUserNotFound   apperror.Code = "user.not_found"
+	// CodeUserLastAdmin: removing the last active owner of an operational
+	// tenant is refused by the protect_last_owner trigger and the service
+	// pre-check.
+	CodeUserLastAdmin apperror.Code = "user.last_admin"
 
 	// CodeInvitationInvalid: unknown, expired, or already accepted
 	// invitation token, or one addressed to another email.
@@ -72,130 +92,197 @@ const (
 	CodeDataExportExpired    apperror.Code = "data_export.expired"
 )
 
-// ErrorCodes returns identity's error catalog for app.ErrorProvider.
-func ErrorCodes() map[apperror.Code]apperror.Spec {
-	return map[apperror.Code]apperror.Spec{
-		CodeAuthInvalidCredentials: {
+// Errors returns identity's error catalog for app.ErrorProvider.
+func Errors() []apperror.Spec {
+	return []apperror.Spec{
+		{
+			Code:    CodeAuthInvalidCredentials,
 			Status:  http.StatusUnauthorized,
 			Title:   "Invalid credentials",
 			DocPath: "/errors/auth-invalid-credentials",
 		},
-		CodeAuthEmailNotVerified: {
+		{
+			Code:    CodeAuthEmailNotVerified,
 			Status:  http.StatusForbidden,
 			Title:   "Email not verified",
 			DocPath: "/errors/auth-email-not-verified",
 		},
-		CodeAuthRefreshInvalid: {
+		{
+			Code:    CodeAuthRefreshInvalid,
 			Status:  http.StatusUnauthorized,
 			Title:   "Invalid refresh token",
 			DocPath: "/errors/auth-refresh-invalid",
 		},
-		CodeAuthRefreshConcurrent: {
+		{
+			Code:    CodeAuthRefreshConcurrent,
 			Status:  http.StatusUnauthorized,
 			Title:   "Concurrent refresh",
 			DocPath: "/errors/auth-refresh-concurrent",
 		},
-		CodeAuthMFAChallengeInvalid: {
+		{
+			Code:    CodeAuthCSRFFailed,
+			Status:  http.StatusForbidden,
+			Title:   "Cross-site request refused",
+			DocPath: "/errors/auth-csrf-failed",
+		},
+		{
+			Code:    CodeAuthMFAChallengeInvalid,
 			Status:  http.StatusUnauthorized,
 			Title:   "Invalid MFA challenge",
 			DocPath: "/errors/auth-mfa-challenge-invalid",
 		},
-		CodeAuthMFAInvalidCode: {
+		{
+			Code:    CodeAuthMFAInvalidCode,
 			Status:  http.StatusUnauthorized,
 			Title:   "Invalid MFA code",
 			DocPath: "/errors/auth-mfa-invalid-code",
 		},
-		CodeAuthMFAAlreadyEnabled: {
+		{
+			Code:    CodeAuthMFAAlreadyEnabled,
 			Status:  http.StatusConflict,
 			Title:   "MFA is already enabled",
 			DocPath: "/errors/auth-mfa-already-enabled",
 		},
-		CodeAuthMFANotEnabled: {
+		{
+			Code:    CodeAuthMFANotEnabled,
 			Status:  http.StatusConflict,
 			Title:   "MFA is not enabled",
 			DocPath: "/errors/auth-mfa-not-enabled",
 		},
-		CodeAuthMFAEnrollmentExpired: {
+		{
+			Code:    CodeAuthMFAEnrollmentExpired,
 			Status:  http.StatusConflict,
 			Title:   "MFA enrollment has expired",
 			DocPath: "/errors/auth-mfa-enrollment-expired",
 		},
-		CodeAuthMFAReauthRequired: {
+		{
+			Code:    CodeAuthMFAReauthRequired,
 			Status:  http.StatusForbidden,
 			Title:   "Re-authentication required",
 			DocPath: "/errors/auth-mfa-reauth-required",
 		},
-		CodeAuthOAuthUpstreamUnavailable: {
+		{
+			Code:    CodeAuthPasskeyInvalid,
+			Status:  http.StatusUnauthorized,
+			Title:   "Invalid passkey ceremony",
+			DocPath: "/errors/auth-passkey-invalid",
+		},
+		{
+			Code:    CodeAuthPasskeyAlreadyRegistered,
+			Status:  http.StatusConflict,
+			Title:   "Passkey is already registered",
+			DocPath: "/errors/auth-passkey-already-registered",
+		},
+		{
+			Code:    CodeAuthPasskeyNotFound,
+			Status:  http.StatusNotFound,
+			Title:   "Passkey not found",
+			DocPath: "/errors/auth-passkey-not-found",
+		},
+		{
+			Code:    CodeAuthPasskeySignCount,
+			Status:  http.StatusUnauthorized,
+			Title:   "Authenticator signature counter did not advance",
+			DocPath: "/errors/auth-passkey-sign-count-invalid",
+		},
+		{
+			Code:    CodeAuthPasskeyNameInvalid,
+			Status:  http.StatusBadRequest,
+			Title:   "Invalid passkey name",
+			DocPath: "/errors/auth-passkey-name-invalid",
+		},
+		{
+			Code:    CodeAuthOAuthUpstreamUnavailable,
 			Status:  http.StatusBadGateway,
 			Title:   "OAuth provider is unavailable",
 			DocPath: "/errors/auth-oauth-upstream-unavailable",
 		},
-		CodeAuthOAuthCodeInvalid: {
+		{
+			Code:    CodeAuthOAuthCodeInvalid,
 			Status:  http.StatusUnauthorized,
 			Title:   "Invalid Google sign-in code",
 			DocPath: "/errors/auth-oauth-code-invalid",
 		},
-		CodeAuthOAuthEmailNotVerified: {
+		{
+			Code:    CodeAuthOAuthEmailNotVerified,
 			Status:  http.StatusForbidden,
 			Title:   "Google email address is not verified",
 			DocPath: "/errors/auth-oauth-email-not-verified",
 		},
-		CodeAuthOAuthUserInfoIncomplete: {
+		{
+			Code:    CodeAuthOAuthUserInfoIncomplete,
 			Status:  http.StatusBadRequest,
 			Title:   "Incomplete Google user info",
 			DocPath: "/errors/auth-oauth-userinfo-incomplete",
 		},
-		CodeUserEmailTaken: {
+		{
+			Code:    CodeUserEmailTaken,
 			Status:  http.StatusConflict,
 			Title:   "Email already in use",
 			DocPath: "/errors/user-email-taken",
 		},
-		CodeUserNotFound: {
+		{
+			Code:    CodeUserNotFound,
 			Status:  http.StatusNotFound,
 			Title:   "User not found",
 			DocPath: "/errors/user-not-found",
 		},
-		CodeInvitationInvalid: {
+		{
+			Code:    CodeUserLastAdmin,
+			Status:  http.StatusConflict,
+			Title:   "Cannot remove the last owner",
+			DocPath: "/errors/user-last-admin",
+		},
+		{
+			Code:    CodeInvitationInvalid,
 			Status:  http.StatusBadRequest,
 			Title:   "Invalid invitation",
 			DocPath: "/errors/invitation-invalid",
 		},
-		CodeInvitationInviterIneligible: {
+		{
+			Code:    CodeInvitationInviterIneligible,
 			Status:  http.StatusConflict,
 			Title:   "Invitation inviter cannot grant its role",
 			DocPath: "/errors/invitation-inviter-ineligible",
 		},
-		CodeMembershipExists: {
+		{
+			Code:    CodeMembershipExists,
 			Status:  http.StatusConflict,
 			Title:   "Already a member",
 			DocPath: "/errors/membership-exists",
 		},
-		CodeRoleInsufficientRank: {
+		{
+			Code:    CodeRoleInsufficientRank,
 			Status:  http.StatusForbidden,
 			Title:   "Insufficient role rank",
 			DocPath: "/errors/role-insufficient-rank",
 		},
-		CodeTenantDeletionNotDue: {
+		{
+			Code:    CodeTenantDeletionNotDue,
 			Status:  http.StatusConflict,
 			Title:   "Tenant deletion is not due",
 			DocPath: "/errors/tenant-deletion-not-due",
 		},
-		CodeDataExportInProgress: {
+		{
+			Code:    CodeDataExportInProgress,
 			Status:  http.StatusConflict,
 			Title:   "A data export is already in progress",
 			DocPath: "/errors/data-export-in-progress",
 		},
-		CodeDataExportNotFound: {
+		{
+			Code:    CodeDataExportNotFound,
 			Status:  http.StatusNotFound,
 			Title:   "Data export not found",
 			DocPath: "/errors/data-export-not-found",
 		},
-		CodeDataExportNotReady: {
+		{
+			Code:    CodeDataExportNotReady,
 			Status:  http.StatusConflict,
 			Title:   "Data export is not ready",
 			DocPath: "/errors/data-export-not-ready",
 		},
-		CodeDataExportExpired: {
+		{
+			Code:    CodeDataExportExpired,
 			Status:  http.StatusGone,
 			Title:   "Data export has expired",
 			DocPath: "/errors/data-export-expired",

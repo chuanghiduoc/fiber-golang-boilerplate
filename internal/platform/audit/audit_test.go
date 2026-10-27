@@ -6,8 +6,12 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
 func TestNoopRecord(t *testing.T) {
@@ -15,7 +19,7 @@ func TestNoopRecord(t *testing.T) {
 
 	var recorder Recorder = Noop{}
 	require.NoError(t, recorder.Record(context.Background(), Event{
-		ActorID:  1,
+		ActorID:  testID(1),
 		Action:   "user.login",
 		Resource: "user",
 	}))
@@ -83,6 +87,16 @@ func TestPostgresRecorderRejectsInvalidEventBeforeTouchingPool(t *testing.T) {
 	err = recorder.Record(context.Background(), Event{Action: "user.login"})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInvalidEvent)
+}
+
+// TestPostgresRecorderRejectsEventWithoutTenant proves there is no
+// compatibility tenant: a row (or context) must name one before the write.
+func TestPostgresRecorderRejectsEventWithoutTenant(t *testing.T) {
+	t.Parallel()
+
+	recorder := NewPostgresRecorder(nil)
+	err := recorder.Record(context.Background(), Event{Action: "user.login", Resource: "user"})
+	require.ErrorIs(t, err, tenant.ErrMissingTenant)
 }
 
 func TestPostgresRecorderSanitizesUnsupportedMetadataBeforeTouchingPool(t *testing.T) {
@@ -168,9 +182,9 @@ func TestMarshalMetadata(t *testing.T) {
 func TestNullableHelpers(t *testing.T) {
 	t.Parallel()
 
-	assert.Nil(t, nullableInt64(0))
-	require.NotNil(t, nullableInt64(7))
-	assert.Equal(t, int64(7), *nullableInt64(7))
+	assert.Nil(t, nullableUUID(uuid.Nil))
+	require.NotNil(t, nullableUUID(testID(7)))
+	assert.Equal(t, testID(7), *nullableUUID(testID(7)))
 
 	assert.Nil(t, nullableString(""))
 	require.NotNil(t, nullableString("1.2.3.4"))

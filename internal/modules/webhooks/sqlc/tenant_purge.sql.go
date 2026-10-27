@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const deleteTenantWebhookDeliveriesBatch = `-- name: DeleteTenantWebhookDeliveriesBatch :execrows
@@ -14,14 +16,14 @@ const deleteTenantWebhookDeliveriesBatch = `-- name: DeleteTenantWebhookDeliveri
 DELETE FROM webhook_deliveries
 WHERE id IN (
     SELECT id FROM webhook_deliveries
-    WHERE tenant_id = $1::bigint
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantWebhookDeliveriesBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 // Tenant purge. Deliveries go before events and events before endpoints
@@ -40,14 +42,14 @@ const deleteTenantWebhookEndpointsBatch = `-- name: DeleteTenantWebhookEndpoints
 DELETE FROM webhook_endpoints
 WHERE id IN (
     SELECT id FROM webhook_endpoints
-    WHERE tenant_id = $1::bigint
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantWebhookEndpointsBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 func (q *Queries) DeleteTenantWebhookEndpointsBatch(ctx context.Context, arg DeleteTenantWebhookEndpointsBatchParams) (int64, error) {
@@ -60,17 +62,17 @@ func (q *Queries) DeleteTenantWebhookEndpointsBatch(ctx context.Context, arg Del
 
 const deleteTenantWebhookEventsBatch = `-- name: DeleteTenantWebhookEventsBatch :execrows
 DELETE FROM webhook_events
-WHERE tenant_id = $1::bigint
+WHERE tenant_id = $1::uuid
   AND event_id IN (
       SELECT event_id FROM webhook_events
-      WHERE tenant_id = $1::bigint
+      WHERE tenant_id = $1::uuid
       LIMIT $2::int
   )
 `
 
 type DeleteTenantWebhookEventsBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 func (q *Queries) DeleteTenantWebhookEventsBatch(ctx context.Context, arg DeleteTenantWebhookEventsBatchParams) (int64, error) {
@@ -85,14 +87,14 @@ const deleteTenantWebhookInboundEventsBatch = `-- name: DeleteTenantWebhookInbou
 DELETE FROM webhook_inbound_events
 WHERE id IN (
     SELECT id FROM webhook_inbound_events
-    WHERE tenant_id = $1::bigint
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantWebhookInboundEventsBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 func (q *Queries) DeleteTenantWebhookInboundEventsBatch(ctx context.Context, arg DeleteTenantWebhookInboundEventsBatchParams) (int64, error) {
@@ -107,14 +109,14 @@ const deleteTenantWebhookInboundSourcesBatch = `-- name: DeleteTenantWebhookInbo
 DELETE FROM webhook_inbound_sources
 WHERE id IN (
     SELECT id FROM webhook_inbound_sources
-    WHERE tenant_id = $1::bigint
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantWebhookInboundSourcesBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 func (q *Queries) DeleteTenantWebhookInboundSourcesBatch(ctx context.Context, arg DeleteTenantWebhookInboundSourcesBatchParams) (int64, error) {

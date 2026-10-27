@@ -1,0 +1,35 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fiber-boilerplate-worker
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/instance: fiber-boilerplate-worker
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: worker
+spec:
+  scaleTargetRef:
+    name: fiber-boilerplate-worker
+  # Keep at least two workers so the scheduler lease and claims survive one
+  # disruption. The upper bound also bounds database connections: each worker
+  # opens a normal and a bypass pool of DB_MAX_CONNS.
+  minReplicaCount: 2
+  maxReplicaCount: 10
+  pollingInterval: 30
+  cooldownPeriod: 300
+  triggers:
+    - type: prometheus
+      metadata:
+        # Replace with your Prometheus service. The worker and API expose
+        # /metrics on the pod port; the public Ingress excludes it.
+        serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+        metricName: jobs_queue_lag_seconds
+        threshold: "60"
+        # Mean queue lag in seconds over five minutes. jobs_queue_lag_seconds is
+        # a histogram observed by the claim query; a queue with no claims in the
+        # window has no observations, so clamp the denominator instead of
+        # dividing by zero.
+        query: |
+          sum(rate(jobs_queue_lag_seconds_sum[5m]))
+          /
+          clamp_min(sum(rate(jobs_queue_lag_seconds_count[5m])), 0.001)

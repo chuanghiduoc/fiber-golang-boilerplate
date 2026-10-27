@@ -16,9 +16,9 @@ func Test{{.U.Name}}(t *testing.T) {
 		ctx  context.Context
 		want apperror.Code
 	}{
-		"authorized":         {adminContext(1), {{.M.Ident}}catalog.CodeNotImplemented},
+		"authorized":         {adminContext(testTenant), {{.M.Ident}}catalog.CodeNotImplemented},
 		"no subject":         {context.Background(), apperror.CodePermissionDenied},
-		"missing permission": {userContext(1), apperror.CodePermissionDenied},
+		"missing permission": {userContext(testTenant), apperror.CodePermissionDenied},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

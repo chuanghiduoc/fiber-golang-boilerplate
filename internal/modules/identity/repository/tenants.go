@@ -4,13 +4,15 @@ import (
 	"context"
 	"time"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
+	"github.com/google/uuid"
 )
 
 // uniqueTenantsSlug is PostgreSQL's name for the inline slug UNIQUE.
-const uniqueTenantsSlug = "tenants_slug_key"
+const uniqueTenantsSlug = "uq_tenants_slug"
 
 // TenantRepository implements service.TenantRepository.
 type TenantRepository struct {
@@ -30,8 +32,8 @@ func toTenant(row identitysqlc.Tenant) *identityservice.Tenant {
 		Name:                row.Name,
 		Status:              identityservice.TenantStatus(row.Status),
 		StatusChangedAt:     row.StatusChangedAt.Time,
-		TrialEndsAt:         timePtr(row.TrialEndsAt),
-		DeletionScheduledAt: timePtr(row.DeletionScheduledAt),
+		TrialEndsAt:         database.TimePtr(row.TrialEndsAt),
+		DeletionScheduledAt: database.TimePtr(row.DeletionScheduledAt),
 		CreatedAt:           row.CreatedAt.Time,
 		UpdatedAt:           row.UpdatedAt.Time,
 	}
@@ -48,11 +50,11 @@ func (r *TenantRepository) GetOperationalBySlug(ctx context.Context, slug string
 	return oneTenant(r.q.GetOperationalTenantBySlug(ctx, slug))
 }
 
-func (r *TenantRepository) GetOperationalByID(ctx context.Context, id int64) (*identityservice.Tenant, error) {
+func (r *TenantRepository) GetOperationalByID(ctx context.Context, id uuid.UUID) (*identityservice.Tenant, error) {
 	return oneTenant(r.q.GetOperationalTenantByID(ctx, id))
 }
 
-func (r *TenantRepository) GetByID(ctx context.Context, id int64) (*identityservice.Tenant, error) {
+func (r *TenantRepository) GetByID(ctx context.Context, id uuid.UUID) (*identityservice.Tenant, error) {
 	return oneTenant(r.q.GetTenantByID(ctx, id))
 }
 
@@ -60,7 +62,7 @@ func (r *TenantRepository) GetBySlug(ctx context.Context, slug string) (*identit
 	return oneTenant(r.q.GetTenantBySlug(ctx, slug))
 }
 
-func (r *TenantRepository) GetByIDForUpdate(ctx context.Context, id int64) (*identityservice.Tenant, error) {
+func (r *TenantRepository) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*identityservice.Tenant, error) {
 	return oneTenant(r.q.GetTenantByIDForUpdate(ctx, id))
 }
 
@@ -87,7 +89,7 @@ func (r *TenantRepository) Create(ctx context.Context, t identityservice.NewTena
 		Slug:        t.Slug,
 		Name:        t.Name,
 		Status:      string(t.Status),
-		TrialEndsAt: optionalTimestamptz(t.TrialEndsAt),
+		TrialEndsAt: database.TimestamptzPtr(t.TrialEndsAt),
 	})
 	if err != nil {
 		if name, ok := uniqueConstraint(err); ok && name == uniqueTenantsSlug {
@@ -105,18 +107,35 @@ func (r *TenantRepository) Create(ctx context.Context, t identityservice.NewTena
 	return toTenant(row), nil
 }
 
-func (r *TenantRepository) UpdateStatus(ctx context.Context, id int64, status identityservice.TenantStatus, deletionScheduledAt *time.Time) (*identityservice.Tenant, error) {
+func (r *TenantRepository) UpdateStatus(ctx context.Context, id uuid.UUID, status identityservice.TenantStatus, deletionScheduledAt *time.Time) (*identityservice.Tenant, error) {
 	return oneTenant(r.q.UpdateTenantStatus(ctx, identitysqlc.UpdateTenantStatusParams{
 		ID:                  id,
 		Status:              string(status),
-		DeletionScheduledAt: optionalTimestamptz(deletionScheduledAt),
+		DeletionScheduledAt: database.TimestamptzPtr(deletionScheduledAt),
 	}))
 }
 
-func (r *TenantRepository) Settings(ctx context.Context, tenantID int64) (*identityservice.TenantSettings, error) {
+func (r *TenantRepository) UpdateName(ctx context.Context, id uuid.UUID, name string) (*identityservice.Tenant, error) {
+	return oneTenant(r.q.UpdateTenantName(ctx, identitysqlc.UpdateTenantNameParams{ID: id, Name: name}))
+}
+
+func (r *TenantRepository) Settings(ctx context.Context, tenantID uuid.UUID) (*identityservice.TenantSettings, error) {
 	row, err := r.q.GetTenantSettings(ctx, tenantID)
 	if err != nil {
 		return nil, wrapErr(err)
 	}
 	return &identityservice.TenantSettings{TenantID: row.TenantID, Locale: row.Locale, Timezone: row.Timezone}, nil
+}
+
+// TouchIfUnchanged is the optimistic-concurrency gate for the tenants ETag.
+// It returns false when another writer already changed the row.
+func (r *TenantRepository) TouchIfUnchanged(ctx context.Context, id uuid.UUID, expected time.Time) (bool, error) {
+	n, err := r.q.TouchTenantIfUnchanged(ctx, identitysqlc.TouchTenantIfUnchangedParams{
+		ID:                id,
+		ExpectedUpdatedAt: timestamptzValue(expected),
+	})
+	if err != nil {
+		return false, wrapErr(err)
+	}
+	return n > 0, nil
 }

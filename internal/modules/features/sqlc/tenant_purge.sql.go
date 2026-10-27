@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const deleteTenantFeatureFlagTargetsBatch = `-- name: DeleteTenantFeatureFlagTargetsBatch :execrows
@@ -14,14 +16,14 @@ const deleteTenantFeatureFlagTargetsBatch = `-- name: DeleteTenantFeatureFlagTar
 DELETE FROM feature_flag_targets
 WHERE id IN (
     SELECT id FROM feature_flag_targets
-    WHERE tenant_id = $1::bigint
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantFeatureFlagTargetsBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 // Tenant purge. Removes tenant- and user-scoped targets in bounded id batches;

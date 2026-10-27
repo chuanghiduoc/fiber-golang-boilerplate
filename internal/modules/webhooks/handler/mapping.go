@@ -7,18 +7,8 @@ import (
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 )
 
-func createEndpointInput(req dto.CreateEndpointRequest) webhookservice.CreateEndpointInput {
+func createEndpointInput(req dto.CreateWebhookEndpointRequest) webhookservice.CreateEndpointInput {
 	return webhookservice.CreateEndpointInput{
-		URL:         req.URL,
-		Description: req.Description,
-		EventTypes:  req.EventTypes,
-		MaxAttempts: req.MaxAttempts,
-		TimeoutMS:   req.TimeoutMS,
-	}
-}
-
-func updateEndpointInput(req dto.UpdateEndpointRequest) webhookservice.UpdateEndpointInput {
-	return webhookservice.UpdateEndpointInput{
 		URL:         req.URL,
 		Description: req.Description,
 		EventTypes:  req.EventTypes,
@@ -28,16 +18,67 @@ func updateEndpointInput(req dto.UpdateEndpointRequest) webhookservice.UpdateEnd
 	}
 }
 
-func createInboundSourceInput(req dto.CreateInboundSourceRequest) webhookservice.CreateInboundSourceInput {
-	return webhookservice.CreateInboundSourceInput{Name: req.Name, Slug: req.Slug}
+// applyEndpointPatch merges the request onto the current endpoint. An absent
+// member keeps the stored value; null restores the service default.
+func applyEndpointPatch(current *webhookservice.Endpoint, req dto.UpdateWebhookEndpointRequest) webhookservice.UpdateEndpointInput {
+	url := current.URL
+	req.URL.Apply(&url)
+	description := current.Description
+	req.Description.Apply(&description)
+	eventTypes := current.EventTypes
+	req.EventTypes.Apply(&eventTypes)
+	status := current.Status
+	req.Status.Apply(&status)
+
+	maxAttempts := int(current.MaxAttempts)
+	var maxPtr *int
+	switch {
+	case req.MaxAttempts.Present && req.MaxAttempts.Null:
+		maxPtr = nil
+	case req.MaxAttempts.Present:
+		maxPtr = req.MaxAttempts.Value
+	default:
+		maxPtr = &maxAttempts
+	}
+
+	timeoutMS := int(current.TimeoutMS)
+	var timeoutPtr *int
+	switch {
+	case req.TimeoutMS.Present && req.TimeoutMS.Null:
+		timeoutPtr = nil
+	case req.TimeoutMS.Present:
+		timeoutPtr = req.TimeoutMS.Value
+	default:
+		timeoutPtr = &timeoutMS
+	}
+
+	return webhookservice.UpdateEndpointInput{
+		URL:         url,
+		Description: description,
+		EventTypes:  eventTypes,
+		Status:      status,
+		MaxAttempts: maxPtr,
+		TimeoutMS:   timeoutPtr,
+	}
 }
 
-func updateInboundSourceInput(req dto.UpdateInboundSourceRequest) webhookservice.UpdateInboundSourceInput {
-	return webhookservice.UpdateInboundSourceInput{Name: req.Name, Slug: req.Slug, Status: req.Status}
+func inboundSourceInputFromRequest(req dto.CreateInboundSourceRequest) webhookservice.CreateInboundSourceInput {
+	return webhookservice.CreateInboundSourceInput{Name: req.Name, Slug: req.Slug, Status: req.Status}
 }
 
-func toEndpointResponse(endpoint *webhookservice.Endpoint) dto.EndpointResponse {
-	resp := dto.EndpointResponse{
+// applyInboundSourcePatch merges the request onto the current source.
+func applyInboundSourcePatch(current *webhookservice.InboundSource, req dto.UpdateInboundSourceRequest) webhookservice.UpdateInboundSourceInput {
+	name := current.Name
+	req.Name.Apply(&name)
+	slug := current.Slug
+	req.Slug.Apply(&slug)
+	status := current.Status
+	req.Status.Apply(&status)
+	return webhookservice.UpdateInboundSourceInput{Name: name, Slug: slug, Status: status}
+}
+
+func toEndpointResponse(endpoint *webhookservice.Endpoint) dto.WebhookEndpointResponse {
+	resp := dto.WebhookEndpointResponse{
 		ID:          endpoint.ID,
 		TenantID:    endpoint.TenantID,
 		URL:         endpoint.URL,
@@ -59,20 +100,20 @@ func toEndpointResponse(endpoint *webhookservice.Endpoint) dto.EndpointResponse 
 	return resp
 }
 
-func toEndpointResponses(endpoints []webhookservice.Endpoint) []dto.EndpointResponse {
-	out := make([]dto.EndpointResponse, len(endpoints))
+func toEndpointResponses(endpoints []webhookservice.Endpoint) []dto.WebhookEndpointResponse {
+	out := make([]dto.WebhookEndpointResponse, len(endpoints))
 	for i := range endpoints {
 		out[i] = toEndpointResponse(&endpoints[i])
 	}
 	return out
 }
 
-func toEndpointSecretResponse(endpoint *webhookservice.Endpoint, secret string) dto.EndpointSecretResponse {
-	return dto.EndpointSecretResponse{EndpointResponse: toEndpointResponse(endpoint), Secret: secret}
+func toEndpointSecretResponse(endpoint *webhookservice.Endpoint, secret string) dto.WebhookEndpointSecretResponse {
+	return dto.WebhookEndpointSecretResponse{WebhookEndpointResponse: toEndpointResponse(endpoint), Secret: secret}
 }
 
-func toDeliveryResponse(delivery *webhookservice.Delivery, includePayload bool) dto.DeliveryResponse {
-	resp := dto.DeliveryResponse{
+func toDeliveryResponse(delivery *webhookservice.Delivery, includePayload bool) dto.WebhookDeliveryResponse {
+	resp := dto.WebhookDeliveryResponse{
 		ID:             delivery.ID,
 		TenantID:       delivery.TenantID,
 		EndpointID:     delivery.EndpointID,
@@ -101,16 +142,16 @@ func toDeliveryResponse(delivery *webhookservice.Delivery, includePayload bool) 
 	return resp
 }
 
-func toDeliveryResponses(deliveries []webhookservice.Delivery) []dto.DeliveryResponse {
-	out := make([]dto.DeliveryResponse, len(deliveries))
+func toDeliveryResponses(deliveries []webhookservice.Delivery) []dto.WebhookDeliveryResponse {
+	out := make([]dto.WebhookDeliveryResponse, len(deliveries))
 	for i := range deliveries {
 		out[i] = toDeliveryResponse(&deliveries[i], false)
 	}
 	return out
 }
 
-func toAttemptResponse(attempt *webhookservice.DeliveryAttempt) dto.DeliveryAttemptResponse {
-	return dto.DeliveryAttemptResponse{
+func toAttemptResponse(attempt *webhookservice.DeliveryAttempt) dto.WebhookAttemptResponse {
+	return dto.WebhookAttemptResponse{
 		ID:         attempt.ID,
 		DeliveryID: attempt.DeliveryID,
 		Attempt:    attempt.Attempt,
@@ -121,8 +162,8 @@ func toAttemptResponse(attempt *webhookservice.DeliveryAttempt) dto.DeliveryAtte
 	}
 }
 
-func toAttemptResponses(attempts []webhookservice.DeliveryAttempt) []dto.DeliveryAttemptResponse {
-	out := make([]dto.DeliveryAttemptResponse, len(attempts))
+func toAttemptResponses(attempts []webhookservice.DeliveryAttempt) []dto.WebhookAttemptResponse {
+	out := make([]dto.WebhookAttemptResponse, len(attempts))
 	for i := range attempts {
 		out[i] = toAttemptResponse(&attempts[i])
 	}
@@ -136,7 +177,7 @@ func toInboundSourceResponse(source *webhookservice.InboundSource) dto.InboundSo
 		Name:        source.Name,
 		Slug:        source.Slug,
 		Status:      source.Status,
-		ReceiverURL: fmt.Sprintf("/api/v1/webhooks/inbound/%d", source.ID),
+		ReceiverURL: fmt.Sprintf("/api/v1/webhooks/inbound/%s", source.ID),
 		CreatedAt:   source.CreatedAt.UTC(),
 		UpdatedAt:   source.UpdatedAt.UTC(),
 	}

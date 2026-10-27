@@ -1,7 +1,8 @@
 // Package repository is the {{.M.Name}} PostgreSQL adapter. It
 // implements the ports declared in service/ports.go with the module's sqlc
 // queries and maps sqlc rows to service types, so no row type leaves this
-// package. Every tenant-owned query is scoped by tenant.EffectiveID(ctx).
+// package. Every tenant-owned query is scoped by tenant.Require(ctx); a
+// context without a tenant is an error, never a fallback.
 package repository
 
 import (

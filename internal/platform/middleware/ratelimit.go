@@ -7,10 +7,12 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -222,9 +224,9 @@ func admissionDelay(previous, current, limit, elapsed, window int64) int64 {
 
 func rateLimitCacheFailure(c fiber.Ctx, prefix string, err error) {
 	metrics.RateLimitErrorsTotal.WithLabelValues(prefix).Inc()
-	slog.Warn("rate-limit counter failed; allowing request",
+	slog.WarnContext(c.Context(), "rate-limit counter failed; allowing request",
 		slog.String("tier", prefix),
-		slog.String("request_id", fiber.Locals[string](c, "request_id")),
+		slog.String("request_id", requestctx.RequestID(c.Context())),
 		slog.Any("error", err),
 	)
 }
@@ -235,11 +237,11 @@ func rateLimitCacheFailure(c fiber.Ctx, prefix string, err error) {
 // are otherwise limited per user so clients behind a shared NAT do not
 // exhaust each other.
 func limiterKey(c fiber.Ctx, prefix string) string {
-	if id := fiber.Locals[int64](c, apikey.LocalAPIKeyID); id != 0 {
-		return prefix + ":apikey:" + strconv.FormatInt(id, 10)
+	if id := apikey.APIKeyIDFromContext(c.Context()); id != uuid.Nil {
+		return prefix + ":apikey:" + id.String()
 	}
-	if id := fiber.Locals[int64](c, "user_id"); id != 0 {
-		return prefix + ":user:" + strconv.FormatInt(id, 10)
+	if id := requestctx.ActorID(c.Context()); id != uuid.Nil {
+		return prefix + ":user:" + id.String()
 	}
 	return prefix + ":ip:" + c.IP()
 }

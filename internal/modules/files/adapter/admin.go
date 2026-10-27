@@ -6,6 +6,8 @@ package adapter
 import (
 	"context"
 
+	"github.com/google/uuid"
+
 	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 )
@@ -33,7 +35,7 @@ func (a *AdminFiles) ListFiles(ctx context.Context, limit int, startingAfter str
 	return filescontracts.FilePage{Items: items, HasMore: hasMore}, nil
 }
 
-func (a *AdminFiles) OpenFile(ctx context.Context, id int64) (filescontracts.FileDownload, error) {
+func (a *AdminFiles) OpenFile(ctx context.Context, id uuid.UUID) (filescontracts.FileDownload, error) {
 	file, reader, err := a.service.Download(ctx, id)
 	if err != nil {
 		return filescontracts.FileDownload{}, err
@@ -41,11 +43,11 @@ func (a *AdminFiles) OpenFile(ctx context.Context, id int64) (filescontracts.Fil
 	return filescontracts.FileDownload{File: toFile(file), Reader: reader}, nil
 }
 
-func (a *AdminFiles) DeleteFile(ctx context.Context, id int64) error {
+func (a *AdminFiles) DeleteFile(ctx context.Context, id uuid.UUID) error {
 	return a.service.DeleteFile(ctx, id)
 }
 
-func (a *AdminFiles) RestoreFile(ctx context.Context, id int64) (filescontracts.File, error) {
+func (a *AdminFiles) RestoreFile(ctx context.Context, id uuid.UUID) (filescontracts.File, error) {
 	file, err := a.service.RestoreFile(ctx, id)
 	if err != nil {
 		return filescontracts.File{}, err

@@ -51,36 +51,46 @@ WHERE tenant_id = $1;
 
 -- name: ListFilesByUserCursor :many
 SELECT * FROM files
-WHERE tenant_id = @tenant_id::bigint
-  AND user_id = @user_id::bigint
+WHERE tenant_id = @tenant_id::uuid
+  AND user_id = @user_id::uuid
   AND (deleted_at IS NULL OR @include_deleted::boolean)
-  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
 -- name: AdminListFilesCursor :many
 SELECT * FROM files
-WHERE tenant_id = @tenant_id::bigint
-  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+WHERE tenant_id = @tenant_id::uuid
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;
+
+-- name: ListFilesCursor :many
+-- Tenant-wide page used by the collection route for an admin caller.
+-- include_deleted is the caller's includeDeleted query (admins also use it).
+SELECT * FROM files
+WHERE tenant_id = @tenant_id::uuid
+  AND (deleted_at IS NULL OR @include_deleted::boolean)
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
 -- name: LockFilesQuota :exec
 -- Serializes uploads of one tenant for the rest of the metadata transaction,
 -- so a concurrent upload cannot read the same free space and also pass.
-SELECT pg_advisory_xact_lock(hashtextextended('files.quota:' || @tenant_id::bigint, 0));
+SELECT pg_advisory_xact_lock(hashtextextended('files.quota:' || @tenant_id::uuid, 0));
 
 -- name: FilesStorageUsage :one
 -- Both quotas count trashed rows: a soft-deleted blob still occupies storage.
 SELECT
     COALESCE(SUM(size), 0)::bigint AS tenant_bytes,
-    COALESCE(SUM(size) FILTER (WHERE user_id = @user_id::bigint), 0)::bigint AS user_bytes
+    COALESCE(SUM(size) FILTER (WHERE user_id = @user_id::uuid), 0)::bigint AS user_bytes
 FROM files
-WHERE tenant_id = @tenant_id::bigint;
+WHERE tenant_id = @tenant_id::uuid;
 
 -- name: ListFileStoragePaths :many
 -- The orphan sweep checks candidate storage keys against the owning tenant's
 -- rows; a key with no row is an orphan.
 SELECT storage_path FROM files
-WHERE tenant_id = @tenant_id::bigint
+WHERE tenant_id = @tenant_id::uuid
   AND storage_path = ANY(@paths::text[]);

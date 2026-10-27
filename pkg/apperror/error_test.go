@@ -15,12 +15,12 @@ func TestConstructors(t *testing.T) {
 		wantStatus int
 		wantCode   string
 	}{
-		{"bad request", NewBadRequest, "bad", 400, "bad_request"},
-		{"unauthorized", NewUnauthorized, "unauth", 401, "unauthorized"},
-		{"forbidden", NewForbidden, "forbidden", 403, "forbidden"},
-		{"not found", NewNotFound, "missing", 404, "not_found"},
-		{"conflict", NewConflict, "dup", 409, "conflict"},
-		{"internal", NewInternal, "oops", 500, "internal_error"},
+		{"bad request", NewBadRequest, "bad", 400, "request.invalid"},
+		{"auth.unauthenticated", NewUnauthorized, "unauth", 401, "auth.unauthenticated"},
+		{"permission.denied", NewForbidden, "permission.denied", 403, "permission.denied"},
+		{"not found", NewNotFound, "missing", 404, "resource.not_found"},
+		{"resource.conflict", NewConflict, "dup", 409, "resource.conflict"},
+		{"internal", NewInternal, "oops", 500, "system.internal"},
 	}
 
 	for _, tt := range tests {
@@ -39,6 +39,29 @@ func TestConstructors(t *testing.T) {
 	}
 }
 
+func TestNewForStatusUsesNamespacedCodes(t *testing.T) {
+	cases := map[int]string{
+		400: "request.invalid",
+		401: "auth.unauthenticated",
+		403: "permission.denied",
+		404: "resource.not_found",
+		409: "resource.conflict",
+		412: "resource.precondition_failed",
+		413: "request.payload_too_large",
+		415: "request.unsupported_media_type",
+		422: "request.validation_failed",
+		429: "rate_limit.exceeded",
+		500: "system.internal",
+		503: "system.unavailable",
+		504: "system.timeout",
+	}
+	for status, want := range cases {
+		if got := NewForStatus(status, "detail").Code; got != want {
+			t.Errorf("NewForStatus(%d).Code = %q, want %q", status, got, want)
+		}
+	}
+}
+
 func TestNewValidation(t *testing.T) {
 	fields := []FieldError{{Path: "email", Code: "invalid_email", Message: "email must be a valid email"}}
 	err := NewValidation("validation failed", fields)
@@ -46,7 +69,7 @@ func TestNewValidation(t *testing.T) {
 	if err.Status != 422 {
 		t.Errorf("Status = %d, want 422", err.Status)
 	}
-	if err.Code != "validation_failed" {
+	if err.Code != "request.validation_failed" {
 		t.Errorf("Code = %q, want validation_failed", err.Code)
 	}
 	if len(err.Errors) != 1 || err.Errors[0].Path != "email" {
@@ -58,6 +81,20 @@ func TestAppError_Error(t *testing.T) {
 	err := NewBadRequest("test message")
 	if err.Error() != "test message" {
 		t.Errorf("Error() = %q, want %q", err.Error(), "test message")
+	}
+}
+
+func TestInternalKeepsCauseOutOfPublicDetail(t *testing.T) {
+	cause := errors.New("database password leaked in driver error")
+	err := Internal(cause, "Internal Server Error")
+	if !errors.Is(err, cause) {
+		t.Fatal("Internal must unwrap to its cause")
+	}
+	if err.Detail != "Internal Server Error" {
+		t.Fatalf("Detail = %q, want the public text only", err.Detail)
+	}
+	if err.Status != 500 || err.Code != string(CodeSystemInternal) {
+		t.Fatalf("status/code = %d/%q", err.Status, err.Code)
 	}
 }
 

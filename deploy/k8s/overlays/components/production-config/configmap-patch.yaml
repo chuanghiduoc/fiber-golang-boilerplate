@@ -22,3 +22,8 @@ data:
 
   # Separate bucket and credentials (credentials stay in the Secret).
   STORAGE_S3_BUCKET: "REPLACE_WITH_PRODUCTION_S3_BUCKET"
+
+  # Bootstrap admin identity for the one-shot seed Job. The password is in
+  # fiber-boilerplate-seed-secrets (ADMIN_PASSWORD).
+  ADMIN_EMAIL: "admin@example.com"
+  ADMIN_NAME: "Admin"

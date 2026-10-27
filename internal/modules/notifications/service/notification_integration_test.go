@@ -9,39 +9,56 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
 	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
-func integrationTenant(t *testing.T, pool *pgxpool.Pool, slug string) int64 {
+func integrationTenant(t *testing.T, pool *pgxpool.Pool, slug string) uuid.UUID {
 	t.Helper()
-	return testutil.CreateTenant(t, context.Background(), pool, slug)
+	var id uuid.UUID
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`INSERT INTO tenants (slug, name) VALUES ($1, $1) RETURNING id`, slug).Scan(&id))
+	_, err := pool.Exec(context.Background(), `INSERT INTO tenant_settings (tenant_id) VALUES ($1)`, id)
+	require.NoError(t, err)
+	return id
 }
 
-func integrationUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, address string) int64 {
+func integrationUser(t *testing.T, pool *pgxpool.Pool, tenantID uuid.UUID, address string) uuid.UUID {
 	t.Helper()
-	return testutil.CreateMember(t, context.Background(), pool, tenantID, address, testutil.MemberOptions{}).UserID
+	ctx := context.Background()
+	var id uuid.UUID
+	require.NoError(t, pool.QueryRow(ctx,
+		`INSERT INTO users (email, name, email_verified_at) VALUES ($1, $1, NOW()) RETURNING id`,
+		address).Scan(&id))
+	_, err := pool.Exec(ctx, `INSERT INTO memberships (tenant_id, user_id) VALUES ($1, $2)`, tenantID, id)
+	require.NoError(t, err)
+	return id
 }
 
-func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients identitycontracts.NotificationRecipientLookup) notificationservice.NotificationService {
+func newIntegrationService(t *testing.T, fx *pgtest.Fixture, recipients identitycontracts.NotificationRecipientLookup) notificationservice.NotificationService {
 	t.Helper()
-	sender := jobs.NewQueuedSender(jobs.NewQueue(testutil.Scoped(pool)))
+	codec, err := jobs.NewPayloadCodec("notifications-integration-encryption-key")
+	if err != nil {
+		t.Fatalf("payload codec: %v", err)
+	}
+	sender := jobs.NewQueuedSender(jobs.NewQueue(fx.Scoped()), codec)
 	return notificationservice.NewNotificationService(
-		repository.NewNotificationRepository(testutil.Scoped(pool)),
+		repository.NewNotificationRepository(fx.Scoped()),
 		recipients,
 		sender,
-		repository.NewTransactor(testutil.NewTxManager(pool), sender),
+		repository.NewTransactor(fx.Tx(), sender),
 	)
 }
 
@@ -52,9 +69,9 @@ func (failingSender) Send(context.Context, email.Message) error {
 	return errors.New("queue unavailable")
 }
 
-type staticRecipients map[int64]identitycontracts.NotificationRecipient
+type staticRecipients map[uuid.UUID]identitycontracts.NotificationRecipient
 
-func (s staticRecipients) NotificationRecipient(_ context.Context, userID int64) (identitycontracts.NotificationRecipient, error) {
+func (s staticRecipients) NotificationRecipient(_ context.Context, userID uuid.UUID) (identitycontracts.NotificationRecipient, error) {
 	recipient, ok := s[userID]
 	if !ok {
 		return identitycontracts.NotificationRecipient{}, apperror.ErrNotFound
@@ -63,11 +80,10 @@ func (s staticRecipients) NotificationRecipient(_ context.Context, userID int64)
 }
 
 func TestCreateIntegrationPersistsRowAndEmailJob(t *testing.T) {
-	setupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	_, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	pool, cleanup, err := testutil.SetupTestDB(setupCtx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := pgtest.New(t)
+	pool := fx.Bypass
 
 	tenantTwo := integrationTenant(t, pool, "notifications-service-two")
 	userOne := integrationUser(t, pool, tenant.DefaultID, "notifications-service-one@example.com")
@@ -76,7 +92,7 @@ func TestCreateIntegrationPersistsRowAndEmailJob(t *testing.T) {
 		userOne: {UserID: userOne, Email: "notifications-service-one@example.com", Name: "One"},
 		userTwo: {UserID: userTwo, Email: "notifications-service-two@example.com", Name: "Two"},
 	}
-	svc := newIntegrationService(t, pool, recipients)
+	svc := newIntegrationService(t, fx, recipients)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
 	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -90,7 +106,7 @@ func TestCreateIntegrationPersistsRowAndEmailJob(t *testing.T) {
 	require.NotNil(t, result.Notification)
 	assert.True(t, result.EmailQueued)
 
-	var storedTenant, storedUser int64
+	var storedTenant, storedUser uuid.UUID
 	var storedTitle, storedType string
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT tenant_id, user_id, type, title FROM notifications WHERE id = $1`, result.Notification.ID,
@@ -100,15 +116,19 @@ func TestCreateIntegrationPersistsRowAndEmailJob(t *testing.T) {
 	assert.Equal(t, "security.alert", storedType)
 	assert.Equal(t, "Sign-in from a new device", storedTitle)
 
-	var jobTenant int64
+	var jobTenant uuid.UUID
 	var payload []byte
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT tenant_id, payload FROM jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1`, jobs.EmailJobKind,
+		`SELECT tenant_id, payload FROM jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1`, jobs.EncryptedEmailJobKind,
 	).Scan(&jobTenant, &payload))
 	assert.Equal(t, tenant.DefaultID, jobTenant, "the email job must inherit the notification tenant")
 
 	var msg email.Message
-	require.NoError(t, json.Unmarshal(payload, &msg))
+	codec, err := jobs.NewPayloadCodec("notifications-integration-encryption-key")
+	require.NoError(t, err)
+	plaintext, err := codec.Open(payload)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(plaintext, &msg))
 	assert.Equal(t, []string{"notifications-service-one@example.com"}, msg.To)
 	assert.Equal(t, "Sign-in from a new device", msg.Subject)
 	assert.Contains(t, msg.Body, "A new device signed in")
@@ -140,18 +160,17 @@ func TestCreateIntegrationPersistsRowAndEmailJob(t *testing.T) {
 }
 
 func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
-	setupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	_, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	pool, cleanup, err := testutil.SetupTestDB(setupCtx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := pgtest.New(t)
+	pool := fx.Bypass
 
 	userID := integrationUser(t, pool, tenant.DefaultID, "notifications-prefs@example.com")
 	recipients := staticRecipients{userID: {UserID: userID, Email: "notifications-prefs@example.com"}}
-	svc := newIntegrationService(t, pool, recipients)
+	svc := newIntegrationService(t, fx, recipients)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
-	_, err = svc.SetPreference(ctx, userID, notificationservice.PreferenceUpdate{
+	_, err := svc.SetPreference(ctx, userID, notificationservice.PreferenceUpdate{
 		Type: "marketing.promo", Channel: notificationservice.ChannelEmail, Enabled: new(false),
 	})
 	require.NoError(t, err)
@@ -213,25 +232,24 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 }
 
 func TestCreateIntegrationRollsBackNotificationWhenQueueFails(t *testing.T) {
-	setupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	_, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	pool, cleanup, err := testutil.SetupTestDB(setupCtx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := pgtest.New(t)
+	pool := fx.Bypass
 
 	userID := integrationUser(t, pool, tenant.DefaultID, "notifications-queue-fail@example.com")
 	recipients := staticRecipients{userID: {UserID: userID, Email: "notifications-queue-fail@example.com"}}
 	// The sender stands in for a full job queue: it fails while the row's
 	// transaction is open, like an INSERT into jobs would.
 	svc := notificationservice.NewNotificationService(
-		repository.NewNotificationRepository(testutil.Scoped(pool)),
+		repository.NewNotificationRepository(fx.Scoped()),
 		recipients,
 		failingSender{},
-		repository.NewTransactor(testutil.NewTxManager(pool), failingSender{}),
+		repository.NewTransactor(fx.Tx(), failingSender{}),
 	)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
-	_, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
+	_, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: userID, Type: "system.info", Title: "Atomic", Body: "Body",
 	})
 	require.Error(t, err)

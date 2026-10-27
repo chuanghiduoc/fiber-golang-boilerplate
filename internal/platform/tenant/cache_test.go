@@ -68,13 +68,13 @@ func newCachedForTest(next Resolver, maxEntries int) (*CachedResolver, *fakeCloc
 }
 
 func TestCachedResolver_CachesHitsUntilTTL(t *testing.T) {
-	next := &mapResolver{tenants: map[string]Tenant{"acme": {ID: 7, Slug: "acme"}}}
+	next := &mapResolver{tenants: map[string]Tenant{"acme": {ID: testID(7), Slug: "acme"}}}
 	r, clock := newCachedForTest(next, 0)
 	ctx := context.Background()
 
 	for range 3 {
 		got, err := r.Resolve(ctx, "acme")
-		if err != nil || got.ID != 7 {
+		if err != nil || got.ID != testID(7) {
 			t.Fatalf("Resolve() = %+v, %v", got, err)
 		}
 	}
@@ -108,16 +108,16 @@ func TestCachedResolver_NegativeCacheIsShort(t *testing.T) {
 		t.Fatalf("negative result must be cached, calls = %d", n)
 	}
 
-	next.set("new", &Tenant{ID: 9, Slug: "new"})
+	next.set("new", &Tenant{ID: testID(9), Slug: "new"})
 	clock.Advance(6 * time.Second)
 	got, err := r.Resolve(ctx, "new")
-	if err != nil || got.ID != 9 {
+	if err != nil || got.ID != testID(9) {
 		t.Fatalf("after negative TTL the new tenant must resolve, got %+v, %v", got, err)
 	}
 }
 
 func TestCachedResolver_DoesNotCacheTransientErrors(t *testing.T) {
-	next := &mapResolver{tenants: map[string]Tenant{"acme": {ID: 7, Slug: "acme"}}, err: errors.New("db down")}
+	next := &mapResolver{tenants: map[string]Tenant{"acme": {ID: testID(7), Slug: "acme"}}, err: errors.New("db down")}
 	r, _ := newCachedForTest(next, 0)
 	ctx := context.Background()
 
@@ -128,7 +128,7 @@ func TestCachedResolver_DoesNotCacheTransientErrors(t *testing.T) {
 	next.err = nil
 	next.mu.Unlock()
 	got, err := r.Resolve(ctx, "acme")
-	if err != nil || got.ID != 7 {
+	if err != nil || got.ID != testID(7) {
 		t.Fatalf("transient error must not be cached, got %+v, %v", got, err)
 	}
 	if n := next.calls.Load(); n != 2 {
@@ -156,7 +156,7 @@ func TestCachedResolver_ConcurrentUse(t *testing.T) {
 	tenants := make(map[string]Tenant, 8)
 	for i := range 8 {
 		slug := fmt.Sprintf("t-%d", i)
-		tenants[slug] = Tenant{ID: int64(i + 1), Slug: slug}
+		tenants[slug] = Tenant{ID: testID(i + 1), Slug: slug}
 	}
 	next := &mapResolver{tenants: tenants}
 	r := NewCachedResolver(next, time.Minute, time.Second, 4)

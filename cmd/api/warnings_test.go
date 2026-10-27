@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
@@ -34,7 +35,7 @@ func TestWarnRiskySettingsScanDisabled(t *testing.T) {
 			name: "production with clamav",
 			cfg: &config.Config{
 				App:   config.AppConfig{Env: "production", Role: config.RoleAPI, BodyLimit: 1 << 24},
-				Files: config.FilesConfig{ScanDriver: "clamav", ClamAVAddr: "clamd:3310", ClamAVTimeoutSecs: 5},
+				Files: config.FilesConfig{ScanDriver: "clamav", ClamAVAddr: "clamd:3310", ClamAVTimeout: 5 * time.Second},
 			},
 		},
 		{

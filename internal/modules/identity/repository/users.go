@@ -3,8 +3,10 @@ package repository
 import (
 	"context"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/google/uuid"
 )
 
 // Unique constraints/indexes the user repository maps to service sentinels.
@@ -31,18 +33,18 @@ func toUser(row identitysqlc.User, hasPassword bool) *identityservice.User {
 		ID:                   row.ID,
 		Email:                row.Email,
 		Name:                 row.Name,
-		EmailVerifiedAt:      timePtr(row.EmailVerifiedAt),
+		EmailVerifiedAt:      database.TimePtr(row.EmailVerifiedAt),
 		Status:               identityservice.UserStatus(row.Status),
 		TokenVersion:         row.TokenVersion,
-		CredentialsChangedAt: timePtr(row.CredentialsChangedAt),
+		CredentialsChangedAt: database.TimePtr(row.CredentialsChangedAt),
 		HasPassword:          hasPassword,
 		CreatedAt:            row.CreatedAt.Time,
 		UpdatedAt:            row.UpdatedAt.Time,
-		DeletedAt:            timePtr(row.DeletedAt),
+		DeletedAt:            database.TimePtr(row.DeletedAt),
 	}
 }
 
-func (r *UserRepository) GetByID(ctx context.Context, id int64) (*identityservice.User, error) {
+func (r *UserRepository) GetByID(ctx context.Context, id uuid.UUID) (*identityservice.User, error) {
 	row, err := r.q.GetUserByID(ctx, id)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -81,14 +83,14 @@ func (r *UserRepository) Create(ctx context.Context, user identityservice.NewUse
 	return toUser(row, false), nil
 }
 
-func (r *UserRepository) CreatePassword(ctx context.Context, userID int64, hash string) error {
+func (r *UserRepository) CreatePassword(ctx context.Context, userID uuid.UUID, hash string) error {
 	if err := r.q.CreateUserPassword(ctx, identitysqlc.CreateUserPasswordParams{UserID: userID, PasswordHash: hash}); err != nil {
 		return wrapErr(err)
 	}
 	return nil
 }
 
-func (r *UserRepository) PasswordHash(ctx context.Context, userID int64) (string, error) {
+func (r *UserRepository) PasswordHash(ctx context.Context, userID uuid.UUID) (string, error) {
 	hash, err := r.q.GetUserPasswordHash(ctx, userID)
 	if err != nil {
 		return "", wrapErr(err)
@@ -96,7 +98,20 @@ func (r *UserRepository) PasswordHash(ctx context.Context, userID int64) (string
 	return hash, nil
 }
 
-func (r *UserRepository) ReplacePassword(ctx context.Context, userID int64, hash string) (*identityservice.User, error) {
+// RehashPassword replaces the stored hash without a credential change, so a
+// sign-in that upgrades an old hash does not end the user's sessions. The
+// update is conditional on the hash that verified: a concurrent password
+// change wins and the stale upgrade is dropped instead of overwriting it.
+func (r *UserRepository) RehashPassword(ctx context.Context, userID uuid.UUID, currentHash, newHash string) error {
+	if _, err := r.q.RehashUserPassword(ctx, identitysqlc.RehashUserPasswordParams{
+		UserID: userID, CurrentHash: currentHash, NewHash: newHash,
+	}); err != nil {
+		return wrapErr(err)
+	}
+	return nil
+}
+
+func (r *UserRepository) ReplacePassword(ctx context.Context, userID uuid.UUID, hash string) (*identityservice.User, error) {
 	if err := r.q.UpsertUserPassword(ctx, identitysqlc.UpsertUserPasswordParams{UserID: userID, PasswordHash: hash}); err != nil {
 		return nil, wrapErr(err)
 	}
@@ -143,7 +158,7 @@ func (r *UserRepository) UpdateProfile(ctx context.Context, update identityservi
 	return r.withPasswordFlag(ctx, row)
 }
 
-func (r *UserRepository) VerifyEmail(ctx context.Context, id int64, email string) (*identityservice.User, error) {
+func (r *UserRepository) VerifyEmail(ctx context.Context, id uuid.UUID, email string) (*identityservice.User, error) {
 	row, err := r.q.VerifyUserEmail(ctx, identitysqlc.VerifyUserEmailParams{ID: id, Email: email})
 	if err != nil {
 		return nil, wrapErr(err)
@@ -151,7 +166,7 @@ func (r *UserRepository) VerifyEmail(ctx context.Context, id int64, email string
 	return r.withPasswordFlag(ctx, row)
 }
 
-func (r *UserRepository) RevokeTokens(ctx context.Context, id int64) (*identityservice.User, error) {
+func (r *UserRepository) RevokeTokens(ctx context.Context, id uuid.UUID) (*identityservice.User, error) {
 	row, err := r.q.RevokeUserTokens(ctx, id)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -159,7 +174,7 @@ func (r *UserRepository) RevokeTokens(ctx context.Context, id int64) (*identitys
 	return r.withPasswordFlag(ctx, row)
 }
 
-func (r *UserRepository) MarkDeleted(ctx context.Context, id int64) (*identityservice.User, error) {
+func (r *UserRepository) MarkDeleted(ctx context.Context, id uuid.UUID) (*identityservice.User, error) {
 	row, err := r.q.MarkUserDeleted(ctx, id)
 	if err != nil {
 		return nil, wrapErr(err)

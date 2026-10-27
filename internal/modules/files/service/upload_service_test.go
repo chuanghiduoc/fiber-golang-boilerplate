@@ -12,7 +12,7 @@ import (
 )
 
 func newTestUploadService(repo *mockFileRepo, store *mockStorage) UploadService {
-	return NewUploadService(repo, newFakeTx(repo), store, UploadOptions{})
+	return NewUploadService(repo, newFakeTx(repo), store, testAuthorizer(), UploadOptions{})
 }
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ func TestUpload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		resp, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("image-data"), 10, "image/jpeg")
+		resp, err := svc.Upload(systemCtx(), testID(1), "photo.jpg", strings.NewReader("image-data"), 10, "image/jpeg")
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -38,8 +38,9 @@ func TestUpload(t *testing.T) {
 		if resp.Size != 10 {
 			t.Errorf("expected size 10, got %d", resp.Size)
 		}
-		if !strings.HasPrefix(resp.StoragePath, "1/1/") || !strings.HasSuffix(resp.StoragePath, ".jpg") {
-			t.Errorf("storage path = %q, want 1/1/<uuid>.jpg", resp.StoragePath)
+		wantPrefix := testID(1).String() + "/" + testID(1).String() + "/"
+		if !strings.HasPrefix(resp.StoragePath, wantPrefix) || !strings.HasSuffix(resp.StoragePath, ".jpg") {
+			t.Errorf("storage path = %q, want %s<uuid>.jpg", resp.StoragePath, wantPrefix)
 		}
 		// Verify file was stored
 		if len(store.files) != 1 {
@@ -53,7 +54,7 @@ func TestUpload(t *testing.T) {
 		store.putErr = fmt.Errorf("disk full")
 		svc := newTestUploadService(repo, store)
 
-		_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
+		_, err := svc.Upload(systemCtx(), testID(1), "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 		if err == nil {
 			t.Fatal("expected error for storage failure")
 		}
@@ -70,9 +71,9 @@ func TestUpload(t *testing.T) {
 		store := newMockStorage()
 		// Use a special repo that always fails on Create
 		failRepo := &failingFileRepo{mockFileRepo: newMockFileRepo(), createErr: fmt.Errorf("db error")}
-		svc := NewUploadService(failRepo, newFakeTx(failRepo), store, UploadOptions{})
+		svc := NewUploadService(failRepo, newFakeTx(failRepo), store, testAuthorizer(), UploadOptions{})
 
-		_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
+		_, err := svc.Upload(systemCtx(), testID(1), "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 		requireStatus(t, err, 500)
 		// Storage should be cleaned up
 		if len(store.files) != 0 {
@@ -83,9 +84,9 @@ func TestUpload(t *testing.T) {
 	t.Run("duplicate storage path is a conflict", func(t *testing.T) {
 		store := newMockStorage()
 		failRepo := &failingFileRepo{mockFileRepo: newMockFileRepo(), createErr: ErrStoragePathTaken}
-		svc := NewUploadService(failRepo, newFakeTx(failRepo), store, UploadOptions{})
+		svc := NewUploadService(failRepo, newFakeTx(failRepo), store, testAuthorizer(), UploadOptions{})
 
-		_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
+		_, err := svc.Upload(systemCtx(), testID(1), "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 		requireStatus(t, err, 409)
 		if len(store.files) != 0 {
 			t.Error("storage should be cleaned up after a conflict")
@@ -116,12 +117,12 @@ func TestGetFileInfo(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &File{
-			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
+		repo.files[testID(1)] = &File{
+			ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		resp, err := svc.GetFileInfo(systemCtx(), 1, 10)
+		resp, err := svc.GetFileInfo(systemCtx(), testID(1), testID(10))
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -135,7 +136,7 @@ func TestGetFileInfo(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		_, err := svc.GetFileInfo(systemCtx(), 999, 10)
+		_, err := svc.GetFileInfo(systemCtx(), testID(999), testID(10))
 		if err == nil {
 			t.Fatal("expected not found error")
 		}
@@ -143,8 +144,8 @@ func TestGetFileInfo(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Status != 404 {
-			t.Errorf("expected 404, got %d", appErr.Status)
+		if resolvedStatus(appErr) != 404 {
+			t.Errorf("expected 404, got %d", resolvedStatus(appErr))
 		}
 	})
 
@@ -153,12 +154,12 @@ func TestGetFileInfo(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &File{
-			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
+		repo.files[testID(1)] = &File{
+			ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		_, err := svc.GetFileInfo(systemCtx(), 1, 99) // wrong user
+		_, err := svc.GetFileInfo(systemCtx(), testID(1), testID(99)) // wrong user
 		if err == nil {
 			t.Fatal("expected not-found error")
 		}
@@ -166,8 +167,8 @@ func TestGetFileInfo(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Status != 404 {
-			t.Errorf("expected 404, got %d", appErr.Status)
+		if resolvedStatus(appErr) != 404 {
+			t.Errorf("expected 404, got %d", resolvedStatus(appErr))
 		}
 	})
 }
@@ -182,17 +183,17 @@ func TestUploadDelete(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &File{
-			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
+		repo.files[testID(1)] = &File{
+			ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		err := svc.Delete(systemCtx(), 1, 10)
+		err := svc.Delete(systemCtx(), testID(1), testID(10))
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
 		// Soft delete: file stays in repo but has DeletedAt set
-		f := repo.files[1]
+		f := repo.files[testID(1)]
 		if f.DeletedAt == nil {
 			t.Error("expected DeletedAt to be set (soft delete)")
 		}
@@ -203,7 +204,7 @@ func TestUploadDelete(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		err := svc.Delete(systemCtx(), 999, 10)
+		err := svc.Delete(systemCtx(), testID(999), testID(10))
 		if err == nil {
 			t.Fatal("expected not found error")
 		}
@@ -217,12 +218,12 @@ func TestUploadDelete(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &File{
-			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
+		repo.files[testID(1)] = &File{
+			ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		err := svc.Delete(systemCtx(), 1, 99) // wrong user
+		err := svc.Delete(systemCtx(), testID(1), testID(99)) // wrong user
 		if err == nil {
 			t.Fatal("expected not-found error")
 		}
@@ -230,8 +231,8 @@ func TestUploadDelete(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Status != 404 {
-			t.Errorf("expected 404, got %d", appErr.Status)
+		if resolvedStatus(appErr) != 404 {
+			t.Errorf("expected 404, got %d", resolvedStatus(appErr))
 		}
 	})
 }
@@ -246,13 +247,13 @@ func TestUploadDownload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &File{
-			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
+		repo.files[testID(1)] = &File{
+			ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 		store.files["10/abc.pdf"] = []byte("pdf-content")
 
-		file, reader, err := svc.Download(systemCtx(), 1, 10)
+		file, reader, err := svc.Download(systemCtx(), testID(1), testID(10))
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -270,7 +271,7 @@ func TestUploadDownload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		_, _, err := svc.Download(systemCtx(), 999, 10)
+		_, _, err := svc.Download(systemCtx(), testID(999), testID(10))
 		if err == nil {
 			t.Fatal("expected not found error")
 		}
@@ -278,8 +279,8 @@ func TestUploadDownload(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Status != 404 {
-			t.Errorf("expected 404, got %d", appErr.Status)
+		if resolvedStatus(appErr) != 404 {
+			t.Errorf("expected 404, got %d", resolvedStatus(appErr))
 		}
 	})
 
@@ -288,12 +289,12 @@ func TestUploadDownload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &File{
-			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
+		repo.files[testID(1)] = &File{
+			ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		_, _, err := svc.Download(systemCtx(), 1, 99)
+		_, _, err := svc.Download(systemCtx(), testID(1), testID(99))
 		if err == nil {
 			t.Fatal("expected not-found error")
 		}
@@ -301,8 +302,8 @@ func TestUploadDownload(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Status != 404 {
-			t.Errorf("expected 404, got %d", appErr.Status)
+		if resolvedStatus(appErr) != 404 {
+			t.Errorf("expected 404, got %d", resolvedStatus(appErr))
 		}
 	})
 
@@ -312,14 +313,14 @@ func TestUploadDownload(t *testing.T) {
 		store.getErr = fmt.Errorf("storage unavailable")
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &File{
-			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
+		repo.files[testID(1)] = &File{
+			ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		_, _, err := svc.Download(systemCtx(), 1, 10)
+		_, _, err := svc.Download(systemCtx(), testID(1), testID(10))
 		var appErr *apperror.AppError
-		if !errors.As(err, &appErr) || appErr.Status != 500 {
+		if !errors.As(err, &appErr) || resolvedStatus(appErr) != 500 {
 			t.Fatalf("expected 500 storage error, got %v", err)
 		}
 	})
@@ -330,14 +331,14 @@ func TestUploadDownload(t *testing.T) {
 		store.getErr = fmt.Errorf("%w: 10/abc.pdf", storage.ErrNotFound)
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &File{
-			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
+		repo.files[testID(1)] = &File{
+			ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		_, _, err := svc.Download(systemCtx(), 1, 10)
+		_, _, err := svc.Download(systemCtx(), testID(1), testID(10))
 		var appErr *apperror.AppError
-		if !errors.As(err, &appErr) || appErr.Status != 404 {
+		if !errors.As(err, &appErr) || resolvedStatus(appErr) != 404 {
 			t.Fatalf("expected 404 for a missing blob, got %v", err)
 		}
 	})
@@ -353,12 +354,12 @@ func TestUploadList(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &File{ID: 1, TenantID: 1, UserID: 10, OriginalName: "a.txt", StoragePath: "10/a.txt", MimeType: "text/plain", Size: 5}
-		repo.files[2] = &File{ID: 2, TenantID: 1, UserID: 10, OriginalName: "b.txt", StoragePath: "10/b.txt", MimeType: "text/plain", Size: 8}
-		repo.files[3] = &File{ID: 3, TenantID: 1, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
+		repo.files[testID(1)] = &File{ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "a.txt", StoragePath: "10/a.txt", MimeType: "text/plain", Size: 5}
+		repo.files[testID(2)] = &File{ID: testID(2), TenantID: testID(1), UserID: testID(10), OriginalName: "b.txt", StoragePath: "10/b.txt", MimeType: "text/plain", Size: 8}
+		repo.files[testID(3)] = &File{ID: testID(3), TenantID: testID(1), UserID: testID(20), OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
 		repo.nextID = 4
 
-		files, hasMore, err := svc.List(systemCtx(), 10, 10, "", false)
+		files, hasMore, err := svc.List(systemCtx(), testID(10), 10, "", false)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}

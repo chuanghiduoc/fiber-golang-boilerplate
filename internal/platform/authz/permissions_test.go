@@ -18,9 +18,9 @@ var sharedAdminPermissions = []Permission{
 }
 
 func TestPermissionsForRole_OwnerAndAdminHaveAllTenantPermissions(t *testing.T) {
-	all := AllTenantPermissions()
+	all := testCatalog.AllTenantPermissions()
 	for _, role := range []string{RoleAdmin, RoleOwner} {
-		got := PermissionsForRole(role)
+		got := testCatalog.PermissionsForRole(role)
 		if len(got) != len(all) {
 			t.Fatalf("%s has %d permissions, want %d", role, len(got), len(all))
 		}
@@ -33,20 +33,20 @@ func TestPermissionsForRole_OwnerAndAdminHaveAllTenantPermissions(t *testing.T) 
 }
 
 func TestPermissionsForRole_PlatformAdminHasOnlyPlatformPermissions(t *testing.T) {
-	got := PermissionsForRole(RolePlatformAdmin)
-	all := AllPlatformPermissions()
+	got := testCatalog.PermissionsForRole(RolePlatformAdmin)
+	all := testCatalog.AllPlatformPermissions()
 	if len(got) != len(all) {
 		t.Fatalf("platform_admin has %d permissions, want %d", len(got), len(all))
 	}
 	for _, permission := range all {
-		if !IsPlatformPermission(permission) {
+		if !testCatalog.IsPlatformPermission(permission) {
 			t.Fatalf("%q is not platform-scoped", permission)
 		}
 		if _, ok := got[permission]; !ok {
 			t.Errorf("platform_admin missing permission %q", permission)
 		}
 	}
-	for _, permission := range AllTenantPermissions() {
+	for _, permission := range testCatalog.AllTenantPermissions() {
 		if _, ok := got[permission]; ok {
 			t.Errorf("platform_admin unexpectedly has tenant permission %q", permission)
 		}
@@ -54,12 +54,12 @@ func TestPermissionsForRole_PlatformAdminHasOnlyPlatformPermissions(t *testing.T
 }
 
 func TestSharedCatalogIsAdminOnly(t *testing.T) {
-	user := PermissionsForRole(RoleMember)
+	user := testCatalog.PermissionsForRole(RoleMember)
 	for _, permission := range sharedAdminPermissions {
-		if !IsKnownPermission(permission) {
+		if !testCatalog.IsKnownPermission(permission) {
 			t.Errorf("shared permission %q is not registered", permission)
 		}
-		if owner, _ := OwnerOf(permission); owner != platformOwner {
+		if owner, _ := testCatalog.OwnerOf(permission); owner != platformOwner {
 			t.Errorf("shared permission %q owner = %q, want %q", permission, owner, platformOwner)
 		}
 		if _, ok := user[permission]; ok {
@@ -69,7 +69,7 @@ func TestSharedCatalogIsAdminOnly(t *testing.T) {
 }
 
 func TestPermissionsForRole_User(t *testing.T) {
-	got := PermissionsForRole(RoleMember)
+	got := testCatalog.PermissionsForRole(RoleMember)
 	for _, permission := range []Permission{testPermissionRead, testPermissionWrite} {
 		if _, ok := got[permission]; !ok {
 			t.Errorf("user missing registered permission %q", permission)
@@ -79,21 +79,21 @@ func TestPermissionsForRole_User(t *testing.T) {
 
 func TestPermissionsForRole_UnknownRoleIsEmpty(t *testing.T) {
 	for _, role := range []string{"", "guest", "superadmin"} {
-		got := PermissionsForRole(role)
+		got := testCatalog.PermissionsForRole(role)
 		if got == nil {
-			t.Fatalf("PermissionsForRole(%q) = nil, want empty map", role)
+			t.Fatalf("testCatalog.PermissionsForRole(%q) = nil, want empty map", role)
 		}
 		if len(got) != 0 {
-			t.Errorf("PermissionsForRole(%q) = %v, want empty", role, got)
+			t.Errorf("testCatalog.PermissionsForRole(%q) = %v, want empty", role, got)
 		}
 	}
 }
 
 func TestPermissionsForRole_ReturnsCopy(t *testing.T) {
-	got := PermissionsForRole(RoleMember)
+	got := testCatalog.PermissionsForRole(RoleMember)
 	got[PermissionAdminUsersBan] = struct{}{}
 
-	if Has(RoleMember, PermissionAdminUsersBan) {
+	if testCatalog.Has(RoleMember, PermissionAdminUsersBan) {
 		t.Error("mutating the returned map must not alter the role catalog")
 	}
 }
@@ -118,47 +118,48 @@ func TestHas(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := Has(tt.role, tt.permission); got != tt.want {
+			if got := testCatalog.Has(tt.role, tt.permission); got != tt.want {
 				t.Errorf("Has(%q, %q) = %v, want %v", tt.role, tt.permission, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestRegisterGrantsAdminImplicitlyAndUserExplicitly(t *testing.T) {
+func TestAddGrantsAdminImplicitlyAndUserExplicitly(t *testing.T) {
 	const adminOnly Permission = "registertest:admin_only"
 	const userToo Permission = "registertest:user_too"
-	if err := Register("registertest",
-		Grant{Permission: adminOnly},
-		Grant{Permission: userToo, Roles: []string{RoleMember, RoleAdmin}},
-	); err != nil {
-		t.Fatalf("Register: %v", err)
+	catalog := NewCatalog()
+	provider := Provider{Owner: "registertest", Grants: []Grant{
+		{Permission: adminOnly},
+		{Permission: userToo, Roles: []string{RoleMember, RoleAdmin}},
+	}}
+	if err := catalog.Add(provider); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
-	if !Has(RoleAdmin, adminOnly) || Has(RoleMember, adminOnly) {
+	if !catalog.Has(RoleAdmin, adminOnly) || catalog.Has(RoleMember, adminOnly) {
 		t.Errorf("%q must be admin-only", adminOnly)
 	}
-	if !Has(RoleAdmin, userToo) || !Has(RoleMember, userToo) {
+	if !catalog.Has(RoleAdmin, userToo) || !catalog.Has(RoleMember, userToo) {
 		t.Errorf("%q must be granted to user and admin", userToo)
 	}
-	if owner, ok := OwnerOf(userToo); !ok || owner != "registertest" {
+	if owner, ok := catalog.OwnerOf(userToo); !ok || owner != "registertest" {
 		t.Errorf("OwnerOf(%q) = %q, %v", userToo, owner, ok)
 	}
 
-	// The identical registration is idempotent (apps built twice in tests).
-	if err := Register("registertest",
-		Grant{Permission: adminOnly},
-		Grant{Permission: userToo, Roles: []string{RoleMember}},
-	); err != nil {
-		t.Fatalf("identical re-registration must be a no-op: %v", err)
+	// The identical addition is idempotent (apps built twice in tests).
+	if err := catalog.Add(provider); err != nil {
+		t.Fatalf("identical re-add must be a no-op: %v", err)
 	}
 }
 
-func TestRegisterRejectsConflicts(t *testing.T) {
+func TestAddRejectsConflicts(t *testing.T) {
 	const owned Permission = "conflicttest:read"
-	if err := Register("conflicttest", Grant{Permission: owned, Roles: []string{RoleMember}}); err != nil {
-		t.Fatalf("Register: %v", err)
+	valid := []Grant{{Permission: owned, Roles: []string{RoleMember}}}
+	catalog := NewCatalog()
+	if err := catalog.Add(Provider{Owner: "conflicttest", Grants: valid}); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
-	before := len(AllPermissions())
+	before := len(catalog.AllPermissions())
 
 	cases := map[string]struct {
 		owner  string
@@ -173,21 +174,21 @@ func TestRegisterRejectsConflicts(t *testing.T) {
 		"invalid id":        {"conflicttest", []Grant{{Permission: "Conflict Test"}}, "invalid permission"},
 		"single segment":    {"conflicttest", []Grant{{Permission: "conflicttest"}}, "invalid permission"},
 		"no owner":          {"", []Grant{{Permission: "conflicttest:z"}}, "owner is required"},
-		// A failed call registers nothing, even its valid leading grants.
+		// A failed call adds nothing, even its valid leading grants.
 		"atomic": {"conflicttest", []Grant{{Permission: "conflicttest:valid"}, {Permission: "BAD"}}, "invalid permission"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			err := Register(tc.owner, tc.grants...)
+			err := catalog.Add(Provider{Owner: tc.owner, Grants: tc.grants})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("Register error = %v, want containing %q", err, tc.want)
+				t.Fatalf("Add error = %v, want containing %q", err, tc.want)
 			}
 		})
 	}
-	if after := len(AllPermissions()); after != before {
-		t.Fatalf("failed registrations changed the catalog size from %d to %d", before, after)
+	if after := len(catalog.AllPermissions()); after != before {
+		t.Fatalf("failed additions changed the catalog size from %d to %d", before, after)
 	}
-	if IsKnownPermission("conflicttest:valid") {
-		t.Fatal("a failed Register call must not partially apply")
+	if catalog.IsKnownPermission("conflicttest:valid") {
+		t.Fatal("a failed Add call must not partially apply")
 	}
 }

@@ -3,10 +3,11 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -52,14 +53,14 @@ type Options struct {
 // TenantChecker reports whether a tenant is active. The composition root
 // adapts the identity tenant store, so this module never reads tenants.
 type TenantChecker interface {
-	TenantActive(ctx context.Context, tenantID int64) (bool, error)
+	TenantActive(ctx context.Context, tenantID uuid.UUID) (bool, error)
 }
 
 // TenantCheckerFunc adapts a function to TenantChecker.
-type TenantCheckerFunc func(ctx context.Context, tenantID int64) (bool, error)
+type TenantCheckerFunc func(ctx context.Context, tenantID uuid.UUID) (bool, error)
 
 // TenantActive implements TenantChecker.
-func (f TenantCheckerFunc) TenantActive(ctx context.Context, tenantID int64) (bool, error) {
+func (f TenantCheckerFunc) TenantActive(ctx context.Context, tenantID uuid.UUID) (bool, error) {
 	return f(ctx, tenantID)
 }
 
@@ -67,26 +68,26 @@ func (f TenantCheckerFunc) TenantActive(ctx context.Context, tenantID int64) (bo
 // secret rotation, delivery history/replay, inbound source CRUD, and the
 // public inbound receiver.
 type Service interface {
-	CreateEndpoint(ctx context.Context, actorID int64, in CreateEndpointInput) (*Endpoint, string, error)
-	UpdateEndpoint(ctx context.Context, actorID, id int64, in UpdateEndpointInput) (*Endpoint, error)
-	DeleteEndpoint(ctx context.Context, actorID, id int64) error
-	GetEndpoint(ctx context.Context, id int64) (*Endpoint, error)
+	CreateEndpoint(ctx context.Context, actorID uuid.UUID, in CreateEndpointInput) (*Endpoint, string, error)
+	UpdateEndpoint(ctx context.Context, actorID, id uuid.UUID, in UpdateEndpointInput) (*Endpoint, error)
+	DeleteEndpoint(ctx context.Context, actorID, id uuid.UUID) error
+	GetEndpoint(ctx context.Context, id uuid.UUID) (*Endpoint, error)
 	ListEndpoints(ctx context.Context, limit int, startingAfter string) ([]Endpoint, bool, error)
-	RotateEndpointSecret(ctx context.Context, actorID, id int64, expirePrevious bool) (*Endpoint, string, error)
+	RotateEndpointSecret(ctx context.Context, actorID, id uuid.UUID, expirePrevious bool) (*Endpoint, string, error)
 
-	ListDeliveries(ctx context.Context, endpointID int64, status string, limit int, startingAfter string) ([]Delivery, bool, error)
-	GetDelivery(ctx context.Context, id int64) (*Delivery, error)
-	ListDeliveryAttempts(ctx context.Context, id int64) ([]DeliveryAttempt, error)
-	ReplayDelivery(ctx context.Context, actorID, id int64) (*Delivery, error)
+	ListDeliveries(ctx context.Context, endpointID uuid.UUID, status string, limit int, startingAfter string) ([]Delivery, bool, error)
+	GetDelivery(ctx context.Context, id uuid.UUID) (*Delivery, error)
+	ListDeliveryAttempts(ctx context.Context, id uuid.UUID) ([]DeliveryAttempt, error)
+	ReplayDelivery(ctx context.Context, actorID, id uuid.UUID) (*Delivery, error)
 
-	CreateInboundSource(ctx context.Context, actorID int64, in CreateInboundSourceInput) (*InboundSource, string, error)
-	UpdateInboundSource(ctx context.Context, actorID, id int64, in UpdateInboundSourceInput) (*InboundSource, error)
-	DeleteInboundSource(ctx context.Context, actorID, id int64) error
-	GetInboundSource(ctx context.Context, id int64) (*InboundSource, error)
+	CreateInboundSource(ctx context.Context, actorID uuid.UUID, in CreateInboundSourceInput) (*InboundSource, string, error)
+	UpdateInboundSource(ctx context.Context, actorID, id uuid.UUID, in UpdateInboundSourceInput) (*InboundSource, error)
+	DeleteInboundSource(ctx context.Context, actorID, id uuid.UUID) error
+	GetInboundSource(ctx context.Context, id uuid.UUID) (*InboundSource, error)
 	ListInboundSources(ctx context.Context, limit int, startingAfter string) ([]InboundSource, bool, error)
-	RotateInboundSourceSecret(ctx context.Context, actorID, id int64) (*InboundSource, string, error)
-	ListInboundEvents(ctx context.Context, sourceID int64, limit int, startingAfter string) ([]InboundEvent, bool, error)
-	ReceiveInbound(ctx context.Context, sourceID int64, headers http.Header, body []byte) (*InboundReceipt, error)
+	RotateInboundSourceSecret(ctx context.Context, actorID, id uuid.UUID, expirePrevious bool) (*InboundSource, string, error)
+	ListInboundEvents(ctx context.Context, sourceID uuid.UUID, limit int, startingAfter string) ([]InboundEvent, bool, error)
+	ReceiveInbound(ctx context.Context, sourceID uuid.UUID, headers http.Header, body []byte) (*InboundReceipt, error)
 
 	PurgeRetention(ctx context.Context, retentionDays int32) (RetentionResult, error)
 }
@@ -147,7 +148,7 @@ func dummyInboundEnvelope(codec *SecretCodec) string {
 	if codec == nil {
 		return ""
 	}
-	sealed, err := codec.Seal(InboundSourceSecretBinding(1, 1), []byte(webhook.SecretPrefix+"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="))
+	sealed, err := codec.Seal(InboundSourceSecretBinding(tenant.DefaultID, tenant.DefaultID), []byte(webhook.SecretPrefix+"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="))
 	if err != nil {
 		slog.Error("webhooks: failed to prepare the dummy inbound envelope", slog.Any("error", err))
 		return ""
@@ -155,7 +156,7 @@ func dummyInboundEnvelope(codec *SecretCodec) string {
 	return sealed
 }
 
-func (s *service) recordAudit(ctx context.Context, actorID int64, action, resource string, resourceID int64, metadata map[string]any) {
+func (s *service) recordAudit(ctx context.Context, actorID uuid.UUID, action, resource string, resourceID uuid.UUID, metadata map[string]any) {
 	if s.audit == nil {
 		return
 	}
@@ -163,11 +164,11 @@ func (s *service) recordAudit(ctx context.Context, actorID int64, action, resour
 		metadata = map[string]any{}
 	}
 	event := audit.Event{
-		TenantID:   tenant.EffectiveID(ctx),
+		TenantID:   tenant.IDFromContext(ctx),
 		ActorID:    actorID,
 		Action:     action,
 		Resource:   resource,
-		ResourceID: fmt.Sprintf("%d", resourceID),
+		ResourceID: resourceID.String(),
 		Metadata:   metadata,
 		CreatedAt:  s.now(),
 	}
@@ -208,5 +209,5 @@ func buildCursor(limit int, startingAfter string) (pagination.DBCursor, int, err
 
 func isConflict(err error) bool {
 	var appErr *apperror.AppError
-	return errors.As(err, &appErr) && appErr.Status == http.StatusConflict
+	return errors.As(err, &appErr) && appErr.Code == string(apperror.CodeResourceConflict)
 }

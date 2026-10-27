@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/google/uuid"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 )
 
 // claimJobsSQL atomically requeues jobs whose worker lease expired and claims
@@ -249,47 +251,47 @@ func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, lease t
 	return result, nil
 }
 
-func (s *pgStore) Succeed(ctx context.Context, id int64, workerID string, attempts int) error {
+func (s *pgStore) Succeed(ctx context.Context, id uuid.UUID, workerID string, attempts int) error {
 	if s == nil || s.db == nil {
 		return ErrNoPool
 	}
 	ctx = database.WithRLSBypass(ctx) // The claimed job may belong to any tenant.
 	tag, err := s.db.Exec(ctx, succeedJobSQL, id, workerID, attempts)
 	if err != nil {
-		return fmt.Errorf("jobs: mark %d succeeded: %w", id, err)
+		return fmt.Errorf("jobs: mark %s succeeded: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
+		return fmt.Errorf("%w: job %s worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
 	}
 	return nil
 }
 
-func (s *pgStore) Fail(ctx context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error {
+func (s *pgStore) Fail(ctx context.Context, id uuid.UUID, workerID string, attempts int, reason string, retryAt *time.Time) error {
 	if s == nil || s.db == nil {
 		return ErrNoPool
 	}
 	ctx = database.WithRLSBypass(ctx) // The claimed job may belong to any tenant.
 	tag, err := s.db.Exec(ctx, failJobSQL, id, workerID, reason, retryAt, attempts)
 	if err != nil {
-		return fmt.Errorf("jobs: mark %d failed: %w", id, err)
+		return fmt.Errorf("jobs: mark %s failed: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
+		return fmt.Errorf("%w: job %s worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
 	}
 	return nil
 }
 
-func (s *pgStore) Release(ctx context.Context, id int64, workerID string, attempts int, reason string) error {
+func (s *pgStore) Release(ctx context.Context, id uuid.UUID, workerID string, attempts int, reason string) error {
 	if s == nil || s.db == nil {
 		return ErrNoPool
 	}
 	ctx = database.WithRLSBypass(ctx) // The claimed job may belong to any tenant.
 	tag, err := s.db.Exec(ctx, releaseJobSQL, id, workerID, reason, attempts)
 	if err != nil {
-		return fmt.Errorf("jobs: release %d: %w", id, err)
+		return fmt.Errorf("jobs: release %s: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
+		return fmt.Errorf("%w: job %s worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
 	}
 	return nil
 }
@@ -298,7 +300,7 @@ func (s *pgStore) Release(ctx context.Context, id int64, workerID string, attemp
 // job that was already reclaimed, finished, or claimed by another worker is
 // reported as ErrLeaseLost; the caller logs it but leaves the handler running.
 // The new deadline is now() + lease, the owning worker's own lease duration.
-func (s *pgStore) Heartbeat(ctx context.Context, id int64, workerID string, attempts int, lease time.Duration) error {
+func (s *pgStore) Heartbeat(ctx context.Context, id uuid.UUID, workerID string, attempts int, lease time.Duration) error {
 	if s == nil || s.db == nil {
 		return ErrNoPool
 	}
@@ -308,10 +310,10 @@ func (s *pgStore) Heartbeat(ctx context.Context, id int64, workerID string, atte
 	ctx = database.WithRLSBypass(ctx) // The claimed job may belong to any tenant.
 	tag, err := s.db.Exec(ctx, heartbeatJobSQL, id, workerID, attempts, lease.Seconds())
 	if err != nil {
-		return fmt.Errorf("jobs: heartbeat %d: %w", id, err)
+		return fmt.Errorf("jobs: heartbeat %s: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
+		return fmt.Errorf("%w: job %s worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
 	}
 	return nil
 }

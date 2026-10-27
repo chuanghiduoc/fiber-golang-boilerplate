@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
@@ -22,7 +24,7 @@ const (
 func newSecret(label string) (string, error) {
 	secret, err := webhook.NewSecret()
 	if err != nil {
-		return "", apperror.NewInternal("failed to generate " + label)
+		return "", apperror.Internal(err, "failed to generate "+label)
 	}
 	return secret, nil
 }
@@ -31,7 +33,7 @@ func newSecret(label string) (string, error) {
 func (s *service) sealSecret(label string, binding SecretBinding, secret string) (string, error) {
 	ciphertext, err := s.codec.Seal(binding, []byte(secret))
 	if err != nil {
-		return "", apperror.NewInternal("failed to protect " + label)
+		return "", apperror.Internal(err, "failed to protect "+label)
 	}
 	return ciphertext, nil
 }
@@ -53,8 +55,11 @@ func (s *service) newSealedSecret(binding SecretBinding, label string) (secret, 
 // RotateEndpointSecret makes a fresh secret active for new deliveries. The
 // delivery worker keeps dual-signing pending retries during the rotation grace
 // unless expirePrevious asks for the previous secret to stop at once.
-func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64, expirePrevious bool) (*Endpoint, string, error) {
-	tenantID := tenant.EffectiveID(ctx)
+func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id uuid.UUID, expirePrevious bool) (*Endpoint, string, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, "", apperror.Internal(err, "tenant context is required")
+	}
 	secret, ciphertext, err := s.newSealedSecret(EndpointSecretBinding(tenantID, id), endpointSecretLabel)
 	if err != nil {
 		return nil, "", err
@@ -64,7 +69,7 @@ func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64, e
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, "", apperror.NewNotFound("webhook endpoint not found")
 		}
-		return nil, "", apperror.NewInternal("failed to rotate webhook secret")
+		return nil, "", apperror.Internal(err, "failed to rotate webhook secret")
 	}
 	metadata := map[string]any{"expirePrevious": expirePrevious}
 	s.recordAudit(ctx, actorID, "webhook.endpoint.secret_rotated", "webhook_endpoint", id, metadata)
@@ -72,19 +77,24 @@ func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64, e
 }
 
 // RotateInboundSourceSecret replaces the secret the sender signs with.
-func (s *service) RotateInboundSourceSecret(ctx context.Context, actorID, id int64) (*InboundSource, string, error) {
-	tenantID := tenant.EffectiveID(ctx)
+func (s *service) RotateInboundSourceSecret(ctx context.Context, actorID, id uuid.UUID, expirePrevious bool) (*InboundSource, string, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, "", apperror.Internal(err, "tenant context is required")
+	}
 	secret, ciphertext, err := s.newSealedSecret(InboundSourceSecretBinding(tenantID, id), inboundSecretLabel)
 	if err != nil {
 		return nil, "", err
 	}
-	source, err := s.inbound.RotateInboundSourceSecret(ctx, id, ciphertext)
+	source, err := s.inbound.RotateInboundSourceSecret(ctx, id, ciphertext, expirePrevious)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, "", apperror.NewNotFound("inbound source not found")
 		}
-		return nil, "", apperror.NewInternal("failed to rotate inbound secret")
+		return nil, "", apperror.Internal(err, "failed to rotate inbound secret")
 	}
-	s.recordAudit(ctx, actorID, "webhook.inbound_source.secret_rotated", "webhook_inbound_source", id, nil)
+	s.recordAudit(ctx, actorID, "webhook.inbound_source.secret_rotated", "webhook_inbound_source", id, map[string]any{
+		"expirePrevious": expirePrevious,
+	})
 	return source, secret, nil
 }

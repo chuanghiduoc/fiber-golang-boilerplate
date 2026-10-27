@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 
+	"github.com/google/uuid"
+
 	featuresprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/privacy"
 	featuressqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/sqlc"
 )
@@ -18,7 +20,7 @@ func NewPrivacyStore(db featuressqlc.DBTX) *PrivacyStore {
 	return &PrivacyStore{q: featuressqlc.New(db)}
 }
 
-func (s *PrivacyStore) List(ctx context.Context, tenantID, userID int64) ([]featuresprivacy.Target, error) {
+func (s *PrivacyStore) List(ctx context.Context, tenantID, userID uuid.UUID) ([]featuresprivacy.Target, error) {
 	rows, err := s.q.ListFeatureFlagTargetsForPrivacy(ctx, featuressqlc.ListFeatureFlagTargetsForPrivacyParams{
 		TenantID: tenantID, UserID: userID,
 	})
@@ -35,7 +37,7 @@ func (s *PrivacyStore) List(ctx context.Context, tenantID, userID int64) ([]feat
 	return out, nil
 }
 
-func (s *PrivacyStore) DeleteAll(ctx context.Context, tenantID, userID int64) error {
+func (s *PrivacyStore) DeleteAll(ctx context.Context, tenantID, userID uuid.UUID) error {
 	_, err := s.q.DeleteFeatureFlagTargetsForPrivacy(ctx, featuressqlc.DeleteFeatureFlagTargetsForPrivacyParams{
 		TenantID: tenantID, UserID: userID,
 	})

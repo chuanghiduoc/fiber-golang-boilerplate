@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
+
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 )
 
 // Event is one stored outbound event attributed to a user.
 type Event struct {
-	ID          string
+	ID          uuid.UUID
 	Type        string
 	DataVersion int32
 	ActorType   string
@@ -25,8 +27,8 @@ type Event struct {
 
 // Delivery is one delivery of such an event.
 type Delivery struct {
-	ID             int64
-	EventID        string
+	ID             uuid.UUID
+	EventID        uuid.UUID
 	URL            string
 	Status         string
 	Attempts       int32
@@ -39,9 +41,9 @@ type Delivery struct {
 
 // Store is the module's privacy persistence port.
 type Store interface {
-	ListEvents(ctx context.Context, tenantID, userID int64) ([]Event, error)
-	ListDeliveries(ctx context.Context, tenantID, userID int64) ([]Delivery, error)
-	DeleteEvents(ctx context.Context, tenantID, userID int64) error
+	ListEvents(ctx context.Context, tenantID, userID uuid.UUID) ([]Event, error)
+	ListDeliveries(ctx context.Context, tenantID, userID uuid.UUID) ([]Delivery, error)
+	DeleteEvents(ctx context.Context, tenantID, userID uuid.UUID) error
 }
 
 // Provider implements privacy.Exporter and privacy.Eraser.
@@ -51,7 +53,7 @@ type Provider struct {
 
 func New(store Store) *Provider { return &Provider{store: store} }
 
-func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacycontracts.Section, error) {
+func (p *Provider) Export(ctx context.Context, tenantID, userID uuid.UUID) (privacycontracts.Section, error) {
 	events, err := p.store.ListEvents(ctx, tenantID, userID)
 	if err != nil {
 		return privacycontracts.Section{}, err
@@ -62,7 +64,7 @@ func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacyc
 	}
 
 	type eventExport struct {
-		ID          string          `json:"id"`
+		ID          uuid.UUID       `json:"id"`
 		Type        string          `json:"type"`
 		DataVersion int32           `json:"dataVersion"`
 		ActorType   string          `json:"actorType"`
@@ -71,8 +73,8 @@ func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacyc
 		Payload     json.RawMessage `json:"payload"`
 	}
 	type deliveryExport struct {
-		ID             int64      `json:"id"`
-		EventID        string     `json:"eventId"`
+		ID             uuid.UUID  `json:"id"`
+		EventID        uuid.UUID  `json:"eventId"`
 		URL            string     `json:"url"`
 		Status         string     `json:"status"`
 		Attempts       int32      `json:"attempts"`
@@ -110,6 +112,6 @@ func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacyc
 	return privacycontracts.Section{Name: "webhooks", Data: raw}, nil
 }
 
-func (p *Provider) Erase(ctx context.Context, tenantID, userID int64) error {
+func (p *Provider) Erase(ctx context.Context, tenantID, userID uuid.UUID) error {
 	return p.store.DeleteEvents(ctx, tenantID, userID)
 }

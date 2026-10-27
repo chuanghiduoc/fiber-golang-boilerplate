@@ -6,15 +6,20 @@ import (
 	"context"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
@@ -23,16 +28,10 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+	"github.com/google/uuid"
 )
-
-func init() {
-	if err := identitycatalog.Register(); err != nil {
-		panic(err)
-	}
-}
 
 type mailbox struct {
 	mu   sync.Mutex
@@ -44,6 +43,13 @@ func (m *mailbox) Send(_ context.Context, msg email.Message) error {
 	defer m.mu.Unlock()
 	m.msgs = append(m.msgs, msg)
 	return nil
+}
+
+// SendTx is the transactional outbox path: the fixture records the message
+// when the caller's transaction asks for it, which is exactly what a real
+// QueuedSender does (enqueue on tx).
+func (m *mailbox) SendTx(ctx context.Context, _ pgx.Tx, msg email.Message) error {
+	return m.Send(ctx, msg)
 }
 
 var linkToken = regexp.MustCompile(`token=([0-9a-f]{64})`)
@@ -69,6 +75,7 @@ func (m *mailbox) tokenFor(t *testing.T, addr string) string {
 
 type env struct {
 	pool     *pgxpool.Pool
+	fx       *pgtest.Fixture
 	stores   service.Stores
 	tx       *identityrepo.Transactor
 	users    service.UserService
@@ -76,6 +83,7 @@ type env struct {
 	roles    service.RoleService
 	sessions *service.SessionService
 	mfa      service.MFAService
+	passkeys service.PasskeyService
 	resets   service.PasswordResetService
 	verify   service.EmailVerificationService
 	mail     *mailbox
@@ -83,39 +91,54 @@ type env struct {
 
 func newEnv(t *testing.T, recorder audit.TxRecorder) *env {
 	t.Helper()
-	setupCtx := context.Background()
-	pool, cleanup, err := testutil.SetupTestDB(setupCtx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+
+	fx := testutil.NewFixture(t)
+	pool := fx.Bypass
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
 
 	if recorder == nil {
-		recorder = audit.NewPostgresRecorder(testutil.Scoped(pool))
+		recorder = audit.NewPostgresRecorder(fx.Scoped())
 	}
-	stores := identityrepo.NewStores(testutil.Scoped(pool))
-	tx := identityrepo.NewTransactor(testutil.NewTxManager(pool), recorder, nil, nil)
+	stores := identityrepo.NewStores(fx.Scoped(), testutil.BanHasher(t))
 	mail := &mailbox{}
+	tx := identityrepo.NewTransactor(fx.Tx(), recorder, mail, nil, testutil.BanHasher(t))
 	sign := func(c service.AccessClaims) (string, error) { return "access", nil }
 	sessions := service.NewSessionService(stores, tx, sign, time.Hour, 720*time.Hour, nil)
 	verify := service.NewEmailVerificationService(service.VerificationDeps{
-		Stores: stores, Tx: tx, Sender: mail, Cache: appCache, FrontendURL: "https://app.example.test",
+		Stores: stores, Tx: tx, Cache: appCache, FrontendURL: "https://app.example.test",
+	})
+	relyingParty, err := webauthn.New(&webauthn.Config{
+		RPID:          "localhost",
+		RPDisplayName: "Identity integration tests",
+		RPOrigins:     []string{"http://localhost:3000"},
+		AuthenticatorSelection: protocol.AuthenticatorSelection{
+			UserVerification: protocol.VerificationRequired,
+			ResidentKey:      protocol.ResidentKeyRequirementRequired,
+		},
+	})
+	require.NoError(t, err)
+	passkeys := service.NewPasskeyService(service.PasskeyDeps{
+		Stores: stores, Tx: tx, Cache: appCache, Sealer: testSealer{}, Sessions: sessions,
+		WebAuthn: relyingParty,
 	})
 	return &env{
 		pool:   pool,
+		fx:     fx,
 		stores: stores,
 		tx:     tx,
 		users: service.NewUserService(service.UserDeps{
 			Stores: stores, Tx: tx, Cache: appCache, Sessions: sessions, Verification: verify,
 		}),
 		admin:    service.NewAdminUserService(stores, tx, nil),
-		roles:    service.NewRoleService(stores, tx, nil),
+		roles:    service.NewRoleService(stores, tx, nil, testCatalog),
 		sessions: sessions,
 		mfa: service.NewMFAService(service.MFADeps{
 			Stores: stores, Tx: tx, Cache: appCache, Sealer: testSealer{}, Sessions: sessions,
 		}),
+		passkeys: passkeys,
 		resets: service.NewPasswordResetService(service.ResetDeps{
-			Stores: stores, Tx: tx, Sender: mail, Cache: appCache, FrontendURL: "https://app.example.test",
+			Stores: stores, Tx: tx, Cache: appCache, FrontendURL: "https://app.example.test",
 		}),
 		verify: verify,
 		mail:   mail,
@@ -131,7 +154,7 @@ func appCode(err error) string {
 
 func appStatus(err error) int {
 	if appErr, ok := err.(*apperror.AppError); ok {
-		return appErr.Status
+		return resolvedStatus(appErr)
 	}
 	return 0
 }
@@ -148,7 +171,7 @@ func scalar[T any](t *testing.T, pool *pgxpool.Pool, sql string, args ...any) T 
 func TestRegister_RollsBackEverythingWhenAuditFails(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
-	broken := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), nil, nil, nil) // nil recorder fails closed
+	broken := identityrepo.NewTransactor(e.fx.Tx(), nil, nil, nil, testutil.BanHasher(t)) // nil recorder fails closed
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: broken, Cache: cache.NewMemoryCache()})
 
 	_, err := users.Register(ctx, service.RegisterInput{Email: "atomic@example.com", Password: testPassphrase, Name: "Atomic"})
@@ -172,9 +195,9 @@ func TestLastOwnerProtection(t *testing.T) {
 	testutil.CreateMember(t, ctx, e.pool, acmeID, "second@example.com", testutil.MemberOptions{Role: "owner"})
 
 	_, err := e.admin.UpdateRole(ctx, owner.UserID, service.RoleMember)
-	assert.Equal(t, string(apperror.CodeUserLastAdmin), appCode(err))
-	assert.Equal(t, string(apperror.CodeUserLastAdmin), appCode(e.admin.BanUser(ctx, owner.UserID)))
-	assert.Equal(t, string(apperror.CodeUserLastAdmin), appCode(e.users.DeleteAccount(ctx, owner.UserID)),
+	assert.Equal(t, string(identitycatalog.CodeUserLastAdmin), appCode(err))
+	assert.Equal(t, string(identitycatalog.CodeUserLastAdmin), appCode(e.admin.BanUser(ctx, owner.UserID)))
+	assert.Equal(t, string(identitycatalog.CodeUserLastAdmin), appCode(e.users.DeleteAccount(ctx, owner.UserID)),
 		"deleting the account would leave the default tenant without an owner")
 
 	// Removing them from acme is fine: acme has another owner.
@@ -183,7 +206,7 @@ func TestLastOwnerProtection(t *testing.T) {
 		`SELECT status FROM memberships WHERE tenant_id = $1 AND user_id = $2`, acmeID, owner.UserID))
 
 	// The database trigger refuses a direct write too.
-	_, err = e.pool.Exec(ctx, `DELETE FROM membership_roles WHERE tenant_id = 1 AND user_id = $1`, owner.UserID)
+	_, err = e.pool.Exec(ctx, `DELETE FROM membership_roles WHERE tenant_id = '0192c9b0-7e4a-7000-8000-000000000001' AND user_id = $1`, owner.UserID)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "last owner")
 }
@@ -198,7 +221,7 @@ func TestBanSurvivesAccountDeletion(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, e.admin.BanUser(ctx, user.User.ID))
 	assert.NotNil(t, scalar[*time.Time](t, e.pool,
-		`SELECT credentials_revoked_at FROM memberships WHERE tenant_id = 1 AND user_id = $1`, user.User.ID),
+		`SELECT credentials_revoked_at FROM memberships WHERE tenant_id = '0192c9b0-7e4a-7000-8000-000000000001' AND user_id = $1`, user.User.ID),
 		"a ban revokes the member's API keys")
 
 	// The banned user can still delete their global account (from another
@@ -207,7 +230,7 @@ func TestBanSurvivesAccountDeletion(t *testing.T) {
 	testutil.CreateMember(t, ctx, e.pool, acmeID, "banned@example.com", testutil.MemberOptions{})
 	require.NoError(t, e.users.DeleteAccount(tenant.WithID(ctx, acmeID), user.User.ID))
 	assert.Equal(t, "suspended", scalar[string](t, e.pool,
-		`SELECT status FROM memberships WHERE tenant_id = 1 AND user_id = $1`, user.User.ID), "the ban stays recorded")
+		`SELECT status FROM memberships WHERE tenant_id = '0192c9b0-7e4a-7000-8000-000000000001' AND user_id = $1`, user.User.ID), "the ban stays recorded")
 
 	_, err = e.users.Register(ctx, service.RegisterInput{Email: "banned@example.com", Password: testPassphrase, Name: "Again"})
 	assert.Equal(t, http.StatusConflict, appStatus(err))
@@ -270,11 +293,11 @@ func TestPasswordReset_IsGlobal(t *testing.T) {
 	resetToken := e.mail.tokenFor(t, "reset@example.com")
 
 	// Reset from a request in the default tenant: the link is not tenant-bound.
-	require.NoError(t, e.resets.ResetPassword(ctx, service.ResetPasswordInput{Token: resetToken, Password: "NewPassword2@2026"}))
-	for _, sid := range []int64{inDefault.SessionID, inAcme.SessionID} {
+	require.NoError(t, e.resets.ResetPassword(ctx, service.ResetPasswordInput{Token: resetToken, Password: testNewPassword}))
+	for _, sid := range []uuid.UUID{inDefault.SessionID, inAcme.SessionID} {
 		assert.Equal(t, "credentials_changed", scalar[string](t, e.pool, `SELECT revoked_reason FROM sessions WHERE id = $1`, sid))
 	}
-	_, err = e.users.Authenticate(tenant.WithID(ctx, acmeID), service.LoginInput{Email: "reset@example.com", Password: "NewPassword2@2026"})
+	_, err = e.users.Authenticate(tenant.WithID(ctx, acmeID), service.LoginInput{Email: "reset@example.com", Password: testNewPassword})
 	assert.NoError(t, err, "the new password works in every tenant")
 	assert.Equal(t, http.StatusBadRequest, appStatus(e.resets.ResetPassword(ctx, service.ResetPasswordInput{Token: resetToken, Password: strings.Join([]string{"second", "reset", "attempt", "phrase"}, "-")})),
 		"single use")
@@ -332,17 +355,17 @@ func TestTenantService_CreateAndLifecycle(t *testing.T) {
 	_, err = tenants.Transition(ctx, created.ID, service.TenantStatusActive)
 	assert.Equal(t, http.StatusConflict, appStatus(err), "deleted is terminal")
 	assert.Equal(t, int64(4), scalar[int64](t, e.pool,
-		`SELECT count(*) FROM audit_events WHERE resource = 'tenant' AND resource_id = $1`, strconv.FormatInt(created.ID, 10)))
+		`SELECT count(*) FROM audit_events WHERE resource = 'tenant' AND resource_id = $1`, created.ID.String()))
 
 	// The schema backs the state machine's invariants.
-	_, err = e.pool.Exec(ctx, `UPDATE tenants SET status = 'deleted', deletion_scheduled_at = NOW() WHERE id = 1`)
+	_, err = e.pool.Exec(ctx, `UPDATE tenants SET status = 'deleted', deletion_scheduled_at = NOW() WHERE id = '0192c9b0-7e4a-7000-8000-000000000001'`)
 	assert.Error(t, err, "the default tenant can never be deleted")
-	_, err = e.pool.Exec(ctx, `UPDATE tenants SET status = 'trialing', trial_ends_at = NULL WHERE id = 1`)
+	_, err = e.pool.Exec(ctx, `UPDATE tenants SET status = 'trialing', trial_ends_at = NULL WHERE id = '0192c9b0-7e4a-7000-8000-000000000001'`)
 	assert.Error(t, err, "a trialing tenant needs a trial end")
 
 	baseline, configured, err := service.StartupTenants(ctx, e.stores.Tenants, "trial-co")
 	require.NoError(t, err, "a deleted configured tenant still exists for startup checks")
-	assert.Equal(t, int64(1), baseline.ID)
+	assert.Equal(t, testID(1), baseline.ID)
 	assert.Equal(t, created.ID, configured.ID)
 	_, _, err = service.StartupTenants(ctx, e.stores.Tenants, "missing")
 	assert.ErrorIs(t, err, apperror.ErrNotFound)

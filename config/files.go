@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"time"
 )
 
 const maxTCPPortNumber = 65535
@@ -23,8 +24,8 @@ type FilesConfig struct {
 	ScanDriver string `env:"FILES_SCAN_DRIVER" envDefault:"none"`
 	// ClamAVAddr is clamd's host:port, required for the clamav driver.
 	ClamAVAddr string `env:"FILES_CLAMAV_ADDR"`
-	// ClamAVTimeoutSecs bounds one scan connection and its response.
-	ClamAVTimeoutSecs int `env:"FILES_CLAMAV_TIMEOUT_SECS" envDefault:"10"`
+	// ClamAVTimeout bounds one scan connection and its response.
+	ClamAVTimeout time.Duration `env:"FILES_CLAMAV_TIMEOUT" envDefault:"10s"`
 }
 
 // validate keeps quotas non-negative and requires the clamav driver's address.
@@ -42,8 +43,8 @@ func (f FilesConfig) validate() error {
 		if err := validateHostPort(f.ClamAVAddr); err != nil {
 			return fmt.Errorf("FILES_CLAMAV_ADDR: %w", err)
 		}
-		if f.ClamAVTimeoutSecs < 1 {
-			return fmt.Errorf("FILES_CLAMAV_TIMEOUT_SECS must be at least 1")
+		if f.ClamAVTimeout < time.Second {
+			return fmt.Errorf("FILES_CLAMAV_TIMEOUT must be at least 1s")
 		}
 		return nil
 	default:

@@ -3,9 +3,10 @@ package audit
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
@@ -16,9 +17,9 @@ type requestInfoKey struct{}
 // services. Guard stores a pointer so a service event can mark that a domain
 // event was recorded without changing the request context.
 type RequestInfo struct {
-	EventID            int64
-	TenantID           int64
-	ActorID            int64
+	EventID            uuid.UUID
+	TenantID           uuid.UUID
+	ActorID            uuid.UUID
 	ActorType          string
 	ActorRole          string
 	RequestID          string
@@ -26,7 +27,7 @@ type RequestInfo struct {
 	UserAgent          string
 	Action             string
 	Resource           string
-	IdempotencyKeyHash string
+	IdempotencyKeyHash []byte
 	// DomainEvents counts service-level events created from this request. A
 	// Guard with RequireDomain uses it to detect a route that mutated without
 	// writing its domain audit row.
@@ -53,7 +54,7 @@ func RequestInfoFromContext(ctx context.Context) *RequestInfo {
 // WithActor enriches the request audit identity with the authenticated actor.
 // It is safe to call before Guard: Guard preserves these values in the intent
 // and completion rows.
-func WithActor(ctx context.Context, actorID int64, role string) context.Context {
+func WithActor(ctx context.Context, actorID uuid.UUID, role string) context.Context {
 	info := RequestInfoFromContext(ctx)
 	if info == nil {
 		info = &RequestInfo{}
@@ -62,7 +63,7 @@ func WithActor(ctx context.Context, actorID int64, role string) context.Context 
 	info.ActorID = actorID
 	info.ActorRole = role
 	info.ActorType = ActorTypeForRole(role)
-	if actorID != 0 && info.ActorType == ActorTypeUnknown {
+	if actorID != uuid.Nil && info.ActorType == ActorTypeUnknown {
 		info.ActorType = ActorTypeUser
 	}
 	return ctx
@@ -91,11 +92,11 @@ func WithRequestMeta(ctx context.Context, requestID, ip, userAgent string) conte
 }
 
 // EventIDFromContext returns the pre-write intent row ID associated with ctx.
-func EventIDFromContext(ctx context.Context) int64 {
+func EventIDFromContext(ctx context.Context) uuid.UUID {
 	if info := RequestInfoFromContext(ctx); info != nil {
 		return info.EventID
 	}
-	return 0
+	return uuid.Nil
 }
 
 // NewServiceEvent builds a terminal service event enriched from the request
@@ -114,20 +115,20 @@ func NewServiceEvent(ctx context.Context, action, resource string) Event {
 	}
 	info := RequestInfoFromContext(ctx)
 	if info == nil {
-		event.TenantID = tenant.EffectiveID(ctx)
+		event.TenantID = tenant.IDFromContext(ctx)
 		return event
 	}
 	info.DomainEvents++
 	event.TenantID = info.TenantID
-	if event.TenantID == 0 {
-		event.TenantID = tenant.EffectiveID(ctx)
+	if event.TenantID == uuid.Nil {
+		event.TenantID = tenant.IDFromContext(ctx)
 	}
 	event.ParentID = info.EventID
 	event.ActorID = info.ActorID
 	event.ActorRole = info.ActorRole
 	if info.ActorType != "" && info.ActorType != ActorTypeUnknown {
 		event.ActorType = info.ActorType
-	} else if event.ActorID != 0 {
+	} else if event.ActorID != uuid.Nil {
 		event.ActorType = ActorTypeUser
 	}
 	event.RequestID = info.RequestID
@@ -139,10 +140,10 @@ func NewServiceEvent(ctx context.Context, action, resource string) Event {
 
 // HashIdempotencyKey returns a stable SHA-256 digest for an Idempotency-Key.
 // The raw key is client-controlled and must never be stored in the trail.
-func HashIdempotencyKey(key string) string {
+func HashIdempotencyKey(key string) []byte {
 	if key == "" {
-		return ""
+		return nil
 	}
 	sum := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(sum[:])
+	return sum[:]
 }

@@ -16,7 +16,7 @@ func (g *generator) generateUseCase(ctx context.Context, kind, module, name stri
 			"(declare its dependencies as ports in service/ports.go) and replace the 501 test",
 	}
 	if withHTTP {
-		next = append(next, "Fill the request/response DTOs and their mapping, then refresh the API spec: make swagger")
+		next = append(next, "Fill the request/response DTOs and their mapping, then refresh the API spec: make openapi")
 	}
 	return g.execute(ctx, p, verifySteps(module, false), next)
 }
@@ -84,7 +84,7 @@ func (g *generator) wireUseCase(p *plan, data templateData) error {
 		if err != nil {
 			return "", err
 		}
-		return insertAtMarker("module.go", out, markerRoutes, fmt.Sprintf("m.register%sRoute(group, deps)", u.Name))
+		return insertAtMarker("module.go", out, markerRoutes, fmt.Sprintf("m.register%sRoute(api)", u.Name))
 	}); err != nil {
 		return err
 	}

@@ -11,13 +11,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -57,10 +59,10 @@ type store interface {
 	// Claim also reports jobs that lease expiry dead-lettered on their final
 	// attempt; they are not dispatched.
 	Claim(ctx context.Context, workerID string, limit int, lease time.Duration) (claimResult, error)
-	Succeed(ctx context.Context, id int64, workerID string, attempts int) error
-	Fail(ctx context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error
-	Heartbeat(ctx context.Context, id int64, workerID string, attempts int, lease time.Duration) error
-	Release(ctx context.Context, id int64, workerID string, attempts int, reason string) error
+	Succeed(ctx context.Context, id uuid.UUID, workerID string, attempts int) error
+	Fail(ctx context.Context, id uuid.UUID, workerID string, attempts int, reason string, retryAt *time.Time) error
+	Heartbeat(ctx context.Context, id uuid.UUID, workerID string, attempts int, lease time.Duration) error
+	Release(ctx context.Context, id uuid.UUID, workerID string, attempts int, reason string) error
 	PurgeTerminal(ctx context.Context, olderThan time.Duration) (int64, error)
 }
 
@@ -74,14 +76,14 @@ type claimResult struct {
 // leaseExpiredJob identifies a job dead-lettered by the claim query because
 // its worker's lease expired on the job's final attempt.
 type leaseExpiredJob struct {
-	ID       int64
-	TenantID int64
+	ID       uuid.UUID
+	TenantID uuid.UUID
 	Kind     string
 }
 
 type claimedJob struct {
-	ID          int64
-	TenantID    int64
+	ID          uuid.UUID
+	TenantID    uuid.UUID
 	Kind        string
 	Payload     json.RawMessage
 	Attempts    int
@@ -217,7 +219,7 @@ func normalizeKinds(kinds []string) []string {
 	return out
 }
 
-// WithTracerProvider enables a job.process consumer span per claimed job. Each
+// WithTracerProvider enables a "<kind> process" consumer span per claimed job. Each
 // span is a new root with a link to the enqueue-time traceparent, so retries do
 // not masquerade as children of the original request. Nil disables tracing.
 func WithTracerProvider(tp trace.TracerProvider) Option {
@@ -455,6 +457,16 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	processCtx, span := w.startJobSpan(ctx, job)
 	defer span.End()
 
+	// A claimed job always names its tenant: jobs.tenant_id is NOT NULL with no
+	// default, so a row without one is a bug. Dead-letter it permanently rather
+	// than running it under some other tenant's context.
+	if job.TenantID == uuid.Nil {
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+		defer cancel()
+		return w.recordFailure(writeCtx, span, job,
+			Permanent(fmt.Errorf("%w: claimed job %d kind %q has no tenant", ErrInvalidTenant, job.ID, job.Kind)))
+	}
+
 	interrupted, leaseLost, handlerErr := w.runHandler(ctx, processCtx, job)
 	if leaseLost {
 		// The job may already belong to another worker. Its fenced outcome
@@ -494,10 +506,9 @@ func (w *Worker) runHandler(workerCtx, processCtx context.Context, job claimedJo
 	}
 
 	// Restore the tenant that owns the job so handlers (email, audit, and
-	// future work) see the same context they would inside a request. Rows
-	// written before multi-tenancy, and test doubles, may omit the column;
-	// those jobs run under the compatibility tenant.
-	handlerCtx := tenant.WithID(processCtx, jobTenantID(job))
+	// future work) see the same context they would inside a request. A job
+	// without a tenant is dead-lettered before this runs.
+	handlerCtx := tenant.WithID(processCtx, job.TenantID)
 	timeoutCancel := context.CancelFunc(func() {})
 	if w.jobTimeout > 0 {
 		handlerCtx, timeoutCancel = context.WithTimeout(handlerCtx, w.jobTimeout)
@@ -622,15 +633,6 @@ func (w *Worker) recordLeaseDead(job leaseExpiredJob) {
 	)
 }
 
-// jobTenantID returns the tenant that owns job, falling back to the
-// compatibility tenant for rows (and test doubles) without one.
-func jobTenantID(job claimedJob) int64 {
-	if job.TenantID == 0 {
-		return tenant.DefaultID
-	}
-	return job.TenantID
-}
-
 // startJobSpan creates the per-attempt consumer span. It is always a new root:
 // a retry is not a child of the previous attempt. When the enqueue context
 // carried a W3C traceparent, a link preserves causality without forcing the
@@ -641,9 +643,13 @@ func (w *Worker) startJobSpan(ctx context.Context, job claimedJob) (context.Cont
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithNewRoot(),
 		trace.WithAttributes(
-			attribute.Int64("job.id", job.ID),
+			semconv.MessagingSystemKey.String(jobMessagingSystem),
+			semconv.MessagingOperationTypeKey.String(semconv.MessagingOperationTypeProcess.Value.AsString()),
+			semconv.MessagingMessageIDKey.String(job.ID.String()),
+			semconv.MessagingDestinationNameKey.String(job.Kind),
+			attribute.String("job.id", job.ID.String()),
 			attribute.String("job.kind", job.Kind),
-			attribute.Int64("job.tenant_id", jobTenantID(job)),
+			attribute.String("job.tenant_id", job.TenantID.String()),
 			attribute.Int("job.attempt", job.Attempts),
 			attribute.Int("job.max_attempts", job.MaxAttempts),
 		),
@@ -654,7 +660,21 @@ func (w *Worker) startJobSpan(ctx context.Context, job claimedJob) (context.Cont
 			opts = append(opts, trace.WithLinks(trace.Link{SpanContext: remote}))
 		}
 	}
-	return w.tracer.Start(ctx, "job.process", opts...)
+	return w.tracer.Start(ctx, jobSpanName(job.Kind), opts...)
+}
+
+// jobMessagingSystem is the custom messaging.system value for the durable
+// PostgreSQL-backed queue (there is no well-known semconv value for an
+// in-database queue).
+const jobMessagingSystem = "job_queue"
+
+// jobSpanName follows the messaging span naming convention:
+// "{destination} {operation}".
+func jobSpanName(kind string) string {
+	if kind == "" {
+		return "job process"
+	}
+	return kind + " " + semconv.MessagingOperationTypeProcess.Value.AsString()
 }
 
 func jobOutcomeAttributes(outcome string, retryAt *time.Time) []attribute.KeyValue {

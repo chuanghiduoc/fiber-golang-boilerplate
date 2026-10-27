@@ -13,24 +13,18 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
-// roleLocalKey is the Fiber locals key populated by the JWTAuth middleware.
-const roleLocalKey = "role"
-
-// subjectLocalKey is the Fiber locals key used by the authentication
-// middleware. Keeping the subject in Fiber locals lets route middleware make a
-// decision without re-reading the context, while SetSubject also updates the
-// context for services and repositories.
-const subjectLocalKey = "authz_subject"
-
-// SetSubject stores the subject in Fiber locals and the request context.
+// SetSubject stores the subject in the request context, which route
+// middleware and handlers read through SubjectFromFiber.
 func SetSubject(c fiber.Ctx, subject authz.Subject) {
-	fiber.Locals[authz.Subject](c, subjectLocalKey, subject)
 	c.SetContext(authz.WithSubject(c.Context(), subject))
 }
 
 // SubjectFromFiber returns the subject stored by SetSubject.
 func SubjectFromFiber(c fiber.Ctx) (authz.Subject, bool) {
-	subject := fiber.Locals[authz.Subject](c, subjectLocalKey)
+	subject, ok := authz.SubjectFromContext(c.Context())
+	if !ok {
+		return authz.Subject{}, false
+	}
 	// A subject is only meaningful with a role or an explicit permission set;
 	// reject the zero value so a missing local cannot grant access through an
 	// unknown role.
@@ -41,17 +35,10 @@ func SubjectFromFiber(c fiber.Ctx) (authz.Subject, bool) {
 }
 
 // requestSubject returns the subject installed by authentication middleware.
-// When only a role local is present (older tests or third-party middleware),
-// it derives permissions from the role catalog so route behavior is unchanged.
+// There is no role fallback: a bare "role" local from older or third-party
+// middleware never grants a permission.
 func requestSubject(c fiber.Ctx) (authz.Subject, bool) {
-	if subject, ok := SubjectFromFiber(c); ok {
-		return subject, true
-	}
-	role := fiber.Locals[string](c, roleLocalKey)
-	if role == "" {
-		return authz.Subject{}, false
-	}
-	return authz.NewSubject(0, 0, role), true
+	return SubjectFromFiber(c)
 }
 
 // Require returns middleware that allows the request only when the
@@ -88,22 +75,41 @@ func RequireAny(permissions ...authz.Permission) fiber.Handler {
 }
 
 // RequireMFA returns middleware that allows the request only when the
-// authenticated subject's access token carries an MFA method (otp or rc) and
-// the session's second factor is no older than maxAge (NIST SP 800-63B rev4
-// §2.2.3: a second factor verified weeks ago is not AAL2 anymore). A missing
-// or stale proof is refused with 403 auth.mfa_required; the client refreshes
-// it with POST /auth/mfa/step-up. It must run after authentication. API-key
-// subjects have no amr and are denied. A non-positive maxAge still requires a
-// recorded verification, just without an age bound.
+// authenticated subject's access token carries an MFA method (otp, rc, hwk, or
+// swk) and the session's second factor is no older than maxAge (NIST SP 800-63B
+// rev4 §2.2.3: a second factor verified weeks ago is not AAL2 anymore). A
+// missing or stale proof is refused with 403 auth.mfa_required; the client
+// refreshes it with POST /me/mfa/step-up. It must run after authentication.
+// API-key subjects have no amr and are denied. A non-positive maxAge still
+// requires a recorded verification, just without an age bound.
 func RequireMFA(maxAge time.Duration) fiber.Handler {
+	return requireMFAMethod(maxAge, false)
+}
+
+// RequirePasskeyMFA is the phishing-resistant variant of RequireMFA: it
+// accepts only a passkey (hwk or swk), never a TOTP or recovery code. Every
+// platform:* permission uses it automatically, so a platform administrator
+// cannot reach cross-tenant operations with a phishable factor.
+func RequirePasskeyMFA(maxAge time.Duration) fiber.Handler {
+	return requireMFAMethod(maxAge, true)
+}
+
+func requireMFAMethod(maxAge time.Duration, passkeyOnly bool) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		subject, ok := requestSubject(c)
-		if !ok || !subject.HasMFA() {
+		if !ok {
+			return apperror.NewCode(apperror.CodeMFARequired, "multi-factor authentication is required")
+		}
+		if passkeyOnly && !subject.HasPasskey() {
+			return apperror.NewCode(apperror.CodeMFARequired,
+				"a passkey is required for this operation; register one at POST /me/mfa/passkeys/options")
+		}
+		if !subject.HasMFA() {
 			return apperror.NewCode(apperror.CodeMFARequired, "multi-factor authentication is required")
 		}
 		if subject.MFAVerifiedAt.IsZero() || (maxAge > 0 && time.Since(subject.MFAVerifiedAt) > maxAge) {
 			return apperror.NewCode(apperror.CodeMFARequired,
-				"multi-factor authentication has expired; re-authenticate at POST /auth/mfa/step-up")
+				"multi-factor authentication has expired; re-authenticate at POST /me/mfa/step-up")
 		}
 		return c.Next()
 	}

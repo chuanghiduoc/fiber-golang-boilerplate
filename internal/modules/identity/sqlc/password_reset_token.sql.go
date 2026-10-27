@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -17,7 +18,7 @@ WHERE token_hash = $1
 RETURNING id, user_id, token_hash, expires_at, created_at
 `
 
-func (q *Queries) ConsumePasswordResetToken(ctx context.Context, tokenHash string) (PasswordResetToken, error) {
+func (q *Queries) ConsumePasswordResetToken(ctx context.Context, tokenHash []byte) (PasswordResetToken, error) {
 	row := q.db.QueryRow(ctx, consumePasswordResetToken, tokenHash)
 	var i PasswordResetToken
 	err := row.Scan(
@@ -47,9 +48,9 @@ RETURNING id, user_id, token_hash, expires_at, created_at
 `
 
 type CreatePasswordResetTokenParams struct {
-	TokenHash string             `json:"token_hash"`
+	TokenHash []byte             `json:"token_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-	UserID    int64              `json:"user_id"`
+	UserID    uuid.UUID          `json:"user_id"`
 	Email     string             `json:"email"`
 }
 
@@ -81,7 +82,7 @@ DELETE FROM password_reset_tokens
 WHERE token_hash = $1
 `
 
-func (q *Queries) DeletePasswordResetToken(ctx context.Context, tokenHash string) error {
+func (q *Queries) DeletePasswordResetToken(ctx context.Context, tokenHash []byte) error {
 	_, err := q.db.Exec(ctx, deletePasswordResetToken, tokenHash)
 	return err
 }
@@ -91,7 +92,7 @@ DELETE FROM password_reset_tokens
 WHERE user_id = $1
 `
 
-func (q *Queries) DeletePasswordResetTokensByUserID(ctx context.Context, userID int64) error {
+func (q *Queries) DeletePasswordResetTokensByUserID(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deletePasswordResetTokensByUserID, userID)
 	return err
 }
@@ -101,7 +102,7 @@ SELECT id, user_id, token_hash, expires_at, created_at FROM password_reset_token
 WHERE token_hash = $1
 `
 
-func (q *Queries) GetPasswordResetTokenByHash(ctx context.Context, tokenHash string) (PasswordResetToken, error) {
+func (q *Queries) GetPasswordResetTokenByHash(ctx context.Context, tokenHash []byte) (PasswordResetToken, error) {
 	row := q.db.QueryRow(ctx, getPasswordResetTokenByHash, tokenHash)
 	var i PasswordResetToken
 	err := row.Scan(

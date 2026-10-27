@@ -8,22 +8,23 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const advanceTenantPurgeCursor = `-- name: AdvanceTenantPurgeCursor :exec
 UPDATE tenants
-SET purge_cursor = $1::bigint,
+SET purge_cursor = $1::uuid,
     purge_progress_at = NOW()
-WHERE id = $2::bigint
+WHERE id = $2::uuid
   AND status = 'deleted'
   AND purged_at IS NULL
-  AND purge_cursor < $1::bigint
+  AND purge_cursor < $1::uuid
 `
 
 type AdvanceTenantPurgeCursorParams struct {
-	PurgeCursor int64 `json:"purge_cursor"`
-	ID          int64 `json:"id"`
+	PurgeCursor uuid.UUID `json:"purge_cursor"`
+	ID          uuid.UUID `json:"id"`
 }
 
 // Records the highest membership user id whose erasers succeeded. It only
@@ -77,9 +78,9 @@ VALUES ($1, $2, $3)
 `
 
 type CreateTenantSettingsParams struct {
-	TenantID int64  `json:"tenant_id"`
-	Locale   string `json:"locale"`
-	Timezone string `json:"timezone"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Locale   string    `json:"locale"`
+	Timezone string    `json:"timezone"`
 }
 
 func (q *Queries) CreateTenantSettings(ctx context.Context, arg CreateTenantSettingsParams) error {
@@ -94,7 +95,7 @@ DELETE FROM tenant_settings WHERE tenant_id = $1
 // Tenant purge: the deleted tenant's configuration has no reader left. The
 // primary key is tenant_id, so this affects at most one row and needs no
 // batching. The tenants row itself is kept for audit and incident review.
-func (q *Queries) DeleteTenantSettings(ctx context.Context, tenantID int64) (int64, error) {
+func (q *Queries) DeleteTenantSettings(ctx context.Context, tenantID uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteTenantSettings, tenantID)
 	if err != nil {
 		return 0, err
@@ -108,7 +109,7 @@ WHERE id = $1
   AND (status = 'active' OR (status = 'trialing' AND trial_ends_at > NOW()))
 `
 
-func (q *Queries) GetOperationalTenantByID(ctx context.Context, id int64) (Tenant, error) {
+func (q *Queries) GetOperationalTenantByID(ctx context.Context, id uuid.UUID) (Tenant, error) {
 	row := q.db.QueryRow(ctx, getOperationalTenantByID, id)
 	var i Tenant
 	err := row.Scan(
@@ -165,7 +166,7 @@ WHERE id = $1
 
 // Startup checks need existence independent of request eligibility so a
 // suspended configured/default tenant does not crash the process.
-func (q *Queries) GetTenantByID(ctx context.Context, id int64) (Tenant, error) {
+func (q *Queries) GetTenantByID(ctx context.Context, id uuid.UUID) (Tenant, error) {
 	row := q.db.QueryRow(ctx, getTenantByID, id)
 	var i Tenant
 	err := row.Scan(
@@ -191,7 +192,7 @@ WHERE id = $1
 FOR UPDATE
 `
 
-func (q *Queries) GetTenantByIDForUpdate(ctx context.Context, id int64) (Tenant, error) {
+func (q *Queries) GetTenantByIDForUpdate(ctx context.Context, id uuid.UUID) (Tenant, error) {
 	row := q.db.QueryRow(ctx, getTenantByIDForUpdate, id)
 	var i Tenant
 	err := row.Scan(
@@ -241,7 +242,7 @@ SELECT tenant_id, locale, timezone, created_at, updated_at FROM tenant_settings
 WHERE tenant_id = $1
 `
 
-func (q *Queries) GetTenantSettings(ctx context.Context, tenantID int64) (TenantSetting, error) {
+func (q *Queries) GetTenantSettings(ctx context.Context, tenantID uuid.UUID) (TenantSetting, error) {
 	row := q.db.QueryRow(ctx, getTenantSettings, tenantID)
 	var i TenantSetting
 	err := row.Scan(
@@ -308,15 +309,15 @@ LIMIT $1::int
 
 // The hourly finalize job moves tenants whose pending_deletion grace ended to
 // deleted through the audited TenantService.
-func (q *Queries) ListDueDeletionTenantIDs(ctx context.Context, rowLimit int32) ([]int64, error) {
+func (q *Queries) ListDueDeletionTenantIDs(ctx context.Context, rowLimit int32) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listDueDeletionTenantIDs, rowLimit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []int64{}
+	items := []uuid.UUID{}
 	for rows.Next() {
-		var id int64
+		var id uuid.UUID
 		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
@@ -338,15 +339,15 @@ LIMIT $1::int
 
 // The hourly trial-expiry job moves these to suspended through the audited
 // tenant service. Bounded so one pass cannot scan an unbounded backlog.
-func (q *Queries) ListExpiredTrialTenantIDs(ctx context.Context, rowLimit int32) ([]int64, error) {
+func (q *Queries) ListExpiredTrialTenantIDs(ctx context.Context, rowLimit int32) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listExpiredTrialTenantIDs, rowLimit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []int64{}
+	items := []uuid.UUID{}
 	for rows.Next() {
-		var id int64
+		var id uuid.UUID
 		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
@@ -360,14 +361,14 @@ func (q *Queries) ListExpiredTrialTenantIDs(ctx context.Context, rowLimit int32)
 
 const listTenantsCursor = `-- name: ListTenantsCursor :many
 SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at FROM tenants
-WHERE (created_at, id) < ($1::timestamptz, $2::bigint)
+WHERE (created_at, id) < ($1::timestamptz, $2::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT $3::int
 `
 
 type ListTenantsCursorParams struct {
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -408,19 +409,74 @@ func (q *Queries) ListTenantsCursor(ctx context.Context, arg ListTenantsCursorPa
 const markTenantPurged = `-- name: MarkTenantPurged :execrows
 UPDATE tenants
 SET purged_at = NOW()
-WHERE id = $1::bigint
+WHERE id = $1::uuid
   AND status = 'deleted'
   AND purged_at IS NULL
 `
 
 // Completion marker. The status check makes a concurrent status change a
 // no-op instead of marking an operational tenant purged.
-func (q *Queries) MarkTenantPurged(ctx context.Context, id int64) (int64, error) {
+func (q *Queries) MarkTenantPurged(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, markTenantPurged, id)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const touchTenantIfUnchanged = `-- name: TouchTenantIfUnchanged :execrows
+UPDATE tenants
+SET updated_at = NOW()
+WHERE id = $1
+  AND updated_at = $2
+`
+
+type TouchTenantIfUnchangedParams struct {
+	ID                uuid.UUID          `json:"id"`
+	ExpectedUpdatedAt pgtype.Timestamptz `json:"expected_updated_at"`
+}
+
+// The optimistic-concurrency gate for the tenants ETag. The row update and the
+// status/name change commit in one transaction, so exactly one concurrent
+// writer holding the same validator succeeds.
+func (q *Queries) TouchTenantIfUnchanged(ctx context.Context, arg TouchTenantIfUnchangedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, touchTenantIfUnchanged, arg.ID, arg.ExpectedUpdatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateTenantName = `-- name: UpdateTenantName :one
+UPDATE tenants
+SET name = $1
+WHERE id = $2
+RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at
+`
+
+type UpdateTenantNameParams struct {
+	Name string    `json:"name"`
+	ID   uuid.UUID `json:"id"`
+}
+
+func (q *Queries) UpdateTenantName(ctx context.Context, arg UpdateTenantNameParams) (Tenant, error) {
+	row := q.db.QueryRow(ctx, updateTenantName, arg.Name, arg.ID)
+	var i Tenant
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.Status,
+		&i.StatusChangedAt,
+		&i.TrialEndsAt,
+		&i.DeletionScheduledAt,
+		&i.PurgedAt,
+		&i.PurgeCursor,
+		&i.PurgeProgressAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const updateTenantStatus = `-- name: UpdateTenantStatus :one
@@ -435,7 +491,7 @@ RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_sch
 type UpdateTenantStatusParams struct {
 	Status              string             `json:"status"`
 	DeletionScheduledAt pgtype.Timestamptz `json:"deletion_scheduled_at"`
-	ID                  int64              `json:"id"`
+	ID                  uuid.UUID          `json:"id"`
 }
 
 func (q *Queries) UpdateTenantStatus(ctx context.Context, arg UpdateTenantStatusParams) (Tenant, error) {

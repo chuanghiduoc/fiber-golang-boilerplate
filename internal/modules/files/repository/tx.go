@@ -5,10 +5,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // Transactor implements service.Transactor: InTx binds the file repository,

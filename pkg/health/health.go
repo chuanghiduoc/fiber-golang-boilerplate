@@ -10,7 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 )
 
 // Overall readiness states. Only StatusDown should take a pod out of rotation.

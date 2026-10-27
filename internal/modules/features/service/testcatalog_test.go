@@ -1,26 +1,55 @@
 package service
 
-import "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+import (
+	featurescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+)
 
-// Flag keys are owned by identity and files, which this module cannot
-// import. The test binary registers identical stand-ins under the same owners
-// so the admin service sees a realistic catalog.
+// Flag keys are owned by identity and files, which this module cannot import.
+// The test catalog contributes identical stand-ins under the same owners so
+// the admin service sees a realistic catalog.
 const (
 	testKeyUserRegistration features.Key = "user_registration"
 	testKeyGoogleOAuth      features.Key = "google_oauth"
 	testKeyFileUploads      features.Key = "file_uploads"
 )
 
-func init() {
-	if err := features.Register("identity",
-		features.Definition{Key: testKeyUserRegistration, Description: "Allow new users to register through the public API.", Default: true},
-		features.Definition{Key: testKeyGoogleOAuth, Description: "Expose Google OAuth login and callback routes (still requires Google credentials).", Default: true},
-	); err != nil {
+var (
+	testCatalog = newTestFeatureCatalog()
+	testAuthz   = newTestAuthzCatalog()
+)
+
+func newTestFeatureCatalog() *features.Catalog {
+	catalog := features.NewCatalog()
+	if err := catalog.Add(features.Provider{Owner: "identity", Definitions: []features.Definition{
+		{Key: testKeyUserRegistration, Description: "Allow new users to register through the public API.", Default: true},
+		{Key: testKeyGoogleOAuth, Description: "Expose Google OAuth login and callback routes (still requires Google credentials).", Default: true},
+	}}); err != nil {
 		panic(err)
 	}
-	if err := features.Register("files",
-		features.Definition{Key: testKeyFileUploads, Description: "Allow authenticated file uploads.", Default: true},
-	); err != nil {
+	if err := catalog.Add(features.Provider{Owner: "files", Definitions: []features.Definition{
+		{Key: testKeyFileUploads, Description: "Allow authenticated file uploads.", Default: true},
+	}}); err != nil {
 		panic(err)
 	}
+	catalog.Seal()
+	return catalog
+}
+
+func newTestAuthzCatalog() *authz.Catalog {
+	catalog := authz.NewCatalog()
+	if err := catalog.Add(authz.Provider{Owner: featurescatalog.Owner, Grants: featurescatalog.Permissions()}); err != nil {
+		panic(err)
+	}
+	catalog.Seal()
+	return catalog
+}
+
+func testAuthorizer() authz.Authorizer { return authz.NewAuthorizer(testAuthz) }
+
+func resolvedStatus(appErr *apperror.AppError) int {
+	_, spec := apperror.PlatformCatalog().Resolve(apperror.Code(appErr.Code))
+	return spec.Status
 }

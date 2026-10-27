@@ -19,6 +19,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/totp"
+	"github.com/google/uuid"
 )
 
 // sessionValidator is the real access-token validator over the application
@@ -29,7 +30,7 @@ func sessionValidator(e *env) session.Store {
 
 // validateForUser checks one session as an HTTP request would: the claims carry
 // the token version the client authenticated at.
-func validateForUser(t *testing.T, store session.Store, tenantID, userID, sessionID int64, tokenVersion int32) error {
+func validateForUser(t *testing.T, store session.Store, tenantID, userID, sessionID uuid.UUID, tokenVersion int32) error {
 	t.Helper()
 	_, err := store.Validate(tenant.WithID(context.Background(), tenantID), session.Claims{
 		UserID:       userID,
@@ -100,7 +101,7 @@ func TestRevokeStaleUserSessions_CleanupIsIdempotent(t *testing.T) {
 	revoked := scalar[int64](t, e.pool,
 		`SELECT count(*) FROM sessions WHERE user_id = $1 AND revoked_at IS NOT NULL`, user.UserID)
 	assert.Equal(t, int64(2), revoked)
-	for _, id := range []int64{first.SessionID, second.SessionID} {
+	for _, id := range []uuid.UUID{first.SessionID, second.SessionID} {
 		assert.Equal(t, string(service.RevokeCredentialsChanged), scalar[string](t, e.pool,
 			`SELECT revoked_reason FROM sessions WHERE id = $1`, id))
 	}
@@ -128,7 +129,7 @@ func TestMFALoginRace_PasswordOnlySessionRefusedAfterConfirm(t *testing.T) {
 	secret := enrollSecret(t, e, user.UserID)
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, code)
 	require.NoError(t, err)
 
 	// Step 3: the first login tries to finish at the version it read.
@@ -147,7 +148,7 @@ func TestCreateSession_RefusesPasswordOnlySessionOnceFactorConfirmed(t *testing.
 	secret := enrollSecret(t, e, user.UserID)
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, code)
 	require.NoError(t, err)
 
 	version := scalar[int32](t, e.pool, `SELECT token_version FROM users WHERE id = $1`, user.UserID)

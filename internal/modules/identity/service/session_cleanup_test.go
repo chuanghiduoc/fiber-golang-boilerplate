@@ -6,10 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/crypto/bcrypt"
-
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/google/uuid"
 )
 
 // failingSessionCleanup rejects the after-commit cross-tenant session-row
@@ -19,7 +18,7 @@ type failingSessionCleanup struct {
 	calls int
 }
 
-func (f *failingSessionCleanup) RevokeStaleForUser(context.Context, int64, RevokeReason) error {
+func (f *failingSessionCleanup) RevokeStaleForUser(context.Context, uuid.UUID, RevokeReason) error {
 	f.calls++
 	return errors.New("session cleanup unavailable")
 }
@@ -58,7 +57,7 @@ func TestChangePasswordCommitsWhenSessionCleanupFails(t *testing.T) {
 	if db.users[user.User.ID].TokenVersion == 0 {
 		t.Fatal("password change did not bump the token version")
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(db.passwords[user.User.ID]), []byte(newPassword)); err != nil {
+	if ok, _ := verifyPassword(db.passwords[user.User.ID], newPassword); !ok {
 		t.Fatal("new password was not stored")
 	}
 }

@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Optional External Secrets Operator integration. It creates the three Secrets
+# the workloads consume, but the workloads mount them as FILES (never envFrom):
+# every Secret-backed setting reaches the process through its <NAME>_FILE
+# variable (config/secretfile.go). See README.md#secrets.
+#
+# Prerequisites:
+#   - external-secrets operator installed, with a ClusterSecretStore named
+#     "fiber-boilerplate" (or patch secretStoreRef.name below).
+#   - the remote paths in externalsecrets.yaml replaced; they are placeholders.
+#   - the store's provider identity may read the app, migrate, and seed paths.
+#
+# Enable it in the prereqs overlay so the Secrets exist before the migration
+# Job, and in the app overlay so they stay managed with the rollout:
+#
+#   components:
+#     - ../../components/external-secrets
+resources:
+  - externalsecrets.yaml

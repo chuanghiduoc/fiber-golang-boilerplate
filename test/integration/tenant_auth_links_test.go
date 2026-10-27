@@ -15,21 +15,23 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/crypto/bcrypt"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
 type recordingEmailSender struct {
@@ -69,18 +71,17 @@ type tenantAuthLinksHarness struct {
 	pool      *pgxpool.Pool
 	verifSvc  identityservice.EmailVerificationService
 	sender    *recordingEmailSender
-	tenantTwo int64
-	userID    int64
-	user2ID   int64
+	tenantTwo uuid.UUID
+	userID    uuid.UUID
+	user2ID   uuid.UUID
 }
 
 func setupTenantAuthLinksHarness(t *testing.T) *tenantAuthLinksHarness {
 	t.Helper()
 	ctx := context.Background()
 
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := testutil.NewFixture(t)
+	pool := fx.Bypass
 
 	tenantTwo := testutil.CreateTenant(t, ctx, pool, "links-acme")
 	userID := testutil.CreateMember(t, ctx, pool, tenantTwo, "links@example.com",
@@ -91,18 +92,46 @@ func setupTenantAuthLinksHarness(t *testing.T) *tenantAuthLinksHarness {
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
 	sender := &recordingEmailSender{}
-	kit := newIdentityKit(pool, appCache, audit.NewPostgresRecorder(testutil.Scoped(pool)), "links-integration-secret", sender)
+	recorder := audit.NewPostgresRecorder(fx.Scoped())
+	kit := newIdentityKit(fx, appCache, recorder, "links-integration-secret", sender)
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
-	// require-header mode: password-reset and verification links must be able
-	// to complete through the validated ?tenant= fallback.
-	api := app.Group("/api/v1", tenanthttp.Middleware(identityadapter.NewTenantResolver(kit.stores.Tenants), ""))
-	api.Post("/auth/forgot-password", kit.auth.ForgotPassword)
-	api.Post("/auth/reset-password", kit.auth.ResetPassword)
-	api.Post("/auth/verify-email", kit.auth.VerifyEmail)
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "test", BodyLimit: 1 << 20, RequestTimeout: 10 * time.Second},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 10000, StrictWindow: 60 * time.Second, NormalMax: 10000, NormalWindow: 60 * time.Second, RelaxedMax: 10000, RelaxedWindow: 60 * time.Second},
+		JWT:       config.JWTConfig{Secret: "links-integration-secret", AccessTTL: time.Hour, RefreshTTL: 24 * time.Hour},
+		// require-header mode: password-reset and verification links must be
+		// able to complete through the validated ?tenant= fallback.
+		Tenant: config.TenantConfig{DefaultSlug: "default", RequireHeader: true},
+	}
+	application := app.New(cfg, app.Deps{
+		Catalogs:       integrationCatalogs(),
+		Cache:          appCache,
+		Sessions:       kit.sessions,
+		Audit:          recorder,
+		TenantResolver: identityadapter.NewTenantResolver(kit.stores.Tenants),
+	})
+	guard := func(action string) *httpapi.GuardPolicy {
+		return &httpapi.GuardPolicy{Action: action, Resource: "auth"}
+	}
+	httpapi.Register(application.HTTP(), httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/password-resets", OperationID: "requestPasswordReset",
+		Tags: []string{"auth"}, Summary: "Request a password reset",
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitStrict, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.password_reset_requested")}}, kit.auth.ForgotPassword)
+	httpapi.Register(application.HTTP(), httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/password-resets/complete", OperationID: "completePasswordReset",
+		Tags: []string{"auth"}, Summary: "Complete a password reset",
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitStrict, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.password_reset_completed")}}, kit.auth.ResetPassword)
+	httpapi.Register(application.HTTP(), httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/email-verifications/complete", OperationID: "completeEmailVerification",
+		Tags: []string{"auth"}, Summary: "Verify an email address",
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.email_verified")}}, kit.auth.VerifyEmail)
 
 	return &tenantAuthLinksHarness{
-		app:       app,
+		app:       application.Fiber(),
 		pool:      pool,
 		verifSvc:  kit.verification,
 		sender:    sender,
@@ -124,6 +153,7 @@ func (h *tenantAuthLinksHarness) postJSONWithTenant(t *testing.T, path string, p
 	req, err := http.NewRequest(http.MethodPost, path, bytes.NewReader(body))
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", uuid.NewString())
 	if slug != "" {
 		req.Header.Set(tenant.Header, slug)
 	}
@@ -152,21 +182,22 @@ func TestTenantAuthLinks_ResetAndVerificationCarryTenant(t *testing.T) {
 
 	// Forgot-password is a normal fetch, so the client sends the header. The
 	// generated link must still carry the tenant for browser completion.
-	status, body := h.postJSONWithTenant(t, "/api/v1/auth/forgot-password",
+	status, body := h.postJSONWithTenant(t, "/api/v1/auth/password-resets",
 		identitydto.ForgotPasswordRequest{Email: "links@example.com"}, "links-acme")
-	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	require.Equal(t, fiber.StatusNoContent, status, "body: %s", body)
 	require.True(t, h.sender.WaitFor(1, 2*time.Second))
 	resetLink := extractEmailLink(t, h.sender.Messages()[0])
 	assert.Equal(t, "links-acme", resetLink.Query().Get("tenant"))
 	require.NotEmpty(t, resetLink.Query().Get("token"))
 
 	// Reset completes in the same tenant without X-Tenant-Slug.
-	status, body = h.postJSON(t, "/api/v1/auth/reset-password?tenant=links-acme",
+	newPassword := strings.Join([]string{"New", "password", "fixture"}, "-") + "-2026"
+	status, body = h.postJSON(t, "/api/v1/auth/password-resets/complete?tenant=links-acme",
 		identitydto.ResetPasswordRequest{
 			Token:    resetLink.Query().Get("token"),
-			Password: "NewPassword1!2026",
+			Password: newPassword,
 		})
-	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	require.Equal(t, fiber.StatusNoContent, status, "body: %s", body)
 
 	// Verification link carries the tenant too.
 	require.NoError(t, h.verifSvc.SendVerification(
@@ -177,9 +208,9 @@ func TestTenantAuthLinks_ResetAndVerificationCarryTenant(t *testing.T) {
 	verifyLink := extractEmailLink(t, h.sender.Messages()[1])
 	assert.Equal(t, "links-acme", verifyLink.Query().Get("tenant"))
 
-	status, body = h.postJSON(t, "/api/v1/auth/verify-email?tenant=links-acme",
+	status, body = h.postJSON(t, "/api/v1/auth/email-verifications/complete?tenant=links-acme",
 		identitydto.VerifyEmailRequest{Token: verifyLink.Query().Get("token")})
-	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	require.Equal(t, fiber.StatusNoContent, status, "body: %s", body)
 
 	var verified bool
 	require.NoError(t, h.pool.QueryRow(context.Background(),
@@ -190,24 +221,28 @@ func TestTenantAuthLinks_ResetAndVerificationCarryTenant(t *testing.T) {
 	// Passwords are global: a reset token belongs to the user, not
 	// to a tenant, so it completes from any tenant's link. Use a second
 	// account so the per-email reset rate limit does not suppress this email.
-	status, _ = h.postJSONWithTenant(t, "/api/v1/auth/forgot-password",
+	status, _ = h.postJSONWithTenant(t, "/api/v1/auth/password-resets",
 		identitydto.ForgotPasswordRequest{Email: "links2@example.com"}, "links-acme")
-	require.Equal(t, fiber.StatusOK, status)
+	require.Equal(t, fiber.StatusNoContent, status)
 	require.True(t, h.sender.WaitFor(3, 2*time.Second))
 	secondReset := extractEmailLink(t, h.sender.Messages()[2])
 	assert.Equal(t, "links-acme", secondReset.Query().Get("tenant"))
 
-	status, body = h.postJSON(t, "/api/v1/auth/reset-password?tenant=default",
+	anotherPassword := strings.Join([]string{"Another", "password", "fixture"}, "-") + "-2026"
+	status, body = h.postJSON(t, "/api/v1/auth/password-resets/complete?tenant=default",
 		identitydto.ResetPasswordRequest{
 			Token:    secondReset.Query().Get("token"),
-			Password: "AnotherPassword1!2026",
+			Password: anotherPassword,
 		})
-	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	require.Equal(t, fiber.StatusNoContent, status, "body: %s", body)
 
 	var hash string
 	require.NoError(t, h.pool.QueryRow(context.Background(),
 		`SELECT password_hash FROM user_passwords WHERE user_id = $1`, h.user2ID,
 	).Scan(&hash))
-	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(hash), []byte("AnotherPassword1!2026")),
+	assert.True(t, identityservice.VerifyPasswordHash(hash, anotherPassword),
 		"the global password must be the reset one")
+
+	// The catalog still owns the CSRF code the cookie mode uses.
+	assert.NotEmpty(t, identitycatalog.CodeAuthCSRFFailed)
 }

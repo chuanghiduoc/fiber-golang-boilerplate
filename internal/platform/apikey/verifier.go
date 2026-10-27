@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -81,7 +83,7 @@ func NewVerifier(store Store, principals identitycontracts.PrincipalReader, opts
 // Expired, revoked, malformed, unknown, or rotation-grace-expired keys fail
 // with 401. A missing owner account or a non-active owning tenant fails with
 // 401 as well.
-func (v *Verifier) Verify(ctx context.Context, raw string, expectedTenantID int64) (Verified, error) {
+func (v *Verifier) Verify(ctx context.Context, raw string, expectedTenantID uuid.UUID) (Verified, error) {
 	if v == nil || v.store == nil {
 		return Verified{}, apperror.NewUnauthorized("invalid API key")
 	}
@@ -97,7 +99,7 @@ func (v *Verifier) Verify(ctx context.Context, raw string, expectedTenantID int6
 		return Verified{}, apperror.NewInternal("failed to verify API key")
 	}
 
-	if expectedTenantID != 0 && key.TenantID != expectedTenantID {
+	if expectedTenantID != uuid.Nil && key.TenantID != expectedTenantID {
 		return Verified{}, apperror.NewCode(apperror.CodePermissionDenied, "tenant mismatch")
 	}
 
@@ -170,7 +172,7 @@ func (v *Verifier) touchLastUsed(ctx context.Context, key Key, now time.Time) {
 	defer cancel()
 	if err := v.store.TouchLastUsed(touchCtx, key.ID, now); err != nil {
 		slog.Warn("failed to update API key last-used timestamp",
-			slog.Int64("api_key_id", key.ID),
+			slog.String("api_key_id", key.ID.String()),
 			slog.Any("error", err),
 		)
 	}

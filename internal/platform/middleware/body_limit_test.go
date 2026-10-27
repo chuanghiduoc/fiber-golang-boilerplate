@@ -100,7 +100,7 @@ func TestBodyLimit(t *testing.T) {
 			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
 				t.Fatalf("decode problem: %v", err)
 			}
-			if problem.Code != "payload_too_large" {
+			if problem.Code != "request.payload_too_large" {
 				t.Errorf("code = %q, want payload_too_large", problem.Code)
 			}
 		})
@@ -200,7 +200,7 @@ func TestBodyLimit_RejectsCompressedBodies(t *testing.T) {
 			if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
 				t.Fatalf("decode problem: %v", err)
 			}
-			if problem.Code != "unsupported_media_type" {
+			if problem.Code != "request.unsupported_media_type" {
 				t.Errorf("code = %q, want unsupported_media_type", problem.Code)
 			}
 		})

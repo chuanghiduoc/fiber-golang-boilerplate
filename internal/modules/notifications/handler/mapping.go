@@ -30,37 +30,22 @@ func toNotificationResponses(items []service.Notification) []dto.NotificationRes
 	return out
 }
 
-func toPreferenceResponse(p *service.Preference) *dto.PreferenceResponse {
+func toPreferenceResponse(p *service.Preference) *dto.NotificationPreferenceResponse {
 	if p == nil {
 		return nil
 	}
-	return &dto.PreferenceResponse{
-		ID:        p.ID,
-		TenantID:  p.TenantID,
-		UserID:    p.UserID,
+	return &dto.NotificationPreferenceResponse{
 		Type:      p.Type,
 		Channel:   p.Channel,
 		Enabled:   p.Enabled,
-		CreatedAt: p.CreatedAt,
 		UpdatedAt: p.UpdatedAt,
 	}
 }
 
-func toPreferenceResponses(items []service.Preference) []dto.PreferenceResponse {
-	out := make([]dto.PreferenceResponse, len(items))
+func toPreferenceResponses(items []service.Preference) []dto.NotificationPreferenceResponse {
+	out := make([]dto.NotificationPreferenceResponse, len(items))
 	for i := range items {
 		out[i] = *toPreferenceResponse(&items[i])
 	}
 	return out
-}
-
-func toPreferenceUpdate(req dto.UpdatePreferenceRequest) service.PreferenceUpdate {
-	return service.PreferenceUpdate{Type: req.Type, Channel: req.Channel, Enabled: req.Enabled}
-}
-
-func toSendNotificationResponse(result service.CreateResult) dto.SendNotificationResponse {
-	return dto.SendNotificationResponse{
-		Notification: toNotificationResponse(result.Notification),
-		EmailQueued:  result.EmailQueued,
-	}
 }

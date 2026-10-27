@@ -2,6 +2,7 @@ package authzhttp
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -21,7 +23,14 @@ func newTestApp() *fiber.App {
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
 		if role := c.Get("X-Test-Role"); role != "" {
-			fiber.Locals[string](c, "role", role)
+			// Mimic the session store: the effective permission set, never the
+			// role name alone, is what Require checks.
+			set := testCatalog.PermissionsForRole(role)
+			permissions := make([]authz.Permission, 0, len(set))
+			for permission := range set {
+				permissions = append(permissions, permission)
+			}
+			SetSubject(c, authz.NewSubjectWithPermissions(uuid.Nil, uuid.Nil, role, permissions...))
 		}
 		return c.Next()
 	})
@@ -207,7 +216,7 @@ func TestRequire_UsesExplicitSubjectScopes(t *testing.T) {
 	app.Use(func(c fiber.Ctx) error {
 		// An administrator's API key limited to files:read must not inherit the
 		// administrator role catalog.
-		SetSubject(c, authz.NewSubjectWithPermissions(1, 1, authz.RoleAdmin, testPermissionRead))
+		SetSubject(c, authz.NewSubjectWithPermissions(testID(1), testID(1), authz.RoleAdmin, testPermissionRead))
 		return c.Next()
 	})
 	app.Get("/files", Require(testPermissionRead), func(c fiber.Ctx) error { return c.SendString("ok") })
@@ -232,6 +241,8 @@ func TestRequireMFA(t *testing.T) {
 		"no amr":                   {want: fiber.StatusForbidden},
 		"totp fresh":               {amr: []string{"pwd", "otp"}, verifiedAt: fresh, want: fiber.StatusOK},
 		"recovery code fresh":      {amr: []string{"google", "rc"}, verifiedAt: fresh, want: fiber.StatusOK},
+		"passkey hardware fresh":   {amr: []string{"hwk"}, verifiedAt: fresh, want: fiber.StatusOK},
+		"passkey software fresh":   {amr: []string{"swk"}, verifiedAt: fresh, want: fiber.StatusOK},
 		"totp older than max age":  {amr: []string{"pwd", "otp"}, verifiedAt: fresh.Add(-13 * time.Hour), want: fiber.StatusForbidden},
 		"totp without a timestamp": {amr: []string{"pwd", "otp"}, want: fiber.StatusForbidden},
 	}
@@ -239,7 +250,7 @@ func TestRequireMFA(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 			app.Use(func(c fiber.Ctx) error {
-				SetSubject(c, authz.NewSubject(1, 1, authz.RoleMember).
+				SetSubject(c, authz.NewSubject(testID(1), testID(1), authz.RoleMember).
 					WithAMR(tc.amr).
 					WithMFAVerifiedAt(tc.verifiedAt))
 				return c.Next()
@@ -268,4 +279,46 @@ func TestRequireMFADeniesAnonymous(t *testing.T) {
 	if status, _, body := doGet(t, app, "/secure", ""); status != fiber.StatusForbidden {
 		t.Fatalf("status = %d, want 403 (body=%s)", status, body)
 	}
+}
+
+// TestRequirePasskeyMFA proves the platform gate cannot be satisfied by a
+// phishable TOTP or recovery code, only by a passkey.
+func TestRequirePasskeyMFA(t *testing.T) {
+	fresh := time.Now()
+	cases := map[string]struct {
+		amr        []string
+		verifiedAt time.Time
+		want       int
+	}{
+		"password only":          {amr: []string{"pwd"}, want: fiber.StatusForbidden},
+		"totp fresh":             {amr: []string{"pwd", "otp"}, verifiedAt: fresh, want: fiber.StatusForbidden},
+		"recovery code fresh":    {amr: []string{"google", "rc"}, verifiedAt: fresh, want: fiber.StatusForbidden},
+		"hardware passkey":       {amr: []string{"pwd", "hwk"}, verifiedAt: fresh, want: fiber.StatusOK},
+		"software passkey":       {amr: []string{"pwd", "swk"}, verifiedAt: fresh, want: fiber.StatusOK},
+		"stale hardware passkey": {amr: []string{"pwd", "hwk"}, verifiedAt: fresh.Add(-13 * time.Hour), want: fiber.StatusForbidden},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
+			app.Use(func(c fiber.Ctx) error {
+				SetSubject(c, authz.NewSubject(testID(1), testID(1), authz.RoleAdmin).
+					WithAMR(tc.amr).
+					WithMFAVerifiedAt(tc.verifiedAt))
+				return c.Next()
+			})
+			app.Get("/platform", RequirePasskeyMFA(12*time.Hour), func(c fiber.Ctx) error { return c.SendString("ok") })
+			status, _, body := doGet(t, app, "/platform", "")
+			if status != tc.want {
+				t.Fatalf("status = %d, want %d (body=%s)", status, tc.want, body)
+			}
+			if tc.want == fiber.StatusForbidden && !strings.Contains(string(body), string(apperror.CodeMFARequired)) {
+				t.Fatalf("body = %s, want code %q", body, apperror.CodeMFARequired)
+			}
+		})
+	}
+}
+
+// testID returns a deterministic UUID for a small fixture number.
+func testID(n int) uuid.UUID {
+	return uuid.MustParse(fmt.Sprintf("0192c9b0-7e4a-7000-8000-%012d", n))
 }

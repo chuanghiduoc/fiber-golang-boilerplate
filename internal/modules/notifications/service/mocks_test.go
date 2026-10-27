@@ -1,26 +1,28 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
+
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 // mockRepository mirrors the repository's tenant and user predicates. It is
 // intentionally in-memory so service tests exercise scoping without Docker.
 type mockRepository struct {
-	notifications map[int64]*Notification
+	notifications map[uuid.UUID]*Notification
 	prefs         map[string]*Preference
-	nextNotifID   int64
-	nextPrefID    int64
+	nextNotifID   int
 	failCreate    error
 	failList      error
 }
@@ -29,10 +31,9 @@ var _ NotificationRepository = (*mockRepository)(nil)
 
 func newMockRepository() *mockRepository {
 	return &mockRepository{
-		notifications: make(map[int64]*Notification),
+		notifications: make(map[uuid.UUID]*Notification),
 		prefs:         make(map[string]*Preference),
 		nextNotifID:   1,
-		nextPrefID:    1,
 	}
 }
 
@@ -45,8 +46,8 @@ func (m *mockRepository) Create(ctx context.Context, in NewNotification) (*Notif
 		_ = json.Unmarshal(in.Data, &data)
 	}
 	row := &Notification{
-		ID:        m.nextNotifID,
-		TenantID:  tenant.EffectiveID(ctx),
+		ID:        testID(m.nextNotifID),
+		TenantID:  tenant.IDFromContext(ctx),
 		UserID:    in.UserID,
 		Type:      in.Type,
 		Title:     in.Title,
@@ -59,7 +60,7 @@ func (m *mockRepository) Create(ctx context.Context, in NewNotification) (*Notif
 	return row, nil
 }
 
-func (m *mockRepository) GetByID(ctx context.Context, id, userID int64) (*Notification, error) {
+func (m *mockRepository) GetByID(ctx context.Context, id, userID uuid.UUID) (*Notification, error) {
 	row, ok := m.notifications[id]
 	if !ok || !m.scoped(ctx, row, userID) {
 		return nil, apperror.ErrNotFound
@@ -67,7 +68,7 @@ func (m *mockRepository) GetByID(ctx context.Context, id, userID int64) (*Notifi
 	return row, nil
 }
 
-func (m *mockRepository) ListCursor(ctx context.Context, userID int64, cur pagination.DBCursor, unreadOnly bool) ([]Notification, error) {
+func (m *mockRepository) ListCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor, unreadOnly bool) ([]Notification, error) {
 	if m.failList != nil {
 		return nil, m.failList
 	}
@@ -86,7 +87,7 @@ func (m *mockRepository) ListCursor(ctx context.Context, userID int64, cur pagin
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
-			return rows[i].ID > rows[j].ID
+			return bytes.Compare(rows[i].ID[:], rows[j].ID[:]) > 0
 		}
 		return rows[i].CreatedAt.After(rows[j].CreatedAt)
 	})
@@ -96,7 +97,7 @@ func (m *mockRepository) ListCursor(ctx context.Context, userID int64, cur pagin
 	return rows, nil
 }
 
-func (m *mockRepository) CountUnread(ctx context.Context, userID int64) (int64, error) {
+func (m *mockRepository) CountUnread(ctx context.Context, userID uuid.UUID) (int64, error) {
 	var count int64
 	for _, row := range m.notifications {
 		if m.scoped(ctx, row, userID) && row.ReadAt == nil {
@@ -106,7 +107,7 @@ func (m *mockRepository) CountUnread(ctx context.Context, userID int64) (int64, 
 	return count, nil
 }
 
-func (m *mockRepository) MarkRead(ctx context.Context, id, userID int64) (*Notification, error) {
+func (m *mockRepository) MarkRead(ctx context.Context, id, userID uuid.UUID) (*Notification, error) {
 	row, ok := m.notifications[id]
 	if !ok || !m.scoped(ctx, row, userID) {
 		return nil, apperror.ErrNotFound
@@ -118,7 +119,16 @@ func (m *mockRepository) MarkRead(ctx context.Context, id, userID int64) (*Notif
 	return row, nil
 }
 
-func (m *mockRepository) MarkAllRead(ctx context.Context, userID int64) (int64, error) {
+func (m *mockRepository) MarkUnread(ctx context.Context, id, userID uuid.UUID) (*Notification, error) {
+	row, ok := m.notifications[id]
+	if !ok || !m.scoped(ctx, row, userID) {
+		return nil, apperror.ErrNotFound
+	}
+	row.ReadAt = nil
+	return row, nil
+}
+
+func (m *mockRepository) MarkAllRead(ctx context.Context, userID uuid.UUID) (int64, error) {
 	var updated int64
 	for _, row := range m.notifications {
 		if m.scoped(ctx, row, userID) && row.ReadAt == nil {
@@ -130,18 +140,18 @@ func (m *mockRepository) MarkAllRead(ctx context.Context, userID int64) (int64, 
 	return updated, nil
 }
 
-func (m *mockRepository) GetPreference(ctx context.Context, userID int64, notificationType, channel string) (*Preference, error) {
-	row, ok := m.prefs[prefKey(tenant.EffectiveID(ctx), userID, notificationType, channel)]
+func (m *mockRepository) GetPreference(ctx context.Context, userID uuid.UUID, notificationType, channel string) (*Preference, error) {
+	row, ok := m.prefs[prefKey(tenant.IDFromContext(ctx), userID, notificationType, channel)]
 	if !ok {
 		return nil, apperror.ErrNotFound
 	}
 	return row, nil
 }
 
-func (m *mockRepository) ListPreferences(ctx context.Context, userID int64) ([]Preference, error) {
+func (m *mockRepository) ListPreferences(ctx context.Context, userID uuid.UUID) ([]Preference, error) {
 	rows := make([]Preference, 0, len(m.prefs))
 	for _, row := range m.prefs {
-		if row.TenantID == tenant.EffectiveID(ctx) && row.UserID == userID {
+		if row.TenantID == tenant.IDFromContext(ctx) && row.UserID == userID {
 			rows = append(rows, *row)
 		}
 	}
@@ -155,7 +165,7 @@ func (m *mockRepository) ListPreferences(ctx context.Context, userID int64) ([]P
 }
 
 func (m *mockRepository) UpsertPreference(ctx context.Context, in NewPreference) (*Preference, error) {
-	tenantID := tenant.EffectiveID(ctx)
+	tenantID := tenant.IDFromContext(ctx)
 	key := prefKey(tenantID, in.UserID, in.Type, in.Channel)
 	if row, ok := m.prefs[key]; ok {
 		row.Enabled = in.Enabled
@@ -164,7 +174,6 @@ func (m *mockRepository) UpsertPreference(ctx context.Context, in NewPreference)
 	}
 	now := time.Now().UTC()
 	row := &Preference{
-		ID:        m.nextPrefID,
 		TenantID:  tenantID,
 		UserID:    in.UserID,
 		Type:      in.Type,
@@ -174,16 +183,15 @@ func (m *mockRepository) UpsertPreference(ctx context.Context, in NewPreference)
 		UpdatedAt: now,
 	}
 	m.prefs[key] = row
-	m.nextPrefID++
 	return row, nil
 }
 
-func (m *mockRepository) scoped(ctx context.Context, row *Notification, userID int64) bool {
-	return row.TenantID == tenant.EffectiveID(ctx) && row.UserID == userID
+func (m *mockRepository) scoped(ctx context.Context, row *Notification, userID uuid.UUID) bool {
+	return row.TenantID == tenant.IDFromContext(ctx) && row.UserID == userID
 }
 
-func (m *mockRepository) snapshot() (notifs map[int64]Notification, prefs map[string]Preference) {
-	notifs = make(map[int64]Notification, len(m.notifications))
+func (m *mockRepository) snapshot() (notifs map[uuid.UUID]Notification, prefs map[string]Preference, nextNotifID int) {
+	notifs = make(map[uuid.UUID]Notification, len(m.notifications))
 	for id, row := range m.notifications {
 		notifs[id] = *row
 	}
@@ -191,27 +199,20 @@ func (m *mockRepository) snapshot() (notifs map[int64]Notification, prefs map[st
 	for key, row := range m.prefs {
 		prefs[key] = *row
 	}
-	return notifs, prefs
+	return notifs, prefs, m.nextNotifID
 }
 
-func (m *mockRepository) restore(notifs map[int64]Notification, prefs map[string]Preference) {
-	m.notifications = make(map[int64]*Notification, len(notifs))
-	m.nextNotifID = 1
+func (m *mockRepository) restore(notifs map[uuid.UUID]Notification, prefs map[string]Preference, nextNotifID int) {
+	m.notifications = make(map[uuid.UUID]*Notification, len(notifs))
+	m.nextNotifID = nextNotifID
 	for id, row := range notifs {
 		copyRow := row
 		m.notifications[id] = &copyRow
-		if id >= m.nextNotifID {
-			m.nextNotifID = id + 1
-		}
 	}
 	m.prefs = make(map[string]*Preference, len(prefs))
-	m.nextPrefID = 1
 	for key, row := range prefs {
 		copyRow := row
 		m.prefs[key] = &copyRow
-		if row.ID >= m.nextPrefID {
-			m.nextPrefID = row.ID + 1
-		}
 	}
 }
 
@@ -219,11 +220,11 @@ func beforeCursor(row *Notification, cur pagination.DBCursor) bool {
 	if row.CreatedAt.Before(cur.CreatedAt) {
 		return true
 	}
-	return row.CreatedAt.Equal(cur.CreatedAt) && row.ID < cur.ID
+	return row.CreatedAt.Equal(cur.CreatedAt) && bytes.Compare(row.ID[:], cur.ID[:]) < 0
 }
 
-func prefKey(tenantID, userID int64, notificationType, channel string) string {
-	return fmt.Sprintf("%d|%d|%s|%s", tenantID, userID, notificationType, channel)
+func prefKey(tenantID, userID uuid.UUID, notificationType, channel string) string {
+	return fmt.Sprintf("%s|%s|%s|%s", tenantID, userID, notificationType, channel)
 }
 
 // mockTransactor models transaction rollback without a database.
@@ -235,9 +236,9 @@ type mockTransactor struct {
 var _ Transactor = (*mockTransactor)(nil)
 
 func (m *mockTransactor) InTx(ctx context.Context, fn func(context.Context, TxRepos) error) error {
-	notifs, prefs := m.repo.snapshot()
+	notifs, prefs, nextNotifID := m.repo.snapshot()
 	if err := fn(ctx, TxRepos{Notifications: m.repo, Mail: txMail{sender: m.mail}}); err != nil {
-		m.repo.restore(notifs, prefs)
+		m.repo.restore(notifs, prefs, nextNotifID)
 		return err
 	}
 	return nil
@@ -271,11 +272,11 @@ func (m *mockEmailSender) Send(_ context.Context, msg email.Message) error {
 }
 
 type mockRecipientLookup struct {
-	recipients map[int64]identitycontracts.NotificationRecipient
+	recipients map[uuid.UUID]identitycontracts.NotificationRecipient
 	err        error
 }
 
-func (m *mockRecipientLookup) NotificationRecipient(_ context.Context, userID int64) (identitycontracts.NotificationRecipient, error) {
+func (m *mockRecipientLookup) NotificationRecipient(_ context.Context, userID uuid.UUID) (identitycontracts.NotificationRecipient, error) {
 	if m.err != nil {
 		return identitycontracts.NotificationRecipient{}, m.err
 	}

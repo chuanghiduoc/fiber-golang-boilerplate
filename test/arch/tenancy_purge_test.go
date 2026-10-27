@@ -3,7 +3,7 @@ package arch_test
 import (
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -58,7 +58,7 @@ func tablesWithTenantID(sql string) []string {
 			}
 		}
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 
@@ -71,7 +71,7 @@ func tablesWithTenantID(sql string) []string {
 func TestTenantOwnedTablesRegisterPurger(t *testing.T) {
 	root := repoRoot(t)
 	owners := migrationOwnerSet(t, root)
-	modules := productionBootstrap(t)
+	modules, _ := productionBootstrap(t)
 	registered := map[string]bool{}
 	for _, provider := range modules.Tenancy.Providers() {
 		registered[provider.Name] = true
@@ -113,7 +113,7 @@ func TestTenantOwnedTablesRegisterPurger(t *testing.T) {
 	}
 	for owner, tables := range tenantTables {
 		if !registered[owner] {
-			sort.Strings(tables)
+			slices.Sort(tables)
 			t.Errorf("module %q owns tenant tables %s but internal/bootstrap registers no tenancy.Purger for it",
 				owner, strings.Join(tables, ", "))
 		}

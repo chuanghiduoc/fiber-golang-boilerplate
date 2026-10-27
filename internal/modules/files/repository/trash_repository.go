@@ -5,9 +5,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // TrashRepository implements service.TrashRepository. It is the only files

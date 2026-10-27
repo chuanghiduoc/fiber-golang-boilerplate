@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -101,8 +101,8 @@ func TestModuleLayering(t *testing.T) {
 			stale = append(stale, key)
 		}
 	}
-	sort.Strings(fresh)
-	sort.Strings(stale)
+	slices.Sort(fresh)
+	slices.Sort(stale)
 	for _, v := range fresh {
 		t.Errorf("layering violation: %s", v)
 	}

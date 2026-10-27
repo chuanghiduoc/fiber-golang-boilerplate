@@ -7,15 +7,17 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Notification is the notifications module's cross-module view of a delivered
 // in-app notification. Email delivery is a side effect of creation and has no
 // contract representation.
 type Notification struct {
-	ID        int64
-	TenantID  int64
-	UserID    int64
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+	UserID    uuid.UUID
 	Type      string
 	Title     string
 	Body      string
@@ -31,8 +33,8 @@ type Notification struct {
 // Title and Body are user-visible. Data is optional JSON metadata (an object)
 // stored with the in-app row and never included in the email body.
 type CreateNotificationInput struct {
-	TenantID int64
-	UserID   int64
+	TenantID uuid.UUID
+	UserID   uuid.UUID
 	Type     string
 	Title    string
 	Body     string

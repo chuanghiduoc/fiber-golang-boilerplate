@@ -11,8 +11,8 @@ SELECT r.id, r.tenant_id, r.scope, r.key, r.name, r.created_at, r.updated_at,
        )::text[] AS permissions
 FROM roles r
 WHERE r.scope = 'tenant'
-  AND (r.tenant_id IS NULL OR r.tenant_id = @tenant_id::bigint)
-  AND (r.created_at, r.id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+  AND (r.tenant_id IS NULL OR r.tenant_id = @tenant_id::uuid)
+  AND (r.created_at, r.id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY r.created_at DESC, r.id DESC
 LIMIT @row_limit::int;
 
@@ -26,7 +26,7 @@ SELECT r.id, r.tenant_id, r.scope, r.key, r.name, r.created_at, r.updated_at,
        )::text[] AS permissions
 FROM roles r
 WHERE r.id = @id
-  AND (r.tenant_id IS NULL OR r.tenant_id = @tenant_id::bigint);
+  AND (r.tenant_id IS NULL OR r.tenant_id = @tenant_id::uuid);
 
 -- name: GetRoleByKey :one
 SELECT r.id, r.tenant_id, r.scope, r.key, r.name, r.created_at, r.updated_at,
@@ -39,7 +39,7 @@ SELECT r.id, r.tenant_id, r.scope, r.key, r.name, r.created_at, r.updated_at,
 FROM roles r
 WHERE r.key = @key
   AND r.scope = 'tenant'
-  AND (r.tenant_id IS NULL OR r.tenant_id = @tenant_id::bigint)
+  AND (r.tenant_id IS NULL OR r.tenant_id = @tenant_id::uuid)
 ORDER BY r.tenant_id NULLS FIRST
 LIMIT 1;
 
@@ -78,12 +78,12 @@ ORDER BY user_id;
 -- Serializes role replacement for one membership, so concurrent requests
 -- cannot delete each other's snapshot or leave a union of both role sets.
 SELECT pg_advisory_xact_lock(
-    hashtextextended('identity.membership_roles:' || @tenant_id::bigint, @user_id::bigint));
+    hashtextextended('identity.membership_roles:' || @tenant_id::uuid || ':' || @user_id::uuid, 0));
 
 -- name: DeleteMemberRolesExcept :exec
 DELETE FROM membership_roles
 WHERE tenant_id = @tenant_id AND user_id = @user_id
-  AND role_id <> ALL(@keep_role_ids::bigint[]);
+  AND role_id <> ALL(@keep_role_ids::uuid[]);
 
 -- name: DeleteMemberRoles :exec
 DELETE FROM membership_roles
@@ -131,7 +131,7 @@ RETURNING *;
 DELETE FROM roles
 WHERE id IN (
     SELECT id FROM roles
-    WHERE tenant_id = @tenant_id::bigint
+    WHERE tenant_id = @tenant_id::uuid
     LIMIT @batch_size::int
 );
 
@@ -142,7 +142,16 @@ WHERE id IN (
 SELECT r.key, mr.created_at
 FROM membership_roles mr
 JOIN roles r ON r.id = mr.role_id
-WHERE mr.tenant_id = @tenant_id::bigint
-  AND mr.user_id = @user_id::bigint
+WHERE mr.tenant_id = @tenant_id::uuid
+  AND mr.user_id = @user_id::uuid
   AND r.scope = 'tenant'
 ORDER BY mr.created_at, r.key;
+
+-- name: UpdateRoleIfUnchanged :one
+-- Renames a tenant role only while its updated_at still matches the ETag the
+-- caller read; a concurrent writer makes this return no rows (412).
+UPDATE roles
+SET name = @name
+WHERE id = @id AND tenant_id = @tenant_id
+  AND updated_at = @expected_updated_at
+RETURNING *;

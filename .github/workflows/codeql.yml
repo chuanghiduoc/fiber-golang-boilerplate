@@ -1,0 +1,59 @@
+name: CodeQL
+
+# Static analysis for Go on every push to the default branch, every pull
+# request, and weekly (so a new query pack or a newly disclosed pattern is
+# checked against unchanged code). Results are uploaded to GitHub code
+# scanning; the Security tab shows them, and the workflow fails when the
+# analysis itself fails (findings appear there, not as a test failure).
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Upload the SARIF result to code scanning.
+      security-events: write
+      # CodeQL downloads query packs from the GitHub container registry.
+      packages: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: go
+          # autobuild runs `go build ./...` for Go. Switch to `manual` with an
+          # explicit build step if the module ever needs tags or generated code
+          # before it compiles.
+          build-mode: autobuild
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: "/language:go"

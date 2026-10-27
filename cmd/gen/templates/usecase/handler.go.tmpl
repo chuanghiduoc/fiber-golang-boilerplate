@@ -3,14 +3,9 @@ package handler
 import (
 	"context"
 
-	"github.com/gofiber/fiber/v3"
-
 	{{.M.Ident}}dto "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/dto"
 	{{.M.Ident}}service "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/service"
-{{- if .U.IsCommand}}
-	"{{.M.ModulePath}}/internal/platform/httpx"
-{{- end}}
-	"{{.M.ModulePath}}/pkg/response"
+	"{{.M.ModulePath}}/internal/platform/httpapi"
 )
 
 // {{.U.Name}}UseCase is the service surface {{.U.Name}}HTTP needs;
@@ -28,37 +23,18 @@ type {{.U.Name}}HTTP struct {
 func New{{.U.Name}}HTTP(useCase {{.U.Name}}UseCase) *{{.U.Name}}HTTP {
 	return &{{.U.Name}}HTTP{useCase: useCase}
 }
-
-// Handle godoc
-// @Summary {{.U.Human}}
-// @Tags {{.M.Pascal}}
-{{- if .U.IsCommand}}
-// @Accept json
-{{- end}}
-// @Produce json
-// @Security BearerAuth
-// @Security ApiKeyAuth
-{{- if .U.IsCommand}}
-// @Param Idempotency-Key header string false "Idempotency key"
-// @Param request body {{.M.Ident}}dto.{{.U.Name}}Request true "{{.U.Human}}"
-{{- end}}
-// @Success 200 {object} {{.M.Ident}}dto.{{.U.Name}}Response
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 501 {object} apperror.ProblemDetails
-// @Router /{{.M.Route}}/{{.U.Route}} [{{if .U.IsCommand}}post{{else}}get{{end}}]
-func (h *{{.U.Name}}HTTP) Handle(c fiber.Ctx) error {
-{{- if .U.IsCommand}}
-	var req {{.M.Ident}}dto.{{.U.Name}}Request
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-{{- end}}
-	result, err := h.useCase.Handle(c.Context(), {{.M.Ident}}service.{{.U.Name}}Input{})
+{{if .U.IsCommand}}
+type {{.U.Camel}}Input struct {
+	Body {{.M.Ident}}dto.{{.U.Name}}Request
+}
+{{end}}
+// Handle runs the {{.U.Human}} {{.U.Kind}}.
+func (h *{{.U.Name}}HTTP) Handle(ctx context.Context{{if .U.IsCommand}}, in *{{.U.Camel}}Input{{else}}, _ *struct{}{{end}}) (*httpapi.Output[{{.M.Ident}}dto.{{.U.Name}}Response], error) {
+	result, err := h.useCase.Handle(ctx, {{.M.Ident}}service.{{.U.Name}}Input{})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return response.Success(c, to{{.U.Name}}Response(result))
+	return &httpapi.Output[{{.M.Ident}}dto.{{.U.Name}}Response]{Body: to{{.U.Name}}Response(result)}, nil
 }
 
 func to{{.U.Name}}Response({{.M.Ident}}service.{{.U.Name}}Result) {{.M.Ident}}dto.{{.U.Name}}Response {

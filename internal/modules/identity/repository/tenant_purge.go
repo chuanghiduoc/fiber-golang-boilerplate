@@ -5,10 +5,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/google/uuid"
 )
 
 // TenantPurgeRepository implements service.TenantPurgeRepository. The
@@ -40,15 +41,15 @@ func (r *TenantPurgeRepository) ListDeletedTenants(ctx context.Context, limit in
 	return tenants, nil
 }
 
-func (r *TenantPurgeRepository) ListDueDeletionTenantIDs(ctx context.Context, limit int32) ([]int64, error) {
+func (r *TenantPurgeRepository) ListDueDeletionTenantIDs(ctx context.Context, limit int32) ([]uuid.UUID, error) {
 	return identitysqlc.New(r.db).ListDueDeletionTenantIDs(ctx, limit)
 }
 
-func (r *TenantPurgeRepository) ListExpiredTrialTenantIDs(ctx context.Context, limit int32) ([]int64, error) {
+func (r *TenantPurgeRepository) ListExpiredTrialTenantIDs(ctx context.Context, limit int32) ([]uuid.UUID, error) {
 	return identitysqlc.New(r.db).ListExpiredTrialTenantIDs(ctx, limit)
 }
 
-func (r *TenantPurgeRepository) ListMembershipUserIDs(ctx context.Context, tenantID, afterUserID int64, limit int32) ([]int64, error) {
+func (r *TenantPurgeRepository) ListMembershipUserIDs(ctx context.Context, tenantID, afterUserID uuid.UUID, limit int32) ([]uuid.UUID, error) {
 	return identitysqlc.New(r.db).ListTenantMembershipUserIDs(ctx, identitysqlc.ListTenantMembershipUserIDsParams{
 		TenantID:    tenantID,
 		AfterUserID: afterUserID,
@@ -56,7 +57,7 @@ func (r *TenantPurgeRepository) ListMembershipUserIDs(ctx context.Context, tenan
 	})
 }
 
-func (r *TenantPurgeRepository) ListDataExports(ctx context.Context, tenantID int64, limit int32) ([]identityservice.DataExport, error) {
+func (r *TenantPurgeRepository) ListDataExports(ctx context.Context, tenantID uuid.UUID, limit int32) ([]identityservice.DataExport, error) {
 	rows, err := identitysqlc.New(r.db).ListTenantDataExportsForPurge(ctx, identitysqlc.ListTenantDataExportsForPurgeParams{
 		TenantID:  tenantID,
 		BatchSize: limit,
@@ -75,7 +76,7 @@ func (r *TenantPurgeRepository) ListDataExports(ctx context.Context, tenantID in
 	return exports, nil
 }
 
-func (r *TenantPurgeRepository) DeleteDataExports(ctx context.Context, tenantID int64, ids []int64) error {
+func (r *TenantPurgeRepository) DeleteDataExports(ctx context.Context, tenantID uuid.UUID, ids []uuid.UUID) error {
 	_, err := identitysqlc.New(r.db).DeleteTenantDataExportsForPurge(ctx, identitysqlc.DeleteTenantDataExportsForPurgeParams{
 		TenantID: tenantID,
 		Ids:      ids,
@@ -83,54 +84,54 @@ func (r *TenantPurgeRepository) DeleteDataExports(ctx context.Context, tenantID 
 	return err
 }
 
-func (r *TenantPurgeRepository) DeleteMemberInvitations(ctx context.Context, tenantID, userID int64) (int64, error) {
+func (r *TenantPurgeRepository) DeleteMemberInvitations(ctx context.Context, tenantID, userID uuid.UUID) (int64, error) {
 	return identitysqlc.New(r.db).DeleteMemberInvitations(ctx, identitysqlc.DeleteMemberInvitationsParams{
 		TenantID: tenantID, UserID: userID,
 	})
 }
 
-func (r *TenantPurgeRepository) DeleteMembership(ctx context.Context, tenantID, userID int64) error {
+func (r *TenantPurgeRepository) DeleteMembership(ctx context.Context, tenantID, userID uuid.UUID) error {
 	_, err := identitysqlc.New(r.db).DeleteTenantMembership(ctx, identitysqlc.DeleteTenantMembershipParams{
 		TenantID: tenantID, UserID: userID,
 	})
 	return err
 }
 
-func (r *TenantPurgeRepository) AdvancePurgeCursor(ctx context.Context, tenantID, cursor int64) error {
+func (r *TenantPurgeRepository) AdvancePurgeCursor(ctx context.Context, tenantID, cursor uuid.UUID) error {
 	return identitysqlc.New(r.db).AdvanceTenantPurgeCursor(ctx, identitysqlc.AdvanceTenantPurgeCursorParams{
 		PurgeCursor: cursor, ID: tenantID,
 	})
 }
 
-func (r *TenantPurgeRepository) DeleteInvitationsBatch(ctx context.Context, tenantID int64, limit int32) (int64, error) {
+func (r *TenantPurgeRepository) DeleteInvitationsBatch(ctx context.Context, tenantID uuid.UUID, limit int32) (int64, error) {
 	return identitysqlc.New(r.db).DeleteTenantInvitationsBatch(ctx, identitysqlc.DeleteTenantInvitationsBatchParams{
 		TenantID:  tenantID,
 		BatchSize: limit,
 	})
 }
 
-func (r *TenantPurgeRepository) DeleteMembershipsBatch(ctx context.Context, tenantID int64, limit int32) (int64, error) {
+func (r *TenantPurgeRepository) DeleteMembershipsBatch(ctx context.Context, tenantID uuid.UUID, limit int32) (int64, error) {
 	return identitysqlc.New(r.db).DeleteTenantMembershipsBatch(ctx, identitysqlc.DeleteTenantMembershipsBatchParams{
 		TenantID:  tenantID,
 		BatchSize: limit,
 	})
 }
 
-func (r *TenantPurgeRepository) DeleteTenantRolesBatch(ctx context.Context, tenantID int64, limit int32) (int64, error) {
+func (r *TenantPurgeRepository) DeleteTenantRolesBatch(ctx context.Context, tenantID uuid.UUID, limit int32) (int64, error) {
 	return identitysqlc.New(r.db).DeleteTenantRolesBatch(ctx, identitysqlc.DeleteTenantRolesBatchParams{
 		TenantID:  tenantID,
 		BatchSize: limit,
 	})
 }
 
-func (r *TenantPurgeRepository) DeleteTenantSettings(ctx context.Context, tenantID int64) error {
+func (r *TenantPurgeRepository) DeleteTenantSettings(ctx context.Context, tenantID uuid.UUID) error {
 	_, err := identitysqlc.New(r.db).DeleteTenantSettings(ctx, tenantID)
 	return err
 }
 
 // MarkPurged stamps purged_at and writes the completion audit row in one
 // transaction. It reports false when another pass already marked the tenant.
-func (r *TenantPurgeRepository) MarkPurged(ctx context.Context, tenantID int64, event audit.Event) (bool, error) {
+func (r *TenantPurgeRepository) MarkPurged(ctx context.Context, tenantID uuid.UUID, event audit.Event) (bool, error) {
 	var marked bool
 	err := r.tx.WithTx(ctx, func(tx pgx.Tx) error {
 		rows, err := identitysqlc.New(tx).MarkTenantPurged(ctx, tenantID)

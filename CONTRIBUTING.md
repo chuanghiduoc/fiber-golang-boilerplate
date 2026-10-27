@@ -50,8 +50,8 @@ TEST_DATABASE_URL="postgres://${DB_USERNAME}:${DB_PASSWORD}@127.0.0.1:5432/appte
   go test -tags=integration -race -count=1 ./...
 ```
 
-Migrations, legacy upgrades, and adding a module are covered in
-[docs/operations.md](docs/operations.md#7-migrations-and-legacy-upgrade) and
+Migrations and adding a module are covered in
+[docs/operations.md](docs/operations.md#7-migrations) and
 [docs/module-template.md](docs/module-template.md).
 
 ## Changelog

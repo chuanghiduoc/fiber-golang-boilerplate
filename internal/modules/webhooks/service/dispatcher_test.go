@@ -8,70 +8,76 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
 type fakeDispatchStore struct {
-	endpoints  map[int64][]ActiveEndpoint
+	endpoints  map[uuid.UUID][]ActiveEndpoint
 	deliveries map[string]DeliveryDraft
 	callErr    error
 }
 
-func (f *fakeDispatchStore) ActiveEndpoints(_ context.Context, tenantID int64) ([]ActiveEndpoint, error) {
+func (f *fakeDispatchStore) ActiveEndpoints(_ context.Context, tenantID uuid.UUID) ([]ActiveEndpoint, error) {
 	if f.callErr != nil {
 		return nil, f.callErr
 	}
 	return f.endpoints[tenantID], nil
 }
 
-func (f *fakeDispatchStore) CreateDeliveryWithJob(_ context.Context, draft DeliveryDraft) (deliveryID int64, created bool, err error) {
+func (f *fakeDispatchStore) CreateDeliveryWithJob(_ context.Context, draft DeliveryDraft) (deliveryID uuid.UUID, created bool, err error) {
 	if f.callErr != nil {
-		return 0, false, f.callErr
+		return uuid.Nil, false, f.callErr
 	}
 	if f.deliveries == nil {
 		f.deliveries = make(map[string]DeliveryDraft)
 	}
-	key := fmt.Sprintf("%d/%d/%s", draft.TenantID, draft.EndpointID, draft.EventID)
+	key := deliveryKey(draft.TenantID, draft.EndpointID, draft.EventID)
 	if _, ok := f.deliveries[key]; ok {
-		return 0, false, nil
+		return uuid.Nil, false, nil
 	}
 	f.deliveries[key] = draft
-	return int64(len(f.deliveries)), true, nil
+	return testID(len(f.deliveries)), true, nil
 }
 
-func activeEndpoint(id, tenantID int64, patterns ...string) ActiveEndpoint {
+func deliveryKey(tenantID, endpointID, eventID uuid.UUID) string {
+	return fmt.Sprintf("%s/%s/%s", tenantID, endpointID, eventID)
+}
+
+func activeEndpoint(id, tenantID uuid.UUID, patterns ...string) ActiveEndpoint {
 	return ActiveEndpoint{
-		ID:               id,
-		TenantID:         tenantID,
-		URL:              fmt.Sprintf("https://receiver.example/%d", id),
-		EventTypes:       patterns,
-		MaxAttempts:      3,
-		TimeoutMS:        1000,
-		SecretCiphertext: "sealed",
+		ID:          id,
+		TenantID:    tenantID,
+		URL:         fmt.Sprintf("https://receiver.example/%s", id),
+		EventTypes:  patterns,
+		MaxAttempts: 3,
+		TimeoutMS:   1000,
+		SecretID:    testID(99),
 	}
 }
 
-func testEvent(id, eventType string, tenantID int64, occurredAt time.Time) events.Event {
+func testEvent(id uuid.UUID, eventType string, tenantID uuid.UUID, occurredAt time.Time) events.Event {
 	return events.Event{
 		ID:          id,
 		Type:        eventType,
 		DataVersion: 2,
 		OccurredAt:  occurredAt,
 		TenantID:    tenantID,
-		Actor:       events.UserActor(5),
+		Actor:       events.UserActor(testID(5)),
 		Data:        json.RawMessage(`{"fileId":7}`),
 	}
 }
 
 func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 	store := &fakeDispatchStore{
-		endpoints: map[int64][]ActiveEndpoint{
+		endpoints: map[uuid.UUID][]ActiveEndpoint{
 			tenant.DefaultID: {
-				activeEndpoint(1, tenant.DefaultID, "file.*"),
-				activeEndpoint(2, tenant.DefaultID, "file.uploaded"),
-				activeEndpoint(3, tenant.DefaultID, "user.registered"),
+				activeEndpoint(testID(1), tenant.DefaultID, "file.*"),
+				activeEndpoint(testID(2), tenant.DefaultID, "file.uploaded"),
+				activeEndpoint(testID(3), tenant.DefaultID, "user.registered"),
 			},
 		},
 	}
@@ -79,7 +85,7 @@ func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	dispatcher.now = func() time.Time { return now }
 
-	event := testEvent("evt_1", "file.uploaded", tenant.DefaultID, now)
+	event := testEvent(testID(11), "file.uploaded", tenant.DefaultID, now)
 	created, err := dispatcher.Dispatch(context.Background(), event)
 	if err != nil {
 		t.Fatalf("Dispatch(): %v", err)
@@ -87,26 +93,29 @@ func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 	if created != 2 {
 		t.Fatalf("created = %d, want 2", created)
 	}
-	for _, endpointID := range []int64{1, 2} {
-		draft, ok := store.deliveries[fmt.Sprintf("%d/%d/evt_1", tenant.DefaultID, endpointID)]
+	for _, endpointID := range []uuid.UUID{testID(1), testID(2)} {
+		draft, ok := store.deliveries[deliveryKey(tenant.DefaultID, endpointID, testID(11))]
 		if !ok {
-			t.Fatalf("missing delivery for endpoint %d", endpointID)
+			t.Fatalf("missing delivery for endpoint %s", endpointID)
 		}
 		if string(draft.Payload) != `{"fileId":7}` {
 			t.Errorf("payload = %s", draft.Payload)
 		}
 		// The whole envelope is stored, so the worker can rebuild it.
-		if draft.EventType != "file.uploaded" || draft.DataVersion != 2 || draft.ActorType != "user" || draft.ActorID != "5" {
+		if draft.EventType != "file.uploaded" || draft.DataVersion != 2 || draft.ActorType != "user" || draft.ActorID != testID(5).String() {
 			t.Errorf("envelope = %s v%d %s/%s", draft.EventType, draft.DataVersion, draft.ActorType, draft.ActorID)
 		}
 		if !draft.EventCreatedAt.Equal(now) {
 			t.Errorf("event time = %v", draft.EventCreatedAt)
 		}
-		if draft.URL != fmt.Sprintf("https://receiver.example/%d", endpointID) {
+		if draft.URL != fmt.Sprintf("https://receiver.example/%s", endpointID) {
 			t.Errorf("url = %s", draft.URL)
 		}
+		if draft.SecretID != testID(99) {
+			t.Errorf("secret id = %s, want the snapshot secret", draft.SecretID)
+		}
 	}
-	if _, ok := store.deliveries[fmt.Sprintf("%d/%d/evt_1", tenant.DefaultID, 3)]; ok {
+	if _, ok := store.deliveries[deliveryKey(tenant.DefaultID, testID(3), testID(11))]; ok {
 		t.Fatal("non-matching endpoint received a delivery")
 	}
 
@@ -122,34 +131,36 @@ func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 
 // The tenant comes from the envelope, never from the job context.
 func TestDispatcher_UsesEnvelopeTenant(t *testing.T) {
+	otherTenant := testID(42)
 	store := &fakeDispatchStore{
-		endpoints: map[int64][]ActiveEndpoint{
-			42: {activeEndpoint(9, 42, "*")},
-			1:  {activeEndpoint(10, 1, "*")},
+		endpoints: map[uuid.UUID][]ActiveEndpoint{
+			otherTenant:      {activeEndpoint(testID(9), otherTenant, "*")},
+			tenant.DefaultID: {activeEndpoint(testID(10), tenant.DefaultID, "*")},
 		},
 	}
 	dispatcher := NewDispatcher(store)
-	ctx := tenant.WithID(context.Background(), 1)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
-	created, err := dispatcher.Dispatch(ctx, testEvent("evt_t", "user.registered", 42, time.Now()))
+	created, err := dispatcher.Dispatch(ctx, testEvent(testID(12), "user.registered", otherTenant, time.Now()))
 	if err != nil || created != 1 {
 		t.Fatalf("Dispatch() = (%d, %v), want (1, nil)", created, err)
 	}
-	if _, ok := store.deliveries["42/9/evt_t"]; !ok {
+	if _, ok := store.deliveries[deliveryKey(otherTenant, testID(9), testID(12))]; !ok {
 		t.Fatalf("deliveries = %v, want endpoint 9 of tenant 42", store.deliveries)
 	}
 }
 
 func TestDispatcher_InvalidEventsArePermanent(t *testing.T) {
 	dispatcher := NewDispatcher(&fakeDispatchStore{})
-	valid := testEvent("evt_v", "file.uploaded", 1, time.Now())
+	valid := testEvent(testID(13), "file.uploaded", tenant.DefaultID, time.Now())
 
 	cases := map[string]func(*events.Event){
-		"no tenant":    func(e *events.Event) { e.TenantID = 0 },
-		"no id":        func(e *events.Event) { e.ID = "" },
-		"no actor":     func(e *events.Event) { e.Actor = events.Actor{} },
-		"pattern type": func(e *events.Event) { e.Type = "file.*" },
-		"no version":   func(e *events.Event) { e.DataVersion = 0 },
+		"no tenant":      func(e *events.Event) { e.TenantID = uuid.Nil },
+		"no id":          func(e *events.Event) { e.ID = uuid.Nil },
+		"no actor":       func(e *events.Event) { e.Actor = events.Actor{} },
+		"non-uuid actor": func(e *events.Event) { e.Actor = events.Actor{Type: events.ActorUser, ID: "api-key-name"} },
+		"pattern type":   func(e *events.Event) { e.Type = "file.*" },
+		"no version":     func(e *events.Event) { e.DataVersion = 0 },
 	}
 	for name, mutate := range cases {
 		event := valid

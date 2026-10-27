@@ -21,7 +21,7 @@ func toFileResponse(file *filesvc.File) dto.FileResponse {
 		DeletedAt:    file.DeletedAt,
 	}
 	if file.DeletedAt == nil {
-		resp.URL = fmt.Sprintf("/api/v1/files/%d/download", file.ID)
+		resp.URL = fmt.Sprintf("/api/v1/files/%s/content", file.ID)
 	}
 	return resp
 }

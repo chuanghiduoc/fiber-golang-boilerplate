@@ -11,15 +11,17 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Redis](https://img.shields.io/badge/Redis-8-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
-[![Swagger](https://img.shields.io/badge/Swagger-85EA2D?logo=swagger&logoColor=black)](https://swagger.io/)
+[![OpenAPI](https://img.shields.io/badge/OpenAPI-3.1-6BA539?logo=openapiinitiative&logoColor=white)](https://www.openapis.org/)
 [![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?logo=prometheus&logoColor=white)](https://prometheus.io/)
 
 </div>
 
-Production-minded REST API boilerplate built with Go Fiber v3, PostgreSQL, and sqlc.
+Production-minded REST API boilerplate built with Go, huma (OpenAPI 3.1), PostgreSQL, and sqlc.
 
 ## Features
 
+- **UUIDv7 identifiers** everywhere (PostgreSQL 18 `uuidv7()`, `uuid.NewV7()`
+  in Go), with no integer keys or sequences in the schema.
 - **Modular monolith** with layered modules (handler → service → repository →
   sqlc), stdlib-only cross-module contracts, and architecture tests that
   enforce the boundaries.
@@ -48,7 +50,7 @@ Production-minded REST API boilerplate built with Go Fiber v3, PostgreSQL, and s
 | Auth | JWT ([golang-jwt](https://github.com/golang-jwt/jwt)), Google OAuth 2.0, `Authorization: ApiKey` keys |
 | Validation | [go-playground/validator](https://github.com/go-playground/validator) |
 | Logging | `slog` (stdlib structured logging) |
-| API docs | Swagger/OpenAPI via [swaggo](https://github.com/swaggo/swag) |
+| API docs | [huma v2](https://huma.rocks/) OpenAPI 3.1 (`docs/openapi.yaml`) |
 | Lint | [golangci-lint v2](https://golangci-lint.run/) |
 | Cache | In-memory or Redis |
 | Storage | Local filesystem, AWS S3, or SeaweedFS (S3 gateway) |
@@ -100,7 +102,7 @@ flowchart TD
     F --> H["cmd/migrate<br/>applies the schema"]
     G --> I["Compose seed service<br/>creates the bootstrap admin"]
     H --> I
-    I --> J["Check /healthz, /readyz, /swagger"]
+    I --> J["Check /healthz, /readyz, /openapi.yaml"]
 ```
 
 ### 1. Create your project
@@ -159,7 +161,7 @@ make test-integration    # integration tests (testcontainers or TEST_DATABASE_UR
 make gen module=billing  # scaffold a module (also resource= / command= / query=)
 make migrate-create module=files name=add_x  # new UTC-timestamp migration
 make sqlc-generate       # regenerate every module's sqlc code
-make swagger             # regenerate OpenAPI docs (served at /swagger outside production)
+make openapi             # regenerate OpenAPI 3.1 (docs/openapi.yaml, /openapi.json)
 ```
 
 See the `Makefile` for the full list.

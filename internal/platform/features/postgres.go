@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -35,7 +36,7 @@ var _ Store = (*PostgresStore)(nil)
 func (s *PostgresStore) LoadSnapshot(ctx context.Context) (Snapshot, error) {
 	snapshot := Snapshot{
 		Flags:         make(map[Key]FlagState),
-		TenantTargets: make(map[Key]map[int64]bool),
+		TenantTargets: make(map[Key]map[uuid.UUID]bool),
 		UserTargets:   make(map[Key]map[UserTargetKey]bool),
 	}
 
@@ -76,8 +77,8 @@ func (s *PostgresStore) LoadSnapshot(ctx context.Context) (Snapshot, error) {
 	for targetRows.Next() {
 		var (
 			key      string
-			tenantID int64
-			userID   pgtype.Int8
+			tenantID uuid.UUID
+			userID   uuid.NullUUID
 			enabled  bool
 		)
 		if err := targetRows.Scan(&key, &tenantID, &userID, &enabled); err != nil {
@@ -90,12 +91,12 @@ func (s *PostgresStore) LoadSnapshot(ctx context.Context) (Snapshot, error) {
 			}
 			snapshot.UserTargets[flagKey][UserTargetKey{
 				TenantID: tenantID,
-				UserID:   userID.Int64,
+				UserID:   userID.UUID,
 			}] = enabled
 			continue
 		}
 		if snapshot.TenantTargets[flagKey] == nil {
-			snapshot.TenantTargets[flagKey] = make(map[int64]bool)
+			snapshot.TenantTargets[flagKey] = make(map[uuid.UUID]bool)
 		}
 		snapshot.TenantTargets[flagKey][tenantID] = enabled
 	}

@@ -69,6 +69,7 @@ type useCaseData struct {
 	Kind       string // command | query
 	IsCommand  bool
 	Name       string // IssueInvoice
+	Camel      string // issueInvoice
 	Snake      string // issue_invoice
 	Route      string // issue-invoice
 	Human      string // Issue invoice
@@ -127,6 +128,7 @@ func newUseCaseData(kind, name string) useCaseData {
 		Kind:       kind,
 		IsCommand:  kind == kindCommand,
 		Name:       name,
+		Camel:      camel(snake),
 		Snake:      snake,
 		Route:      strings.ReplaceAll(snake, "_", "-"),
 		Human:      strings.ToUpper(human[:1]) + human[1:],

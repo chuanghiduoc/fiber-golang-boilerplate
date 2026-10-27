@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 const (
 	// TrashPurgeJobKind is the durable job that permanently removes files
-	// soft-deleted longer than FILES_TRASH_RETENTION_DAYS. The scheduler
+	// soft-deleted longer than FILES_TRASH_RETENTION. The scheduler
 	// enqueues it every TrashPurgeInterval (SCHEDULER_ENABLED must be true).
 	TrashPurgeJobKind = "files.trash.purge"
 	// TrashPurgeInterval is how often the trash is purged. A trashed file is
@@ -28,15 +30,15 @@ const (
 
 // TrashedFile is one purge candidate: a soft-deleted row and its blob.
 type TrashedFile struct {
-	ID          int64
-	TenantID    int64
+	ID          uuid.UUID
+	TenantID    uuid.UUID
 	StoragePath string
 }
 
 // TrashPurgeFunc removes the blobs of a claimed batch and returns the IDs whose
 // rows may now be hard-deleted and the IDs whose blob delete failed. A failed
 // row is deferred with a per-row backoff, so the rest of the batch continues.
-type TrashPurgeFunc func(ctx context.Context, batch []TrashedFile) (purgeIDs, failedIDs []int64, err error)
+type TrashPurgeFunc func(ctx context.Context, batch []TrashedFile) (purgeIDs, failedIDs []uuid.UUID, err error)
 
 // TrashRepository is the purge persistence port. Unlike FileRepository it is
 // not tenant-scoped: retention is a cross-tenant maintenance pass, and every
@@ -58,7 +60,7 @@ type TrashPurger struct {
 }
 
 // NewTrashPurger builds the purger. retentionDays is validated by config
-// (FILES_TRASH_RETENTION_DAYS, 1..3650).
+// (FILES_TRASH_RETENTION, 1..3650).
 func NewTrashPurger(repo TrashRepository, store storage.Storage, retentionDays int32) *TrashPurger {
 	return &TrashPurger{repo: repo, storage: store, retentionDays: retentionDays}
 }
@@ -84,7 +86,7 @@ func (p *TrashPurger) HandleJob(ctx context.Context, _ json.RawMessage) error {
 	for {
 		var claimed int
 		deleted, err := p.repo.PurgeBatch(budgetCtx, p.retentionDays, trashPurgeBatchSize,
-			func(ctx context.Context, batch []TrashedFile) ([]int64, []int64, error) {
+			func(ctx context.Context, batch []TrashedFile) ([]uuid.UUID, []uuid.UUID, error) {
 				claimed = len(batch)
 				ids, failed, err := p.deleteBlobs(ctx, batch)
 				failedTotal += int64(len(failed))
@@ -112,8 +114,8 @@ func (p *TrashPurger) HandleJob(ctx context.Context, _ json.RawMessage) error {
 // logged, counted, and returned so the repository can defer that row with a
 // retry time while the rest of the batch continues. Cancellation aborts the
 // batch before its hard delete.
-func (p *TrashPurger) deleteBlobs(ctx context.Context, batch []TrashedFile) (ids, failed []int64, err error) {
-	ids = make([]int64, 0, len(batch))
+func (p *TrashPurger) deleteBlobs(ctx context.Context, batch []TrashedFile) (ids, failed []uuid.UUID, err error) {
+	ids = make([]uuid.UUID, 0, len(batch))
 	for _, file := range batch {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
@@ -124,7 +126,7 @@ func (p *TrashPurger) deleteBlobs(ctx context.Context, batch []TrashedFile) (ids
 			}
 			failed = append(failed, file.ID)
 			slog.Error("failed to delete trashed file blob; the row is deferred for a later run",
-				slog.Int64("file_id", file.ID), slog.Int64("tenant_id", file.TenantID), slog.Any("error", err))
+				slog.String("file_id", file.ID.String()), slog.String("tenant_id", file.TenantID.String()), slog.Any("error", err))
 			continue
 		}
 		ids = append(ids, file.ID)

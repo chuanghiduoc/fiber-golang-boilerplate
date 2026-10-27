@@ -19,6 +19,16 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-body-size: "16m"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # Operations endpoints are not part of the public API. Exact-match
+    # locations take precedence over the "/" prefix location, so probes and
+    # scrapes can still reach the pod/Service directly while the internet sees
+    # 404. /metrics is bearer-token protected when METRICS_AUTH_TOKEN is set,
+    # but leaving it off the public Ingress removes the endpoint entirely.
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location = /healthz { return 404; }
+      location = /readyz { return 404; }
+      location = /health { return 404; }
+      location = /metrics { return 404; }
 spec:
   ingressClassName: nginx
   tls:

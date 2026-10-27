@@ -1,8 +1,8 @@
 package service
 
 import (
-	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -15,15 +15,15 @@ func TestRegister_RejectsPasswordContainingEmailLocalPart(t *testing.T) {
 	db := newMemDB()
 	svc := newTestUserService(db)
 
-	_, err := svc.Register(context.Background(), RegisterInput{
-		Email: "alice@example.com", Password: "alice-in-wonderland", Name: "Alice",
+	_, err := svc.Register(testTenantCtx(), RegisterInput{
+		Email: "alice@example.com", Password: strings.Join([]string{"alice", "fixture", "guess"}, "-"), Name: "Alice",
 	})
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) {
 		t.Fatalf("Register error = %v, want an AppError", err)
 	}
-	if appErr.Status != 422 {
-		t.Errorf("status = %d, want 422", appErr.Status)
+	if resolvedStatus(appErr) != 422 {
+		t.Errorf("status = %d, want 422", resolvedStatus(appErr))
 	}
 	if len(appErr.Errors) != 1 || appErr.Errors[0].Code != validator.CodePasswordFromEmail {
 		t.Errorf("field errors = %+v, want one %q", appErr.Errors, validator.CodePasswordFromEmail)

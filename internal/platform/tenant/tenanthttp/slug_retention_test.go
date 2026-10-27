@@ -5,12 +5,12 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -39,15 +39,15 @@ func (r *callCountingResolver) Resolve(_ context.Context, slug string) (tenant.T
 // a slug retained without copying is rewritten by the next request.
 func TestMiddlewareKeepAliveKeepsCachedSlugsStable(t *testing.T) {
 	backend := &callCountingResolver{tenants: map[string]tenant.Tenant{
-		"acme": {ID: 2, Slug: "acme"},
-		"beta": {ID: 3, Slug: "beta"},
+		"acme": {ID: testID(2), Slug: "acme"},
+		"beta": {ID: testID(3), Slug: "beta"},
 	}}
 	cached := tenant.NewCachedResolver(backend, time.Minute, time.Minute, 16)
 
 	app := fiber.New()
 	app.Use(Middleware(cached, tenant.DefaultSlug))
 	app.Get("/api/v1/ping", func(c fiber.Ctx) error {
-		return c.SendString(strconv.FormatInt(ID(c), 10) + ":" + Slug(c))
+		return c.SendString(ID(c).String() + ":" + Slug(c))
 	})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -59,7 +59,7 @@ func TestMiddlewareKeepAliveKeepsCachedSlugsStable(t *testing.T) {
 	t.Cleanup(transport.CloseIdleConnections)
 	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
 
-	want := map[string]string{"acme": "2:acme", "beta": "3:beta"}
+	want := map[string]string{"acme": testID(2).String() + ":acme", "beta": testID(3).String() + ":beta"}
 	for i, slug := range []string{"acme", "beta", "acme", "beta", "acme"} {
 		req, err := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/api/v1/ping", http.NoBody)
 		require.NoError(t, err)
@@ -76,7 +76,7 @@ func TestMiddlewareKeepAliveKeepsCachedSlugsStable(t *testing.T) {
 
 	// The cache keys must still be the original slugs: a key rewritten by a
 	// reused request buffer would miss here and reach the backend again.
-	for slug, id := range map[string]int64{"acme": 2, "beta": 3} {
+	for slug, id := range map[string]uuid.UUID{"acme": testID(2), "beta": testID(3)} {
 		got, err := cached.Resolve(context.Background(), slug)
 		require.NoError(t, err)
 		assert.Equal(t, id, got.ID, slug)

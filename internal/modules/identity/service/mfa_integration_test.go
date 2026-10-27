@@ -5,7 +5,6 @@ package service_test
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"net/url"
 	"strings"
 	"sync"
@@ -19,6 +18,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/totp"
+	"github.com/google/uuid"
 )
 
 // testSealer is a reversible test double for the data-encryption codec; the
@@ -35,9 +35,9 @@ func (testSealer) Open(p []byte) ([]byte, error) {
 	return []byte(strings.TrimPrefix(string(p), "sealed:")), nil
 }
 
-func enrollSecret(t *testing.T, e *env, userID int64) string {
+func enrollSecret(t *testing.T, e *env, userID uuid.UUID) string {
 	t.Helper()
-	enrollment, err := e.mfa.EnrollTOTP(tenant.WithID(context.Background(), tenant.DefaultID), userID, 0, mfaIntegrationPassword)
+	enrollment, err := e.mfa.EnrollTOTP(tenant.WithID(context.Background(), tenant.DefaultID), userID, uuid.Nil, mfaIntegrationPassword)
 	require.NoError(t, err)
 	u, err := url.Parse(enrollment.OtpauthURI)
 	require.NoError(t, err)
@@ -46,10 +46,10 @@ func enrollSecret(t *testing.T, e *env, userID int64) string {
 	return secret
 }
 
-func recoveryHash(code string) string {
+func recoveryHash(code string) []byte {
 	normalized := strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(code))
 	sum := sha256.Sum256([]byte(normalized))
-	return hex.EncodeToString(sum[:])
+	return sum[:]
 }
 
 // One RFC 6238 step may be consumed at most once, even by concurrent requests.
@@ -65,7 +65,7 @@ func TestMFAVerifyFailureIsPersistedInAudit(t *testing.T) {
 
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, code)
 	require.NoError(t, err)
 
 	challenge, err := e.mfa.BeginChallenge(ctx, user.UserID, service.AMRPassword)
@@ -74,7 +74,7 @@ func TestMFAVerifyFailureIsPersistedInAudit(t *testing.T) {
 	_, err = e.mfa.Verify(ctx, challenge, attempted)
 	require.Error(t, err)
 
-	var actorID int64
+	var actorID uuid.UUID
 	var actorType, reason string
 	require.NoError(t, e.pool.QueryRow(ctx,
 		`SELECT actor_id, actor_type, metadata->>'reason' FROM audit_events
@@ -100,7 +100,7 @@ func TestConsumeTOTPStep_ConcurrentUseSucceedsOnce(t *testing.T) {
 	t0 := time.Now()
 	code, err := totp.Code(secret, t0)
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, code)
 	require.NoError(t, err)
 
 	step := totp.Step(t0) + 1
@@ -128,7 +128,7 @@ func TestUseRecoveryCode_ConcurrentUseSucceedsOnce(t *testing.T) {
 	t0 := time.Now()
 	code, err := totp.Code(secret, t0)
 	require.NoError(t, err)
-	codes, err := e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+	codes, err := e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, code)
 	require.NoError(t, err)
 	require.Len(t, codes.RecoveryCodes, 10)
 
@@ -158,7 +158,7 @@ func TestMFAVerify_ConcurrentChallengeSucceedsOnce(t *testing.T) {
 	t0 := time.Now()
 	first, err := totp.Code(secret, t0)
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, first)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, first)
 	require.NoError(t, err)
 	// Confirmation used step(t0); the login uses the next step, still inside
 	// the +/-1 acceptance window.
@@ -181,7 +181,7 @@ func TestMFAVerify_ConcurrentChallengeSucceedsOnce(t *testing.T) {
 	wg.Wait()
 
 	succeeded := 0
-	var sessionID int64
+	var sessionID uuid.UUID
 	for i, err := range errs {
 		if err == nil {
 			succeeded++
@@ -189,7 +189,7 @@ func TestMFAVerify_ConcurrentChallengeSucceedsOnce(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, succeeded, "exactly one concurrent challenge verification may pass")
-	require.Positive(t, sessionID)
+	require.NotEqual(t, uuid.Nil, sessionID)
 
 	// The session records the full amr set; a refresh keeps it.
 	amr := scalar[[]string](t, e.pool, `SELECT amr FROM sessions WHERE id = $1`, sessionID)
@@ -213,7 +213,7 @@ func TestMFAConfirm_ConcurrentConfirmSucceedsOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, results[i] = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+			_, results[i] = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, code)
 		}()
 	}
 	wg.Wait()

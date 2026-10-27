@@ -14,9 +14,10 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
 
 const (
@@ -137,7 +138,7 @@ func (r idempotentRequest) serve() error {
 		}
 		return apperror.NewConflict(idempotencyInProgressError)
 	case lockUnavailable:
-		slog.Warn("idempotency lock unavailable; proceeding without a lock",
+		slog.WarnContext(r.c.Context(), "idempotency lock unavailable; proceeding without a lock",
 			slog.String("method", r.c.Method()),
 			slog.String("path", r.c.Path()),
 			slog.String("request_id", r.requestID()),
@@ -179,7 +180,7 @@ func (r idempotentRequest) claimLock(token []byte) lockClaim {
 	owner, readErr := r.cache.Get(ctx, r.lockKey)
 	switch {
 	case readErr != nil || len(owner) == 0:
-		slog.Warn("idempotency lock claim failed",
+		slog.WarnContext(r.c.Context(), "idempotency lock claim failed",
 			slog.String("request_id", r.requestID()),
 			slog.Any("error", err),
 			slog.Any("read_back_error", readErr),
@@ -205,7 +206,7 @@ func (r idempotentRequest) releaseLock(token []byte) {
 		err = r.cache.Delete(ctx, r.lockKey)
 	}
 	if err != nil {
-		slog.Warn("idempotency lock release failed; it will expire",
+		slog.WarnContext(r.c.Context(), "idempotency lock release failed; it will expire",
 			slog.String("request_id", r.requestID()),
 			slog.Any("error", err),
 		)
@@ -238,7 +239,7 @@ func (r idempotentRequest) runAndStore() error {
 		Body:     r.c.Response().Body(),
 	})
 	if err != nil {
-		slog.Warn("idempotency response encoding failed; not caching",
+		slog.WarnContext(r.c.Context(), "idempotency response encoding failed; not caching",
 			slog.String("request_id", r.requestID()),
 			slog.Any("error", err),
 		)
@@ -250,7 +251,7 @@ func (r idempotentRequest) runAndStore() error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.c.Context()), idempotencyCacheWriteTimeout)
 	defer cancel()
 	if err := r.cache.Set(ctx, r.responseKey, payload, idempotencyResponseTTL); err != nil {
-		slog.Warn("idempotency response cache failed; returning original response",
+		slog.WarnContext(r.c.Context(), "idempotency response cache failed; returning original response",
 			slog.String("request_id", r.requestID()),
 			slog.Any("error", err),
 		)
@@ -263,7 +264,7 @@ func (r idempotentRequest) loadResponse() (*cachedResponse, bool) {
 	defer cancel()
 	data, err := r.cache.Get(ctx, r.responseKey)
 	if err != nil {
-		slog.Warn("idempotency cache read failed; proceeding normally",
+		slog.WarnContext(r.c.Context(), "idempotency cache read failed; proceeding normally",
 			slog.String("request_id", r.requestID()),
 			slog.Any("error", err),
 		)
@@ -275,7 +276,7 @@ func (r idempotentRequest) loadResponse() (*cachedResponse, bool) {
 
 	var cached cachedResponse
 	if err := json.Unmarshal(data, &cached); err != nil {
-		slog.Warn("idempotency cache entry is invalid; proceeding normally",
+		slog.WarnContext(r.c.Context(), "idempotency cache entry is invalid; proceeding normally",
 			slog.String("request_id", r.requestID()),
 			slog.Any("error", err),
 		)
@@ -302,7 +303,7 @@ func (r idempotentRequest) replay(cached *cachedResponse) error {
 }
 
 func (r idempotentRequest) requestID() string {
-	return fiber.Locals[string](r.c, "request_id")
+	return requestctx.RequestID(r.c.Context())
 }
 
 func validIdempotencyKey(key string) bool {
@@ -331,6 +332,9 @@ func idempotencyBodyHash(c fiber.Ctx) string {
 		return ""
 	}
 	body := c.Body()
+	// Fiber streams the request body (StreamRequestBody) and Huma reads the
+	// stream, so restore it after hashing or the handler sees an empty body.
+	c.Request().SetBodyStream(bytes.NewReader(body), len(body))
 	if len(body) > idempotencyMaxBodyHashSize {
 		return ""
 	}
@@ -344,9 +348,9 @@ func idempotencyBodyHash(c fiber.Ctx) string {
 // is the security boundary; the slug is included for operator readability.
 // Authenticated routes are scoped by user ID; public routes fall back to the
 // client IP.
-func idempotencyScope(method, path string, tenantID int64, tenantSlug, identity, key string) string {
+func idempotencyScope(method, path string, tenantID uuid.UUID, tenantSlug, identity, key string) string {
 	return "idempotency:" + method + ":" + path +
-		":tenant=" + strconv.FormatInt(tenantID, 10) + ":" + tenantSlug +
+		":tenant=" + tenantID.String() + ":" + tenantSlug +
 		":" + identity + ":" + key
 }
 
@@ -377,8 +381,8 @@ func idempotencyRoutePath(c fiber.Ctx) string {
 }
 
 func idempotencyIdentity(c fiber.Ctx) string {
-	if userID := fiber.Locals[int64](c, "user_id"); userID != 0 {
-		return strconv.FormatInt(userID, 10)
+	if userID := requestctx.ActorID(c.Context()); userID != uuid.Nil {
+		return userID.String()
 	}
 	return c.IP()
 }

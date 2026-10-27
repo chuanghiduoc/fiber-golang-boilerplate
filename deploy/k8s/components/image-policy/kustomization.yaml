@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Enforcement side of the supply chain: the cluster refuses any image that is
+# not keyless-signed by this repository's release.yml on a v<semver> tag.
+# Requires sigstore policy-controller (or a compatible ClusterImagePolicy
+# implementation) installed with the admission webhook enabled.
+#
+# This is optional so a cluster without policy-controller can still deploy.
+# Enable it in the prereqs overlay (applied before any workload), and optionally
+# in the app overlay for GitOps drift:
+#
+#   components:
+#     - ../../components/image-policy
+#
+# Replace OWNER/REPO in clusterimagepolicy.yaml (lowercase, matching the GHCR
+# image) before enabling it. The deploy/k8s/examples/image-policy kustomization
+# builds base + this component so CI can render and validate it without
+# enabling enforcement.
+resources:
+  - clusterimagepolicy.yaml

@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	apikeyscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/catalog"
@@ -35,12 +36,19 @@ const (
 
 // Service is the API-key administration surface consumed by the HTTP handler.
 type Service interface {
-	Create(ctx context.Context, callerUserID int64, in CreateInput) (*CreatedKey, error)
+	Create(ctx context.Context, callerUserID uuid.UUID, in CreateInput) (*CreatedKey, error)
 	List(ctx context.Context, limit int, startingAfter string) ([]APIKey, bool, error)
-	Get(ctx context.Context, id int64) (*APIKey, error)
-	Update(ctx context.Context, id int64, in UpdateInput) (*APIKey, error)
-	Revoke(ctx context.Context, id int64) error
-	Rotate(ctx context.Context, callerUserID, id int64) (*RotatedKey, error)
+	ListOwnedBy(ctx context.Context, ownerID uuid.UUID, limit int, startingAfter string) ([]APIKey, bool, error)
+	ListForMember(ctx context.Context, memberID uuid.UUID, limit int, startingAfter string) ([]APIKey, bool, error)
+	Get(ctx context.Context, id uuid.UUID) (*APIKey, error)
+	GetOwnedBy(ctx context.Context, ownerID, id uuid.UUID) (*APIKey, error)
+	Update(ctx context.Context, id uuid.UUID, in UpdateInput) (*APIKey, error)
+	UpdateOwnedBy(ctx context.Context, ownerID, id uuid.UUID, in UpdateInput) (*APIKey, error)
+	UpdateForMember(ctx context.Context, memberID, id uuid.UUID, in UpdateInput) (*APIKey, error)
+	Revoke(ctx context.Context, id uuid.UUID) error
+	RevokeOwnedBy(ctx context.Context, ownerID, id uuid.UUID) error
+	RevokeForMember(ctx context.Context, memberID, id uuid.UUID) error
+	Rotate(ctx context.Context, callerUserID, id uuid.UUID) (*RotatedKey, error)
 }
 
 type service struct {
@@ -48,6 +56,7 @@ type service struct {
 	principals  identitycontracts.PrincipalReader
 	ranks       identitycontracts.MemberRankChecker
 	tx          Transactor
+	authorizer  authz.Authorizer
 	now         func() time.Time
 	maxLifetime time.Duration
 }
@@ -58,7 +67,7 @@ type service struct {
 // maxLifetime caps every newly issued key; a non-positive value falls back to
 // the documented default for tests and minimal deployments. ranks is identity's
 // member hierarchy; nil fails closed when a caller manages another member's key.
-func NewService(keys APIKeyRepository, principals identitycontracts.PrincipalReader, ranks identitycontracts.MemberRankChecker, tx Transactor, maxLifetime time.Duration) Service {
+func NewService(keys APIKeyRepository, principals identitycontracts.PrincipalReader, ranks identitycontracts.MemberRankChecker, tx Transactor, authorizer authz.Authorizer, maxLifetime time.Duration) Service {
 	if maxLifetime <= 0 {
 		maxLifetime = defaultMaxLifetime
 	}
@@ -67,6 +76,7 @@ func NewService(keys APIKeyRepository, principals identitycontracts.PrincipalRea
 		principals:  principals,
 		ranks:       ranks,
 		tx:          tx,
+		authorizer:  authorizer,
 		now:         time.Now,
 		maxLifetime: maxLifetime,
 	}
@@ -102,7 +112,7 @@ func (s *service) recordAudit(ctx context.Context, tx TxRepos, event *audit.Even
 // secret or its hash.
 func keyEvent(ctx context.Context, action string, key *APIKey, extra map[string]any) *audit.Event {
 	event := audit.NewServiceEvent(ctx, action, "api_key")
-	event.ResourceID = strconv.FormatInt(key.ID, 10)
+	event.ResourceID = key.ID.String()
 	scopes := make([]string, len(key.Scopes))
 	for i, scope := range key.Scopes {
 		scopes[i] = string(scope)
@@ -111,7 +121,7 @@ func keyEvent(ctx context.Context, action string, key *APIKey, extra map[string]
 	// "api_key"/"apikey"), otherwise the value is stored as "[redacted]".
 	metadata := map[string]any{
 		"name":        key.Name,
-		"ownerUserId": key.UserID,
+		"ownerUserId": key.UserID.String(),
 		"scopes":      scopes,
 	}
 	for k, v := range extra {
@@ -121,7 +131,7 @@ func keyEvent(ctx context.Context, action string, key *APIKey, extra map[string]
 	return &event
 }
 
-func (s *service) Create(ctx context.Context, callerUserID int64, in CreateInput) (*CreatedKey, error) {
+func (s *service) Create(ctx context.Context, callerUserID uuid.UUID, in CreateInput) (*CreatedKey, error) {
 	name, err := normalizeName(in.Name)
 	if err != nil {
 		return nil, err
@@ -132,7 +142,7 @@ func (s *service) Create(ctx context.Context, callerUserID int64, in CreateInput
 	// user who will act with it, so audience routes (/me/*) and the audit actor
 	// cannot be borrowed by creating a key for someone else.
 	ownerID := callerUserID
-	if ownerID <= 0 {
+	if ownerID == uuid.Nil {
 		return nil, apperror.NewBadRequest("authenticated user is required")
 	}
 
@@ -142,7 +152,7 @@ func (s *service) Create(ctx context.Context, callerUserID int64, in CreateInput
 	}
 	credentials, err := apikey.Generate()
 	if err != nil {
-		return nil, apperror.NewInternal("failed to generate API key")
+		return nil, apperror.Internal(err, "failed to generate API key")
 	}
 
 	var created *APIKey
@@ -153,7 +163,7 @@ func (s *service) Create(ctx context.Context, callerUserID int64, in CreateInput
 		if ownerErr != nil {
 			return nil, ownerErr
 		}
-		scopes, scopeErr := normalizeScopes(in.Scopes, principal)
+		scopes, scopeErr := s.normalizeScopes(in.Scopes, principal)
 		if scopeErr != nil {
 			return nil, scopeErr
 		}
@@ -172,7 +182,7 @@ func (s *service) Create(ctx context.Context, callerUserID int64, in CreateInput
 			if errors.Is(createErr, apperror.ErrNotFound) {
 				return nil, apperror.NewNotFound("user not found")
 			}
-			return nil, apperror.NewInternal("failed to create API key")
+			return nil, apperror.Internal(createErr, "failed to create API key")
 		}
 		created = key
 		return keyEvent(ctx, "api_key.created", key, nil), nil
@@ -191,23 +201,81 @@ func (s *service) List(ctx context.Context, limit int, startingAfter string) ([]
 	}
 	keys, err := s.keys.ListCursor(ctx, cur)
 	if err != nil {
-		return nil, false, apperror.NewInternal("failed to list API keys")
+		return nil, false, apperror.Internal(err, "failed to list API keys")
 	}
-	hasMore := len(keys) > pageSize
-	if hasMore {
-		keys = keys[:pageSize]
-	}
-	return keys, hasMore, nil
+	more := hasMore(keys, pageSize)
+	return page(keys, pageSize), more, nil
 }
 
-func (s *service) Get(ctx context.Context, id int64) (*APIKey, error) {
+// ListOwnedBy lists one member's keys. The route layer scopes the owner to the
+// authenticated caller for /me; the user id is part of the query predicate so a
+// caller can never page through another member's keys.
+func (s *service) ListOwnedBy(ctx context.Context, ownerID uuid.UUID, limit int, startingAfter string) ([]APIKey, bool, error) {
+	if ownerID == uuid.Nil {
+		return nil, false, apperror.NewBadRequest("authenticated user is required")
+	}
+	return s.listByUser(ctx, ownerID, limit, startingAfter)
+}
+
+// ListForMember lists another member's keys. The route's admin:api_keys:read
+// permission already restricts the caller to owner/admin; the user id is part
+// of the query so the page is scoped to the member on the path.
+func (s *service) ListForMember(ctx context.Context, memberID uuid.UUID, limit int, startingAfter string) ([]APIKey, bool, error) {
+	if memberID == uuid.Nil {
+		return nil, false, apperror.NewNotFound("user not found")
+	}
+	// Conceal an unknown, cross-tenant, or inactive member as not found instead
+	// of returning an empty page for an id the caller cannot address.
+	if _, err := s.loadPrincipal(ctx, memberID); err != nil {
+		return nil, false, err
+	}
+	return s.listByUser(ctx, memberID, limit, startingAfter)
+}
+
+func (s *service) listByUser(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]APIKey, bool, error) {
+	cur, pageSize, err := buildCursor(limit, startingAfter)
+	if err != nil {
+		return nil, false, err
+	}
+	keys, err := s.keys.ListByUserCursor(ctx, userID, cur)
+	if err != nil {
+		return nil, false, apperror.Internal(err, "failed to list API keys")
+	}
+	more := hasMore(keys, pageSize)
+	return page(keys, pageSize), more, nil
+}
+
+// page trims the extra row fetched to detect the next page.
+func page(keys []APIKey, pageSize int) []APIKey {
+	if len(keys) > pageSize {
+		return keys[:pageSize]
+	}
+	return keys
+}
+
+// hasMore reports whether the repository returned the look-ahead row.
+func hasMore(keys []APIKey, pageSize int) bool {
+	return len(keys) > pageSize
+}
+
+func (s *service) Get(ctx context.Context, id uuid.UUID) (*APIKey, error) {
 	return s.get(ctx, id)
 }
 
-func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey, error) {
-	if in.Name == nil && len(in.Scopes) == 0 {
-		return nil, apperror.NewBadRequest("at least one of name or scopes is required")
+// GetOwnedBy returns a key only when ownerID owns it. A key belonging to
+// another member is concealed as not found, never as forbidden.
+func (s *service) GetOwnedBy(ctx context.Context, ownerID, id uuid.UUID) (*APIKey, error) {
+	key, err := s.get(ctx, id)
+	if err != nil {
+		return nil, err
 	}
+	if key.UserID != ownerID {
+		return nil, apperror.NewNotFound("API key not found")
+	}
+	return key, nil
+}
+
+func (s *service) Update(ctx context.Context, id uuid.UUID, in UpdateInput) (*APIKey, error) {
 	existing, err := s.get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -219,11 +287,46 @@ func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey
 			return nil, err
 		}
 	}
+	return s.updateKey(ctx, existing, in, isOwner)
+}
+
+// UpdateOwnedBy updates the caller's own key. Ownership is checked before any
+// mutation, so the self-service route cannot reach another member's key even
+// when the caller holds api_keys:update.
+func (s *service) UpdateOwnedBy(ctx context.Context, ownerID, id uuid.UUID, in UpdateInput) (*APIKey, error) {
+	existing, err := s.GetOwnedBy(ctx, ownerID, id)
+	if err != nil {
+		return nil, err
+	}
+	return s.updateKey(ctx, existing, in, true)
+}
+
+// UpdateForMember updates another member's key after the member id on the path
+// and the caller's rank both allow it.
+func (s *service) UpdateForMember(ctx context.Context, memberID, id uuid.UUID, in UpdateInput) (*APIKey, error) {
+	existing, err := s.get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if existing.UserID != memberID {
+		return nil, apperror.NewNotFound("API key not found")
+	}
+	if err := s.ensureCanManageKey(ctx, existing); err != nil {
+		return nil, err
+	}
+	return s.updateKey(ctx, existing, in, false)
+}
+
+func (s *service) updateKey(ctx context.Context, existing *APIKey, in UpdateInput, isOwner bool) (*APIKey, error) {
+	if in.Name == nil && in.Scopes == nil {
+		return nil, apperror.NewBadRequest("at least one of name or scopes is required")
+	}
 	if existing.RevokedAt != nil {
 		return nil, apperror.NewConflict("API key has been revoked")
 	}
 
 	name := existing.Name
+	var err error
 	if in.Name != nil {
 		name, err = normalizeName(*in.Name)
 		if err != nil {
@@ -231,12 +334,12 @@ func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey
 		}
 	}
 	scopes := existing.Scopes
-	if len(in.Scopes) > 0 {
+	if in.Scopes != nil {
 		principal, err := s.loadPrincipal(ctx, existing.UserID)
 		if err != nil {
 			return nil, err
 		}
-		scopes, err = normalizeScopes(in.Scopes, principal)
+		scopes, err = s.normalizeScopes(in.Scopes, principal)
 		if err != nil {
 			return nil, err
 		}
@@ -254,12 +357,12 @@ func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey
 
 	var updated *APIKey
 	err = s.mutate(ctx, func(ctx context.Context, tx TxRepos) (*audit.Event, error) {
-		key, updateErr := tx.Keys.Update(ctx, id, name, scopes)
+		key, updateErr := tx.Keys.Update(ctx, existing.ID, name, scopes)
 		if updateErr != nil {
 			if errors.Is(updateErr, apperror.ErrNotFound) {
 				return nil, apperror.NewNotFound("API key not found")
 			}
-			return nil, apperror.NewInternal("failed to update API key")
+			return nil, apperror.Internal(updateErr, "failed to update API key")
 		}
 		updated = key
 		return keyEvent(ctx, "api_key.updated", key, nil), nil
@@ -270,7 +373,7 @@ func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey
 	return updated, nil
 }
 
-func (s *service) Revoke(ctx context.Context, id int64) error {
+func (s *service) Revoke(ctx context.Context, id uuid.UUID) error {
 	existing, err := s.get(ctx, id)
 	if err != nil {
 		return err
@@ -278,34 +381,63 @@ func (s *service) Revoke(ctx context.Context, id int64) error {
 	if err := s.ensureCanManageKey(ctx, existing); err != nil {
 		return err
 	}
+	return s.revoke(ctx, existing)
+}
+
+// RevokeOwnedBy revokes the caller's own key.
+func (s *service) RevokeOwnedBy(ctx context.Context, ownerID, id uuid.UUID) error {
+	existing, err := s.GetOwnedBy(ctx, ownerID, id)
+	if err != nil {
+		return err
+	}
+	return s.revoke(ctx, existing)
+}
+
+// RevokeForMember revokes another member's key after the member id on the path
+// and the caller's rank both allow it.
+func (s *service) RevokeForMember(ctx context.Context, memberID, id uuid.UUID) error {
+	existing, err := s.get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if existing.UserID != memberID {
+		return apperror.NewNotFound("API key not found")
+	}
+	if err := s.ensureCanManageKey(ctx, existing); err != nil {
+		return err
+	}
+	return s.revoke(ctx, existing)
+}
+
+func (s *service) revoke(ctx context.Context, existing *APIKey) error {
 	if existing.RevokedAt != nil {
 		// Revocation is idempotent and writes no second audit row.
 		return nil
 	}
 	return s.mutate(ctx, func(ctx context.Context, tx TxRepos) (*audit.Event, error) {
-		revoked, err := tx.Keys.Revoke(ctx, id)
+		revoked, err := tx.Keys.Revoke(ctx, existing.ID)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
 				// A concurrent revoke won the race; the outcome is the same.
-				current, getErr := tx.Keys.GetByID(ctx, id)
+				current, getErr := tx.Keys.GetByID(ctx, existing.ID)
 				if getErr != nil {
 					if errors.Is(getErr, apperror.ErrNotFound) {
 						return nil, apperror.NewNotFound("API key not found")
 					}
-					return nil, apperror.NewInternal("failed to revoke API key")
+					return nil, apperror.Internal(getErr, "failed to revoke API key")
 				}
 				if current.RevokedAt != nil {
 					return nil, nil
 				}
 				return nil, apperror.NewNotFound("API key not found")
 			}
-			return nil, apperror.NewInternal("failed to revoke API key")
+			return nil, apperror.Internal(err, "failed to revoke API key")
 		}
 		return keyEvent(ctx, "api_key.revoked", revoked, nil), nil
 	})
 }
 
-func (s *service) Rotate(ctx context.Context, callerUserID, id int64) (*RotatedKey, error) {
+func (s *service) Rotate(ctx context.Context, callerUserID, id uuid.UUID) (*RotatedKey, error) {
 	graceSeconds := int32(RotationGrace / time.Second)
 
 	var result *RotatedKey
@@ -316,11 +448,11 @@ func (s *service) Rotate(ctx context.Context, callerUserID, id int64) (*RotatedK
 		}
 		result = rotated
 		event := audit.NewServiceEvent(ctx, "api_key.rotated", "api_key")
-		event.ResourceID = strconv.FormatInt(rotated.PreviousKeyID, 10)
+		event.ResourceID = rotated.PreviousKeyID.String()
 		event.Metadata = map[string]any{
-			"successorId":           rotated.ID,
+			"successorId":           rotated.ID.String(),
 			"previousKeyValidUntil": rotated.PreviousKeyValidUntil,
-			"ownerUserId":           rotated.UserID,
+			"ownerUserId":           rotated.UserID.String(),
 		}
 		return &event, nil
 	})
@@ -330,13 +462,13 @@ func (s *service) Rotate(ctx context.Context, callerUserID, id int64) (*RotatedK
 	return result, nil
 }
 
-func (s *service) rotate(ctx context.Context, tx TxRepos, callerUserID, id int64, graceSeconds int32) (*RotatedKey, error) {
+func (s *service) rotate(ctx context.Context, tx TxRepos, callerUserID, id uuid.UUID, graceSeconds int32) (*RotatedKey, error) {
 	existing, err := tx.Keys.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("API key not found")
 		}
-		return nil, apperror.NewInternal("failed to rotate API key")
+		return nil, apperror.Internal(err, "failed to rotate API key")
 	}
 	// Rotation returns a fresh secret, so it is owner-only. Another member's
 	// key is concealed as not found (the list/revoke admin surface stays
@@ -353,7 +485,7 @@ func (s *service) rotate(ctx context.Context, tx TxRepos, callerUserID, id int64
 	}
 	// A key past its expiry is already unusable; a successor inheriting that
 	// expiry would be dead on arrival.
-	if existing.ExpiresAt != nil && !existing.ExpiresAt.After(s.now()) {
+	if !existing.ExpiresAt.After(s.now()) {
 		return nil, apperror.NewConflict("API key has expired")
 	}
 	if err := s.ensureOwnerCanRotate(ctx, tx, existing); err != nil {
@@ -373,12 +505,12 @@ func (s *service) rotate(ctx context.Context, tx TxRepos, callerUserID, id int64
 			// the conditional update.
 			return nil, apperror.NewConflict("API key was rotated or revoked concurrently")
 		}
-		return nil, apperror.NewInternal("failed to rotate API key")
+		return nil, apperror.Internal(err, "failed to rotate API key")
 	}
 
 	credentials, err := apikey.Generate()
 	if err != nil {
-		return nil, apperror.NewInternal("failed to generate API key")
+		return nil, apperror.Internal(err, "failed to generate API key")
 	}
 	created, err := tx.Keys.Create(ctx, NewKey{
 		UserID:    rotated.UserID,
@@ -389,7 +521,7 @@ func (s *service) rotate(ctx context.Context, tx TxRepos, callerUserID, id int64
 		ExpiresAt: s.rotationExpiry(rotated.ExpiresAt, s.now()),
 	})
 	if err != nil {
-		return nil, apperror.NewInternal("failed to create rotated API key")
+		return nil, apperror.Internal(err, "failed to create rotated API key")
 	}
 
 	validUntil := s.now().UTC().Add(RotationGrace)
@@ -403,13 +535,13 @@ func (s *service) rotate(ctx context.Context, tx TxRepos, callerUserID, id int64
 	}, nil
 }
 
-func (s *service) get(ctx context.Context, id int64) (*APIKey, error) {
+func (s *service) get(ctx context.Context, id uuid.UUID) (*APIKey, error) {
 	key, err := s.keys.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("API key not found")
 		}
-		return nil, apperror.NewInternal("failed to get API key")
+		return nil, apperror.Internal(err, "failed to get API key")
 	}
 	return key, nil
 }
@@ -438,7 +570,7 @@ func (s *service) ensureOwnerCanRotate(ctx context.Context, tx TxRepos, key *API
 // which a ban's UPDATE does not wait for; without this lock a key inserted
 // while its owner is being banned would survive the ban and come back to life
 // on unban. A wired reader that cannot lock fails closed.
-func (s *service) lockActiveOwner(ctx context.Context, tx TxRepos, userID int64) (identitycontracts.Principal, error) {
+func (s *service) lockActiveOwner(ctx context.Context, tx TxRepos, userID uuid.UUID) (identitycontracts.Principal, error) {
 	if s.principals == nil {
 		return s.loadPrincipal(ctx, userID)
 	}
@@ -446,18 +578,22 @@ func (s *service) lockActiveOwner(ctx context.Context, tx TxRepos, userID int64)
 		slog.Error("API key owner reader cannot lock the owner row; refusing the key write")
 		return identitycontracts.Principal{}, apperror.NewInternal("failed to load API key owner")
 	}
-	return s.checkPrincipal(ctx, userID, func(tenantID int64) (identitycontracts.Principal, error) {
+	return s.checkPrincipal(ctx, userID, func(tenantID uuid.UUID) (identitycontracts.Principal, error) {
 		return tx.Principals.LockPrincipal(ctx, tenantID, userID)
 	})
 }
 
-func (s *service) loadPrincipal(ctx context.Context, userID int64) (identitycontracts.Principal, error) {
+func (s *service) loadPrincipal(ctx context.Context, userID uuid.UUID) (identitycontracts.Principal, error) {
 	if s.principals == nil {
 		// Tests and minimal deployments may omit the identity adapter. Scope
 		// validation is then limited to the catalog; production always wires it.
-		return identitycontracts.Principal{ID: userID, TenantID: tenant.EffectiveID(ctx)}, nil
+		tenantID, err := tenant.Require(ctx)
+		if err != nil {
+			return identitycontracts.Principal{}, apperror.Internal(err, "tenant context is required")
+		}
+		return identitycontracts.Principal{ID: userID, TenantID: tenantID}, nil
 	}
-	return s.checkPrincipal(ctx, userID, func(tenantID int64) (identitycontracts.Principal, error) {
+	return s.checkPrincipal(ctx, userID, func(tenantID uuid.UUID) (identitycontracts.Principal, error) {
 		return s.principals.GetPrincipal(ctx, tenantID, userID)
 	})
 }
@@ -466,16 +602,19 @@ func (s *service) loadPrincipal(ctx context.Context, userID int64) (identitycont
 // inactive, or cross-tenant owner as 404 user not found.
 func (s *service) checkPrincipal(
 	ctx context.Context,
-	userID int64,
-	load func(tenantID int64) (identitycontracts.Principal, error),
+	userID uuid.UUID,
+	load func(tenantID uuid.UUID) (identitycontracts.Principal, error),
 ) (identitycontracts.Principal, error) {
-	tenantID := tenant.EffectiveID(ctx)
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return identitycontracts.Principal{}, apperror.Internal(err, "tenant context is required")
+	}
 	principal, err := load(tenantID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return identitycontracts.Principal{}, apperror.NewNotFound("user not found")
 		}
-		return identitycontracts.Principal{}, apperror.NewInternal("failed to load API key owner")
+		return identitycontracts.Principal{}, apperror.Internal(err, "failed to load API key owner")
 	}
 	if principal.ID != userID || principal.TenantID != tenantID {
 		return identitycontracts.Principal{}, apperror.NewNotFound("user not found")
@@ -501,8 +640,8 @@ func (s *service) ensureCanManageKey(ctx context.Context, key *APIKey) error {
 	}
 	if s.ranks == nil {
 		slog.Error("API-key management has no member rank checker; refusing a cross-member operation",
-			slog.Int64("key_id", key.ID),
-			slog.Int64("owner_user_id", key.UserID),
+			slog.String("key_id", key.ID.String()),
+			slog.String("owner_user_id", key.UserID.String()),
 		)
 		return apperror.NewInternal("failed to check API key owner rank")
 	}
@@ -524,7 +663,7 @@ func scopesSubset(candidate, allowed []authz.Permission) bool {
 	return true
 }
 
-func normalizeScopes(raw []string, principal identitycontracts.Principal) ([]authz.Permission, error) {
+func (s *service) normalizeScopes(raw []string, principal identitycontracts.Principal) ([]authz.Permission, error) {
 	if len(raw) == 0 {
 		return nil, apperror.NewBadRequest("at least one scope is required")
 	}
@@ -539,10 +678,10 @@ func normalizeScopes(raw []string, principal identitycontracts.Principal) ([]aut
 			return nil, apperror.NewBadRequest("scopes must not contain empty values")
 		}
 		permission := authz.Permission(value)
-		if !authz.IsKnownPermission(permission) {
+		if !s.authorizer.IsKnownPermission(permission) {
 			return nil, apperror.NewBadRequest(fmt.Sprintf("unknown scope %q", value))
 		}
-		if !ownerHasPermission(principal, permission) {
+		if !s.ownerHasPermission(principal, permission) {
 			return nil, apperror.NewBadRequest(fmt.Sprintf("scope %q is not granted to the key owner", value))
 		}
 		if _, ok := seen[permission]; ok {
@@ -555,9 +694,9 @@ func normalizeScopes(raw []string, principal identitycontracts.Principal) ([]aut
 	return scopes, nil
 }
 
-func ownerHasPermission(principal identitycontracts.Principal, permission authz.Permission) bool {
+func (s *service) ownerHasPermission(principal identitycontracts.Principal, permission authz.Permission) bool {
 	if principal.Permissions == nil {
-		return principal.Role == "" || authz.Has(principal.Role, permission)
+		return principal.Role == "" || s.authorizer.Has(principal.Role, permission)
 	}
 	for _, granted := range principal.Permissions {
 		if granted == string(permission) {
@@ -598,32 +737,31 @@ func ensureCallerCanGrant(ctx context.Context, scopes []authz.Permission) error 
 
 // expiry applies APIKEYS_MAX_LIFETIME to a new key: an omitted expiresAt
 // becomes now + max, a later one is rejected, and an earlier one is preserved.
-func (s *service) expiry(requested *time.Time, now time.Time) (*time.Time, error) {
+func (s *service) expiry(requested *time.Time, now time.Time) (time.Time, error) {
 	now = now.UTC()
 	latest := now.Add(s.maxLifetime)
 	if requested == nil {
-		return &latest, nil
+		return latest, nil
 	}
 	value := requested.UTC()
 	if !value.After(now) {
-		return nil, apperror.NewBadRequest("expiresAt must be in the future")
+		return time.Time{}, apperror.NewBadRequest("expiresAt must be in the future")
 	}
 	if value.After(latest) {
-		return nil, apperror.NewCode(apikeyscatalog.CodeAPIKeyExpiryExceedsMaxLifetime,
+		return time.Time{}, apperror.NewCode(apikeyscatalog.CodeAPIKeyExpiryExceedsMaxLifetime,
 			"expiresAt exceeds APIKEYS_MAX_LIFETIME")
 	}
-	return &value, nil
+	return value, nil
 }
 
 // rotationExpiry never extends a successor beyond the original key's expiry or
-// the configured maximum. A legacy key with NULL expiry gets now + max.
-func (s *service) rotationExpiry(original *time.Time, now time.Time) *time.Time {
+// the configured maximum.
+func (s *service) rotationExpiry(original, now time.Time) time.Time {
 	latest := now.UTC().Add(s.maxLifetime)
-	if original == nil || original.After(latest) {
-		return &latest
+	if original.IsZero() || original.After(latest) {
+		return latest
 	}
-	value := original.UTC()
-	return &value
+	return original.UTC()
 }
 
 func buildCursor(limit int, startingAfter string) (cur pagination.DBCursor, pageSize int, err error) {

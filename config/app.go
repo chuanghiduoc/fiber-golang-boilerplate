@@ -52,14 +52,14 @@ type AppConfig struct {
 	// (ShutdownBudget - ShutdownReserve) so an in-flight request, including its
 	// audit and idempotency bookkeeping, finishes before the process stops
 	// waiting for it.
-	RequestTimeout           int    `env:"APP_REQUEST_TIMEOUT" envDefault:"12"` // seconds
-	FrontendURL              string `env:"APP_FRONTEND_URL" envDefault:"http://localhost:3000"`
-	RequireEmailVerification bool   `env:"REQUIRE_EMAIL_VERIFICATION" envDefault:"false"`
+	RequestTimeout           time.Duration `env:"APP_REQUEST_TIMEOUT" envDefault:"12s"`
+	FrontendURL              string        `env:"APP_FRONTEND_URL" envDefault:"http://localhost:3000"`
+	RequireEmailVerification bool          `env:"REQUIRE_EMAIL_VERIFICATION" envDefault:"false"`
 	// TrustProxy enables reading the client IP from ProxyHeader only when the
 	// direct peer is in TrustedProxies. Required for correct rate limiting
 	// behind a reverse proxy; leaving it off prevents X-Forwarded-For spoofing.
-	TrustProxy     bool   `env:"APP_TRUST_PROXY" envDefault:"false"`
-	TrustedProxies string `env:"APP_TRUSTED_PROXIES"` // comma-separated IPs or CIDR ranges
+	TrustProxy     bool     `env:"APP_TRUST_PROXY" envDefault:"false"`
+	TrustedProxies []string `env:"APP_TRUSTED_PROXIES" envSeparator:","`
 	// MetricsAuthToken, when set, requires a matching Bearer token to access
 	// the /metrics endpoint. Leave empty to keep /metrics open (local/dev only).
 	MetricsAuthToken string `env:"METRICS_AUTH_TOKEN"`
@@ -83,17 +83,17 @@ const (
 // release (1s). It mirrors app.PostHandlerBudget, which config cannot import.
 const PostHandlerReserve = 3 * time.Second
 
-// MaxRequestTimeoutSeconds is the largest APP_REQUEST_TIMEOUT that still lets
-// an in-flight request, with its post-handler work, finish inside the
-// shutdown drain window.
-const MaxRequestTimeoutSeconds = int((ShutdownBudget - ShutdownReserve - PostHandlerReserve) / time.Second)
+// MaxRequestTimeout is the largest APP_REQUEST_TIMEOUT that still lets an
+// in-flight request, with its post-handler work, finish inside the shutdown
+// drain window.
+const MaxRequestTimeout = ShutdownBudget - ShutdownReserve - PostHandlerReserve
 
 // DefaultJSONBodyLimit is the APP_JSON_BODY_LIMIT default (1 MiB).
 const DefaultJSONBodyLimit = 1 << 20
 
 // TrustedProxiesList returns the parsed list of trusted proxy IPs/CIDRs.
 func (a AppConfig) TrustedProxiesList() []string {
-	return splitCSV(a.TrustedProxies)
+	return trimmedList(a.TrustedProxies)
 }
 
 // EffectiveJSONBodyLimit returns JSONBodyLimit, or the 1 MiB default for a
@@ -127,12 +127,6 @@ func (a AppConfig) RunsWorker() bool {
 	return a.EffectiveRole() != RoleAPI
 }
 
-// usesSampleSecrets reports whether the environment may run with the public
-// sample JWT secret and admin password (local and test only).
-func usesSampleSecrets(appEnv string) bool {
-	return appEnv == envLocal || appEnv == envTest
-}
-
 // validateAppEnv rejects unknown APP_ENV values. normalized is the value
 // compared; raw is echoed in the error so the operator sees what they set.
 func validateAppEnv(normalized, raw string) error {
@@ -157,12 +151,12 @@ func (a AppConfig) validate() error {
 	default:
 		return fmt.Errorf("APP_ROLE must be one of: all, api, worker (got %q)", a.Role)
 	}
-	if a.RequestTimeout < 1 {
-		return fmt.Errorf("APP_REQUEST_TIMEOUT must be at least 1 second")
+	if a.RequestTimeout < time.Second {
+		return fmt.Errorf("APP_REQUEST_TIMEOUT must be at least 1s")
 	}
-	if a.RequestTimeout > MaxRequestTimeoutSeconds {
-		return fmt.Errorf("APP_REQUEST_TIMEOUT (%d) must be at most %d seconds so in-flight requests finish within the shutdown budget",
-			a.RequestTimeout, MaxRequestTimeoutSeconds)
+	if a.RequestTimeout > MaxRequestTimeout {
+		return fmt.Errorf("APP_REQUEST_TIMEOUT (%s) must be at most %s so in-flight requests finish within the shutdown budget",
+			a.RequestTimeout, MaxRequestTimeout)
 	}
 	if a.FrontendURL != "" && !isAbsoluteHTTPURL(a.FrontendURL) {
 		return fmt.Errorf("APP_FRONTEND_URL must be an absolute http(s) URL")

@@ -26,11 +26,11 @@ RETURNING id, tenant_id, storage_path;
 UPDATE files
 SET purge_attempts = purge_attempts + 1,
     purge_retry_after = now() + make_interval(hours => LEAST(24, 1 << LEAST(purge_attempts, 5)))
-WHERE id = ANY(@ids::bigint[])
+WHERE id = ANY(@ids::uuid[])
   AND purge_started_at IS NOT NULL;
 
 -- name: HardDeleteTrashedFiles :execrows
 DELETE FROM files
-WHERE id = ANY(@ids::bigint[])
+WHERE id = ANY(@ids::uuid[])
   AND deleted_at IS NOT NULL
   AND purge_started_at IS NOT NULL;

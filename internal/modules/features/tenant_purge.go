@@ -4,11 +4,11 @@ import (
 	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 )
 
-// RegisterTenantPurge contributes features' tenant-wide purger to the tenancy
-// registry. The composition root calls it once after Build.
-func (m *Module) RegisterTenantPurge(registry *tenancycontracts.Registry) {
+// TenantPurgers contributes features' tenant-wide purger to the composition
+// root's tenancy registry.
+func (m *Module) TenantPurgers() []tenancycontracts.Provider {
 	if m.tenantPurger == nil {
-		return
+		return nil
 	}
-	registry.Register(tenancycontracts.Provider{Name: "features", Purger: m.tenantPurger})
+	return []tenancycontracts.Provider{{Name: "features", Purger: m.tenantPurger}}
 }

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 var (
@@ -57,14 +59,14 @@ func ParseCatchup(value string) (CatchupPolicy, error) {
 
 // Spec declares one schedule. Exactly one of Interval or Cron must be set.
 // Interval schedules align to Unix epoch boundaries; Cron expressions are
-// standard 5-field expressions evaluated in UTC. A zero TenantID lets the
-// queue resolve the context tenant (default 1) when the job is inserted.
+// standard 5-field expressions evaluated in UTC. A nil TenantID lets the
+// queue resolve the context tenant when the job is inserted.
 type Spec struct {
 	Name        string
 	Interval    time.Duration
 	Cron        string
 	Kind        string
-	TenantID    int64
+	TenantID    uuid.UUID
 	Payload     json.RawMessage
 	MaxAttempts int
 }
@@ -76,9 +78,6 @@ func (s Spec) Validate() error {
 	}
 	if !namePattern.MatchString(strings.TrimSpace(s.Kind)) {
 		return fmt.Errorf("%w: job kind %q must match %s", ErrInvalidSchedule, s.Kind, namePattern)
-	}
-	if s.TenantID < 0 {
-		return fmt.Errorf("%w: tenant id must not be negative", ErrInvalidSchedule)
 	}
 	if s.MaxAttempts < 0 {
 		return fmt.Errorf("%w: max attempts must not be negative", ErrInvalidSchedule)

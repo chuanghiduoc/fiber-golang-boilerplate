@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
@@ -66,7 +67,7 @@ func (s *OrphanSweeper) HandleJob(ctx context.Context, _ json.RawMessage) error 
 		return fmt.Errorf("files: list storage objects: %w", err)
 	}
 	cutoff := s.now().Add(-orphanSweepGrace)
-	byTenant := make(map[int64][]string)
+	byTenant := make(map[uuid.UUID][]string)
 	for _, object := range objects {
 		if !object.ModifiedAt.Before(cutoff) {
 			continue
@@ -84,7 +85,7 @@ func (s *OrphanSweeper) HandleJob(ctx context.Context, _ json.RawMessage) error 
 			end := min(start+orphanSweepLookupBatch, len(paths))
 			existing, err := s.lookup.ExistingStoragePaths(tenant.WithID(ctx, tenantID), paths[start:end])
 			if err != nil {
-				return fmt.Errorf("files: check orphan candidates for tenant %d: %w", tenantID, err)
+				return fmt.Errorf("files: check orphan candidates for tenant %s: %w", tenantID, err)
 			}
 			for _, path := range paths[start:end] {
 				if _, ok := existing[path]; ok {
@@ -97,7 +98,7 @@ func (s *OrphanSweeper) HandleJob(ctx context.Context, _ json.RawMessage) error 
 				attempted++
 				if err := s.storage.Delete(ctx, path); err != nil {
 					slog.Error("files: failed to delete orphan blob; a later sweep retries",
-						slog.Int64("tenant_id", tenantID), slog.String("path", path), slog.Any("error", err))
+						slog.String("tenant_id", tenantID.String()), slog.String("path", path), slog.Any("error", err))
 					continue
 				}
 				swept++
@@ -111,20 +112,20 @@ func (s *OrphanSweeper) HandleJob(ctx context.Context, _ json.RawMessage) error 
 }
 
 // fileBlobTenant validates the files blob layout and returns its tenant. Only
-// exactly <tenant>/<user>/<name> keys qualify, so export blobs and unrelated
-// objects are never deleted.
-func fileBlobTenant(path string) (int64, bool) {
+// exactly <tenant>/<user>/<name> keys with UUID tenant and user segments
+// qualify, so export blobs and unrelated objects are never deleted.
+func fileBlobTenant(path string) (uuid.UUID, bool) {
 	parts := strings.Split(path, "/")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return 0, false
+		return uuid.Nil, false
 	}
-	tenantID, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || tenantID <= 0 {
-		return 0, false
+	tenantID, err := uuid.Parse(parts[0])
+	if err != nil || tenantID == uuid.Nil {
+		return uuid.Nil, false
 	}
-	userID, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil || userID <= 0 {
-		return 0, false
+	userID, err := uuid.Parse(parts[1])
+	if err != nil || userID == uuid.Nil {
+		return uuid.Nil, false
 	}
 	return tenantID, true
 }

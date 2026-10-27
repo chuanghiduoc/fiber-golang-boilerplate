@@ -26,10 +26,10 @@ func failures(events []audit.Event, action string) []audit.Event {
 // attributed to the user and carrying only a reason class (never the code).
 func TestMFAVerifyFailureIsAuditedInItsOwnTransaction(t *testing.T) {
 	h := newMFAHarness(t)
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	h.enrollAndConfirm(t)
 
-	challenge, err := h.svc.BeginChallenge(ctx, 100, AMRPassword)
+	challenge, err := h.svc.BeginChallenge(ctx, testID(100), AMRPassword)
 	require.NoError(t, err)
 	const attempted = "not-a-real-code"
 	_, err = h.svc.Verify(ctx, challenge, attempted)
@@ -39,10 +39,10 @@ func TestMFAVerifyFailureIsAuditedInItsOwnTransaction(t *testing.T) {
 	failed := failures(h.db.audits, "auth.mfa_verify_failed")
 	require.Len(t, failed, 1, "one failure audit for one failed guess")
 	event := failed[0]
-	assert.Equal(t, int64(100), event.ActorID)
+	assert.Equal(t, testID(100), event.ActorID)
 	assert.Equal(t, audit.ActorTypeUser, event.ActorType)
 	assert.Equal(t, audit.OutcomeFailed, event.Outcome)
-	assert.Equal(t, "100", event.ResourceID)
+	assert.Equal(t, testID(100).String(), event.ResourceID)
 	assert.Equal(t, "invalid_code", event.Metadata["reason"])
 	assert.NotContains(t, event.Metadata, "code", "the attempted code is never audit metadata")
 	for _, value := range event.Metadata {
@@ -55,9 +55,9 @@ func TestMFAVerifyFailureIsAuditedInItsOwnTransaction(t *testing.T) {
 // later rejected attempts record only the ordinary failure.
 func TestMFABudgetExhaustionAuditedOnce(t *testing.T) {
 	h := newMFAHarness(t)
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	h.enrollAndConfirm(t)
-	challenge, err := h.svc.BeginChallenge(ctx, 100, AMRPassword)
+	challenge, err := h.svc.BeginChallenge(ctx, testID(100), AMRPassword)
 	require.NoError(t, err)
 
 	for i := range maxMFAAttempts + 2 {
@@ -82,16 +82,16 @@ func TestMFABudgetExhaustionAuditedOnce(t *testing.T) {
 func TestMFADisableAndRegenerateFailuresAreAudited(t *testing.T) {
 	for name, call := range map[string]func(h *mfaHarness, ctx context.Context) error{
 		"disable": func(h *mfaHarness, ctx context.Context) error {
-			return h.svc.Disable(ctx, 100, 1, "not-a-real-code")
+			return h.svc.Disable(ctx, testID(100), testID(1), "not-a-real-code")
 		},
 		"regenerate": func(h *mfaHarness, ctx context.Context) error {
-			_, err := h.svc.RegenerateRecoveryCodes(ctx, 100, "not-a-real-code")
+			_, err := h.svc.RegenerateRecoveryCodes(ctx, testID(100), "not-a-real-code")
 			return err
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newMFAHarness(t)
-			ctx := context.Background()
+			ctx := testTenantCtx()
 			h.enrollAndConfirm(t)
 			err := call(h, ctx)
 			require.Error(t, err)
@@ -128,10 +128,10 @@ func (t failingMFAFailureAuditTx) InTx(ctx context.Context, fn func(ctx context.
 func TestMFAFailureAuditErrorDoesNotChangeTheResponse(t *testing.T) {
 	db := newMemDB()
 	h := newMFAHarnessWithTx(t, db, failingMFAFailureAuditTx{db: db})
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	h.enrollAndConfirm(t)
 
-	challenge, err := h.svc.BeginChallenge(ctx, 100, AMRPassword)
+	challenge, err := h.svc.BeginChallenge(ctx, testID(100), AMRPassword)
 	require.NoError(t, err)
 	_, err = h.svc.Verify(ctx, challenge, "not-a-real-code")
 	require.Error(t, err)

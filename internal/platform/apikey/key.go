@@ -9,18 +9,12 @@
 // reaches the hash lookup and fails there. Only the SHA-256 hash of
 // the complete credential is stored; the plaintext is returned exactly once
 // when a key is created or rotated.
-//
-// Keys issued before the checksum existed are `<prefix>_<32-byte base64url
-// secret>`. They remain valid for verification but are deprecated: rotation
-// issues the current format.
 package apikey
 
 import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -37,15 +31,12 @@ const (
 	// KeyHashBytes is the size of the SHA-256 digest stored at rest.
 	KeyHashBytes = sha256.Size
 
-	// randomPartLen is the fixed-length base62 encoding of SecretBytes. A
-	// fixed width keeps the new format unambiguous with the legacy one.
+	// randomPartLen is the fixed-length base62 encoding of SecretBytes.
 	randomPartLen = 43
 	// checksumLen is the fixed-width base62 CRC32.
 	checksumLen = 6
-	// newSecretLen is the total suffix length of a current-format key.
-	newSecretLen = randomPartLen + checksumLen
-	// legacySecretLen is the fixed base64url length of SecretBytes.
-	legacySecretLen = 43
+	// secretLen is the total suffix length of a key.
+	secretLen = randomPartLen + checksumLen
 )
 
 // ErrMalformedKey is returned when a credential does not match the published
@@ -58,7 +49,7 @@ var prefixPattern = regexp.MustCompile(`^[a-z0-9]{2,16}$`)
 // persisted; Key must be returned to the caller once and then discarded.
 type Credentials struct {
 	Key    string
-	Hash   string
+	Hash   []byte
 	Prefix string
 }
 
@@ -89,46 +80,39 @@ func GenerateWithPrefix(prefix string) (Credentials, error) {
 	}, nil
 }
 
-// Hash returns the lowercase hex SHA-256 digest of a complete credential.
-func Hash(key string) string {
+// Hash returns the SHA-256 digest of a complete credential. It is stored as
+// BYTEA and never compared as text.
+func Hash(key string) []byte {
 	sum := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(sum[:])
+	return sum[:]
 }
 
 // ParsePrefix validates a credential's format and returns its prefix. It does
-// not verify the key against the store, but it does verify the current-format
-// CRC32 checksum, so a corrupted key is rejected before any lookup. Legacy
-// base64url credentials are accepted for backward compatibility.
+// not verify the key against the store, but it does verify the CRC32 checksum,
+// so a corrupted key is rejected before any lookup.
 func ParsePrefix(key string) (string, error) {
 	prefix, secret, ok := strings.Cut(key, "_")
 	if !ok || !prefixPattern.MatchString(prefix) {
 		return "", ErrMalformedKey
 	}
-	switch len(secret) {
-	case newSecretLen:
-		if err := validateChecksum(secret); err != nil {
-			return "", err
-		}
-	case legacySecretLen:
-		decoded, err := base64.RawURLEncoding.DecodeString(secret)
-		if err != nil || len(decoded) != SecretBytes {
-			return "", ErrMalformedKey
-		}
-	default:
+	if len(secret) != secretLen {
 		return "", ErrMalformedKey
+	}
+	if err := validateChecksum(secret); err != nil {
+		return "", err
 	}
 	return prefix, nil
 }
 
-// Valid reports whether key matches a published credential format, including
-// the current-format checksum.
+// Valid reports whether key matches the credential format, including the
+// checksum.
 func Valid(key string) bool {
 	_, err := ParsePrefix(key)
 	return err == nil
 }
 
-// validateChecksum checks a current-format suffix: a canonical 43-character
-// base62 random part followed by its 6-character CRC32 checksum.
+// validateChecksum checks a suffix: a canonical 43-character base62 random part
+// followed by its 6-character CRC32 checksum.
 func validateChecksum(secret string) error {
 	randomPart := secret[:randomPartLen]
 	raw, err := decodeBase62(randomPart)

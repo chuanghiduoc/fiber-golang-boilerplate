@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -21,29 +22,18 @@ import (
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 const trashRetentionDays = 30
 
-func setupTrashDB(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
-	return pool
-}
-
 // insertFile creates a metadata row (soft-deleted deletedAgo ago when
 // deletedAgo > 0) and, when withBlob, its blob.
-func insertFile(t *testing.T, pool *pgxpool.Pool, store storage.Storage, tenantID, userID int64, name string, deletedAgo time.Duration, withBlob bool) (id int64, path string) {
+func insertFile(t *testing.T, pool *pgxpool.Pool, store storage.Storage, tenantID, userID uuid.UUID, name string, deletedAgo time.Duration, withBlob bool) (id uuid.UUID, path string) {
 	t.Helper()
 	ctx := context.Background()
-	path = fmt.Sprintf("%d/%d/%s.png", tenantID, userID, name)
+	path = fmt.Sprintf("%s/%s/%s.png", tenantID, userID, name)
 	if withBlob {
 		require.NoError(t, store.Put(ctx, path, bytes.NewReader([]byte(name)), int64(len(name)), "image/png"))
 	}
@@ -84,24 +74,25 @@ func blobExists(t *testing.T, root, path string) bool {
 	return true
 }
 
-func fileIDs(t *testing.T, pool *pgxpool.Pool) []int64 {
+func fileIDs(t *testing.T, pool *pgxpool.Pool) []uuid.UUID {
 	t.Helper()
 	rows, err := pool.Query(context.Background(), `SELECT id FROM files ORDER BY id`)
 	require.NoError(t, err)
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
 	require.NoError(t, err)
 	return ids
 }
 
 func TestTrashPurgeRemovesExpiredTrashAcrossTenants(t *testing.T) {
-	pool := setupTrashDB(t)
+	fx := setupFilesDB(t)
+	pool := fx.Bypass
 	root := t.TempDir()
 	store, err := storage.NewLocalStorage(root)
 	require.NoError(t, err)
 
-	tenantB := testutil.CreateTenant(t, context.Background(), pool, "trash-b")
-	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-a@example.com", testutil.MemberOptions{}).UserID
-	userB := testutil.CreateMember(t, context.Background(), pool, tenantB, "trash-b@example.com", testutil.MemberOptions{}).UserID
+	tenantB := createFilesTenant(t, pool, "trash-b")
+	userA := createFilesMember(t, pool, tenant.DefaultID, "trash-a@example.com")
+	userB := createFilesMember(t, pool, tenantB, "trash-b@example.com")
 
 	const old, recent = 40 * 24 * time.Hour, 5 * 24 * time.Hour
 	_, oldA := insertFile(t, pool, store, tenant.DefaultID, userA, "old-a", old, true)
@@ -110,11 +101,11 @@ func TestTrashPurgeRemovesExpiredTrashAcrossTenants(t *testing.T) {
 	recentID, recentPath := insertFile(t, pool, store, tenant.DefaultID, userA, "recent", recent, true)
 	liveID, livePath := insertFile(t, pool, store, tenantB, userB, "live", 0, true)
 
-	purger := filesvc.NewTrashPurger(filesrepo.NewTrashRepository(testutil.NewTxManager(pool)), store, trashRetentionDays)
+	purger := filesvc.NewTrashPurger(filesrepo.NewTrashRepository(fx.Tx()), store, trashRetentionDays)
 	ctx := context.Background()
 	require.NoError(t, purger.HandleJob(ctx, nil))
 
-	assert.Equal(t, []int64{recentID, liveID}, fileIDs(t, pool),
+	assert.Equal(t, []uuid.UUID{recentID, liveID}, fileIDs(t, pool),
 		"expired trash is gone in every tenant; recent trash and live files stay")
 	assert.False(t, blobExists(t, root, oldA))
 	assert.False(t, blobExists(t, root, oldB))
@@ -127,7 +118,7 @@ func TestTrashPurgeRemovesExpiredTrashAcrossTenants(t *testing.T) {
 
 	// At-least-once redelivery is a no-op.
 	require.NoError(t, purger.HandleJob(ctx, nil))
-	assert.Equal(t, []int64{recentID, liveID}, fileIDs(t, pool))
+	assert.Equal(t, []uuid.UUID{recentID, liveID}, fileIDs(t, pool))
 }
 
 // TestTrashPurgeClaimBlocksRestore proves a restore can never revive a row
@@ -135,19 +126,20 @@ func TestTrashPurgeRemovesExpiredTrashAcrossTenants(t *testing.T) {
 // so restore fails while the blob is being deleted and still fails after the
 // purge errors out (blob gone, row kept). The next run finishes the row.
 func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
-	pool := setupTrashDB(t)
+	fx := setupFilesDB(t)
+	pool := fx.Bypass
 	root := t.TempDir()
 	store, err := storage.NewLocalStorage(root)
 	require.NoError(t, err)
-	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-claim@example.com", testutil.MemberOptions{}).UserID
+	userA := createFilesMember(t, pool, tenant.DefaultID, "trash-claim@example.com")
 	id, path := insertFile(t, pool, store, tenant.DefaultID, userA, "claimed", 40*24*time.Hour, true)
 
 	ctx := context.Background()
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
-	files := filesrepo.NewFileRepository(testutil.Scoped(pool))
-	repo := filesrepo.NewTrashRepository(testutil.NewTxManager(pool))
+	files := filesrepo.NewFileRepository(fx.Scoped())
+	repo := filesrepo.NewTrashRepository(fx.Tx())
 	failure := errors.New("hard delete never ran")
-	_, err = repo.PurgeBatch(ctx, trashRetentionDays, 10, func(ctx context.Context, batch []filesvc.TrashedFile) ([]int64, []int64, error) {
+	_, err = repo.PurgeBatch(ctx, trashRetentionDays, 10, func(ctx context.Context, batch []filesvc.TrashedFile) ([]uuid.UUID, []uuid.UUID, error) {
 		require.Len(t, batch, 1)
 		_, restoreErr := files.Restore(tenantCtx, id)
 		assert.ErrorIs(t, restoreErr, apperror.ErrNotFound, "a claimed row is not restorable")
@@ -156,13 +148,13 @@ func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
 	})
 	require.ErrorIs(t, err, failure)
 
-	assert.Equal(t, []int64{id}, fileIDs(t, pool), "the failed batch keeps its row")
+	assert.Equal(t, []uuid.UUID{id}, fileIDs(t, pool), "the failed batch keeps its row")
 	assert.False(t, blobExists(t, root, path))
 	_, err = files.Restore(tenantCtx, id)
 	assert.ErrorIs(t, err, apperror.ErrNotFound, "the claim survives the failed purge")
 
-	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(_ context.Context, batch []filesvc.TrashedFile) ([]int64, []int64, error) {
-		return []int64{batch[0].ID}, nil, nil
+	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(_ context.Context, batch []filesvc.TrashedFile) ([]uuid.UUID, []uuid.UUID, error) {
+		return []uuid.UUID{batch[0].ID}, nil, nil
 	})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), deleted, "the next run reclaims and finishes the row")
@@ -174,22 +166,23 @@ func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
 // claim is kept (the row is never restorable again), the attempt is counted,
 // and the next run continues with rows outside the backoff.
 func TestTrashPurgeFailedBlobDoesNotBlockNewerRows(t *testing.T) {
-	pool := setupTrashDB(t)
+	fx := setupFilesDB(t)
+	pool := fx.Bypass
 	root := t.TempDir()
 	base, err := storage.NewLocalStorage(root)
 	require.NoError(t, err)
 	store := &failingBlobStore{Storage: base}
 
-	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-retry@example.com", testutil.MemberOptions{}).UserID
+	userA := createFilesMember(t, pool, tenant.DefaultID, "trash-retry@example.com")
 	const old = 40 * 24 * time.Hour
 	stuckID, stuckPath := insertFile(t, pool, store, tenant.DefaultID, userA, "stuck", old, true)
 	insertFile(t, pool, store, tenant.DefaultID, userA, "ok", old, true)
 	store.failPath = stuckPath
 
 	ctx := context.Background()
-	purger := filesvc.NewTrashPurger(filesrepo.NewTrashRepository(testutil.NewTxManager(pool)), store, trashRetentionDays)
+	purger := filesvc.NewTrashPurger(filesrepo.NewTrashRepository(fx.Tx()), store, trashRetentionDays)
 	require.NoError(t, purger.HandleJob(ctx, nil), "a blob failure is recorded, not returned as a job error")
-	assert.Equal(t, []int64{stuckID}, fileIDs(t, pool), "the rest of the batch is purged")
+	assert.Equal(t, []uuid.UUID{stuckID}, fileIDs(t, pool), "the rest of the batch is purged")
 	assert.True(t, blobExists(t, root, stuckPath), "the failed delete leaves the blob for the retry")
 
 	var attempts int
@@ -206,23 +199,24 @@ func TestTrashPurgeFailedBlobDoesNotBlockNewerRows(t *testing.T) {
 	// A newer expired row is purged on the next run while the failed row waits.
 	_, newerPath := insertFile(t, pool, store, tenant.DefaultID, userA, "newer", old, true)
 	require.NoError(t, purger.HandleJob(ctx, nil))
-	assert.Equal(t, []int64{stuckID}, fileIDs(t, pool), "the backoff row does not block newer rows")
+	assert.Equal(t, []uuid.UUID{stuckID}, fileIDs(t, pool), "the backoff row does not block newer rows")
 	assert.False(t, blobExists(t, root, newerPath))
 	assert.Equal(t, 1, store.fails, "the row in backoff is skipped, not retried immediately")
 
 	// Keeping the claim means the user can never restore a row whose blob
 	// delete was already attempted.
-	_, err = filesrepo.NewFileRepository(testutil.Scoped(pool)).Restore(tenant.WithID(ctx, tenant.DefaultID), stuckID)
+	_, err = filesrepo.NewFileRepository(fx.Scoped()).Restore(tenant.WithID(ctx, tenant.DefaultID), stuckID)
 	assert.ErrorIs(t, err, apperror.ErrNotFound, "a failed purge stays non-restorable")
 }
 
 // TestTrashPurgeSkipsRowsLockedByRestore proves the claim does not wait on a
 // row a restore is still updating: it skips it, and the restore wins.
 func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
-	pool := setupTrashDB(t)
+	fx := setupFilesDB(t)
+	pool := fx.Bypass
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
-	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-skip@example.com", testutil.MemberOptions{}).UserID
+	userA := createFilesMember(t, pool, tenant.DefaultID, "trash-skip@example.com")
 	id, _ := insertFile(t, pool, store, tenant.DefaultID, userA, "restoring", 40*24*time.Hour, true)
 
 	ctx := context.Background()
@@ -232,8 +226,8 @@ func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
 	_, err = tx.Exec(ctx, `UPDATE files SET deleted_at = NULL WHERE id = $1`, id)
 	require.NoError(t, err)
 
-	repo := filesrepo.NewTrashRepository(testutil.NewTxManager(pool))
-	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(context.Context, []filesvc.TrashedFile) ([]int64, []int64, error) {
+	repo := filesrepo.NewTrashRepository(fx.Tx())
+	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(context.Context, []filesvc.TrashedFile) ([]uuid.UUID, []uuid.UUID, error) {
 		t.Fatal("a row locked by a restore must be skipped")
 		return nil, nil, nil
 	})
@@ -245,14 +239,15 @@ func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
 // TestTrashPurgeQueryUsesPartialIndex checks the purge plan on a realistic
 // table (100k live rows, 0.5% trashed) instead of an empty one.
 func TestTrashPurgeQueryUsesPartialIndex(t *testing.T) {
-	pool := setupTrashDB(t)
+	fx := setupFilesDB(t)
+	pool := fx.Bypass
 	ctx := context.Background()
-	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-plan@example.com", testutil.MemberOptions{}).UserID
+	userA := createFilesMember(t, pool, tenant.DefaultID, "trash-plan@example.com")
 	_, err := pool.Exec(ctx, `
 		INSERT INTO files (tenant_id, user_id, original_name, storage_path, mime_type, size, deleted_at)
-		SELECT 1, $1, 'f', 'seed/' || g, 'image/png', 1,
+		SELECT $2, $1, 'f', 'seed/' || g, 'image/png', 1,
 		       CASE WHEN g % 200 = 0 THEN now() - make_interval(days => 31 + g % 30) END
-		FROM generate_series(1, 100000) AS g`, userA)
+		FROM generate_series(1, 100000) AS g`, userA, tenant.DefaultID)
 	require.NoError(t, err)
 	_, err = pool.Exec(ctx, `ANALYZE files`)
 	require.NoError(t, err)
@@ -281,19 +276,21 @@ func TestTrashPurgeQueryUsesPartialIndex(t *testing.T) {
 // sees the tenant in its context, so a path owned by another tenant is never
 // treated as live.
 func TestExistingStoragePathsScopesToTenant(t *testing.T) {
-	pool := setupTrashDB(t)
+	fx := setupFilesDB(t)
+	pool := fx.Bypass
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
-	tenantB := testutil.CreateTenant(t, context.Background(), pool, "orphan-b")
-	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "orphan-a@example.com", testutil.MemberOptions{}).UserID
-	userB := testutil.CreateMember(t, context.Background(), pool, tenantB, "orphan-b@example.com", testutil.MemberOptions{}).UserID
+	tenantB := createFilesTenant(t, pool, "orphan-b")
+	userA := createFilesMember(t, pool, tenant.DefaultID, "orphan-a@example.com")
+	userB := createFilesMember(t, pool, tenantB, "orphan-b@example.com")
 	_, pathA := insertFile(t, pool, store, tenant.DefaultID, userA, "live-a", 0, true)
 	_, pathB := insertFile(t, pool, store, tenantB, userB, "live-b", 0, true)
 
-	repo := filesrepo.NewFileRepository(testutil.Scoped(pool))
-	existing, err := repo.ExistingStoragePaths(tenant.WithID(context.Background(), tenant.DefaultID), []string{pathA, pathB, "1/999/orphan.png"})
+	repo := filesrepo.NewFileRepository(fx.Scoped())
+	orphan := fmt.Sprintf("%s/%s/orphan.png", tenant.DefaultID, testID(999))
+	existing, err := repo.ExistingStoragePaths(tenant.WithID(context.Background(), tenant.DefaultID), []string{pathA, pathB, orphan})
 	require.NoError(t, err)
 	assert.Contains(t, existing, pathA)
 	assert.NotContains(t, existing, pathB, "another tenant's row must not make a path live")
-	assert.NotContains(t, existing, "1/999/orphan.png")
+	assert.NotContains(t, existing, orphan)
 }

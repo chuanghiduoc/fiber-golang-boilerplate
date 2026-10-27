@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -85,7 +86,7 @@ func TestHighestEffectiveRank(t *testing.T) {
 		"highest wins":          {roles: []string{"reader", "delegated_role"}, want: 2},
 		"unknown key":           {roles: []string{"gone-role"}, want: 1},
 	} {
-		got, err := highestEffectiveRank(context.Background(), repo, tc.roles)
+		got, err := highestEffectiveRank(testTenantCtx(), repo, tc.roles)
 		require.NoError(t, err, name)
 		assert.Equal(t, tc.want, got, name)
 	}
@@ -138,13 +139,13 @@ func TestCanGrantRank(t *testing.T) {
 // authorizeGrant used to return nil whenever the context carried no subject.
 // An internal caller must now say so explicitly with authz.SystemContext.
 func TestAuthorizeGrantFailsClosedWithoutSubject(t *testing.T) {
-	err := authorizeGrant(context.Background(), []string{"invitations:read"})
+	err := authorizeGrant(testTenantCtx(), []string{"invitations:read"})
 	assert.Equal(t, http.StatusForbidden, statusOf(err))
 	assert.Equal(t, string(apperror.CodePermissionDenied), codeOf(err))
 
-	assert.NoError(t, authorizeGrant(authz.SystemContext(context.Background()), []string{"invitations:read"}))
+	assert.NoError(t, authorizeGrant(authz.SystemContext(testTenantCtx()), []string{"invitations:read"}))
 
-	subjectCtx := authz.WithSubject(context.Background(), authz.NewSubject(7, 1, RoleMember))
+	subjectCtx := authz.WithSubject(testTenantCtx(), authz.NewSubjectWithPermissions(testID(7), testID(1), RoleMember, identitycatalog.PermissionProfileRead))
 	assert.NoError(t, authorizeGrant(subjectCtx, []string{"profile:read"}))
 	assert.Equal(t, http.StatusForbidden, statusOf(authorizeGrant(subjectCtx, []string{"admin:users:role"})))
 }

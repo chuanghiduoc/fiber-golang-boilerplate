@@ -1,21 +1,21 @@
 -- {{.R.HumanPlural}} queries owned by the {{.M.Name}} module. Every query
--- filters by tenant_id; the repository binds tenant.EffectiveID(ctx).
+-- filters by tenant_id; the repository binds tenant.Require(ctx).
 
 -- name: Create{{.R.Pascal}} :one
 INSERT INTO {{.R.Table}} (tenant_id, name)
-VALUES (@tenant_id::bigint, @name::text)
+VALUES (@tenant_id::uuid, @name::text)
 RETURNING *;
 
 -- name: Get{{.R.Pascal}} :one
 SELECT * FROM {{.R.Table}}
-WHERE tenant_id = @tenant_id::bigint AND id = @id::bigint;
+WHERE tenant_id = @tenant_id::uuid AND id = @id::uuid;
 
 -- name: List{{.R.PluralPascal}} :many
 -- Index-friendly cursor page (see pkg/pagination): the first page binds
 -- ('infinity', MaxInt64), so the row comparison is always an index condition.
 SELECT * FROM {{.R.Table}}
-WHERE tenant_id = @tenant_id::bigint
-  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+WHERE tenant_id = @tenant_id::uuid
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
@@ -24,12 +24,21 @@ LIMIT @row_limit::int;
 -- concurrent write to an omitted column is never clobbered.
 UPDATE {{.R.Table}}
 SET name = CASE WHEN @set_name::boolean THEN @name::text ELSE name END
-WHERE tenant_id = @tenant_id::bigint AND id = @id::bigint
+WHERE tenant_id = @tenant_id::uuid AND id = @id::uuid
+RETURNING *;
+
+-- name: Patch{{.R.Pascal}}IfUnchanged :one
+-- The ETag compare-and-swap: the UPDATE only applies while updated_at still
+-- matches the validator the caller read, so exactly one concurrent writer wins.
+UPDATE {{.R.Table}}
+SET name = CASE WHEN @set_name::boolean THEN @name::text ELSE name END
+WHERE tenant_id = @tenant_id::uuid AND id = @id::uuid
+  AND updated_at = @expected_updated_at::timestamptz
 RETURNING *;
 
 -- name: Delete{{.R.Pascal}} :execrows
 DELETE FROM {{.R.Table}}
-WHERE tenant_id = @tenant_id::bigint AND id = @id::bigint;
+WHERE tenant_id = @tenant_id::uuid AND id = @id::uuid;
 
 -- name: DeleteTenant{{.R.Pascal}}Batch :execrows
 -- Tenant purge: one bounded page per statement so a large tenant never holds
@@ -37,6 +46,6 @@ WHERE tenant_id = @tenant_id::bigint AND id = @id::bigint;
 DELETE FROM {{.R.Table}}
 WHERE id IN (
     SELECT id FROM {{.R.Table}}
-    WHERE tenant_id = @tenant_id::bigint
+    WHERE tenant_id = @tenant_id::uuid
     LIMIT @batch_size::int
 );

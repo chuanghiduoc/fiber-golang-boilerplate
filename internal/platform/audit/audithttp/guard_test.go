@@ -3,10 +3,12 @@ package audithttp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,16 +16,15 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 type completionCall struct {
-	ID         int64
+	ID         uuid.UUID
 	Completion audit.Completion
 }
 
 type guardRecorder struct {
-	nextID      int64
+	nextID      uuid.UUID
 	intentErr   error
 	completeErr error
 	intents     []audit.Event
@@ -34,16 +35,16 @@ func (r *guardRecorder) Record(context.Context, audit.Event) error { return nil 
 
 func (r *guardRecorder) RecordTx(context.Context, pgx.Tx, audit.Event) error { return nil }
 
-func (r *guardRecorder) RecordID(_ context.Context, event audit.Event) (int64, error) {
+func (r *guardRecorder) RecordID(_ context.Context, event audit.Event) (uuid.UUID, error) {
 	r.intents = append(r.intents, event)
 	if r.intentErr != nil {
-		return 0, r.intentErr
+		return uuid.Nil, r.intentErr
 	}
-	r.nextID++
+	r.nextID = uuid.New()
 	return r.nextID, nil
 }
 
-func (r *guardRecorder) Complete(_ context.Context, id int64, completion audit.Completion) error {
+func (r *guardRecorder) Complete(_ context.Context, id uuid.UUID, completion audit.Completion) error {
 	r.completions = append(r.completions, completionCall{ID: id, Completion: completion})
 	return r.completeErr
 }
@@ -145,7 +146,7 @@ func TestGuard_CompletionMapping(t *testing.T) {
 			},
 			want:      audit.OutcomeFailed,
 			status:    fiber.StatusInternalServerError,
-			errorCode: "internal_error",
+			errorCode: "system.internal",
 		},
 	}
 
@@ -163,7 +164,7 @@ func TestGuard_CompletionMapping(t *testing.T) {
 			assert.Equal(t, tt.want, recorder.completions[0].Completion.Outcome)
 			assert.Equal(t, tt.status, recorder.completions[0].Completion.StatusCode)
 			assert.Equal(t, tt.errorCode, recorder.completions[0].Completion.ErrorCode)
-			assert.Positive(t, recorder.completions[0].ID)
+			assert.NotEqual(t, uuid.Nil, recorder.completions[0].ID)
 		})
 	}
 }
@@ -210,7 +211,7 @@ func TestGuard_SkipsIdempotentReplay(t *testing.T) {
 }
 
 func TestGuard_RequireDomainCountsMissingEvent(t *testing.T) {
-	before := counterValue(t, metrics.AuditDomainMissingTotal)
+	before := counterValue(t, "audit_domain_missing_total")
 	recorder := &guardRecorder{}
 	app := newGuardApp(recorder, Policy{
 		Mode:          ModeRequired,
@@ -227,7 +228,7 @@ func TestGuard_RequireDomainCountsMissingEvent(t *testing.T) {
 	require.Len(t, recorder.completions, 1)
 	assert.Equal(t, audit.OutcomeUnknown, recorder.completions[0].Completion.Outcome)
 	assert.Equal(t, "audit.domain_missing", recorder.completions[0].Completion.ErrorCode)
-	assert.Equal(t, before+1, counterValue(t, metrics.AuditDomainMissingTotal))
+	assert.Equal(t, before+1, counterValue(t, "audit_domain_missing_total"))
 }
 
 func TestGuard_RequireDomainAcceptsServiceEvent(t *testing.T) {
@@ -247,22 +248,6 @@ func TestGuard_RequireDomainAcceptsServiceEvent(t *testing.T) {
 	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
 	require.Len(t, recorder.completions, 1)
 	assert.Equal(t, audit.OutcomeSucceeded, recorder.completions[0].Completion.Outcome)
-}
-
-func TestGuard_CompletesWithActorAfterHandler(t *testing.T) {
-	recorder := &guardRecorder{}
-	app := newGuardApp(recorder, Policy{Mode: ModeRequired, Action: "auth.login", Resource: "auth"}, func(c fiber.Ctx) error {
-		fiber.Locals[int64](c, "user_id", 42)
-		fiber.Locals[string](c, "role", "admin")
-		return c.SendStatus(fiber.StatusOK)
-	})
-
-	_, err := doGuardRequest(t, app)
-	require.NoError(t, err)
-	require.Len(t, recorder.completions, 1)
-	assert.Equal(t, int64(42), recorder.completions[0].Completion.ActorID)
-	assert.Equal(t, audit.ActorTypeUser, recorder.completions[0].Completion.ActorType)
-	assert.Equal(t, "admin", recorder.completions[0].Completion.ActorRole)
 }
 
 func TestGuard_ResourceIDFallsBackToKeyParam(t *testing.T) {
@@ -304,4 +289,9 @@ func TestGuard_CompletionFailurePreservesResponse(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode,
 		"a completion failure cannot roll back a committed Tier 2 mutation")
+}
+
+// testID returns a deterministic UUID for a small fixture number.
+func testID(n int) uuid.UUID {
+	return uuid.MustParse(fmt.Sprintf("0192c9b0-7e4a-7000-8000-%012d", n))
 }

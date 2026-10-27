@@ -13,10 +13,11 @@ const (
 	CodeAPIKeyExpiryExceedsMaxLifetime apperror.Code = "api_key.expiry_exceeds_max_lifetime"
 )
 
-// ErrorCodes returns the apikeys error catalog for app.ErrorProvider.
-func ErrorCodes() map[apperror.Code]apperror.Spec {
-	return map[apperror.Code]apperror.Spec{
-		CodeAPIKeyExpiryExceedsMaxLifetime: {
+// Errors returns the apikeys error catalog for app.ErrorProvider.
+func Errors() []apperror.Spec {
+	return []apperror.Spec{
+		{
+			Code:    CodeAPIKeyExpiryExceedsMaxLifetime,
 			Status:  http.StatusBadRequest,
 			Title:   "API key expiry exceeds the maximum lifetime",
 			DocPath: "/errors/api-key-expiry-exceeds-max-lifetime",

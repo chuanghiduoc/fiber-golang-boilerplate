@@ -54,7 +54,7 @@ func TestLocalizedTitleAndDetail(t *testing.T) {
 		"detail.user.not_found":       "Không tìm thấy người dùng {id}",
 	}
 	body, _, status := decodeWithHandler(t,
-		FiberErrorHandlerWithLocalizer(localizer),
+		New(testCatalog, localizer),
 		func(c fiber.Ctx) error {
 			return apperror.NewCode(CodeUserNotFound, "user missing").WithDetailKey("detail.user.not_found", map[string]any{"id": 7})
 		},
@@ -86,13 +86,13 @@ func TestLocalizedTitleAndDetail(t *testing.T) {
 
 func TestLocalizedValidationMessages(t *testing.T) {
 	localizer := mapLocalizer{
-		"errors.validation_failed.title": "Dữ liệu không hợp lệ",
-		"validation.required":            "Trường {path} là bắt buộc.",
-		"validation.too_short":           "Trường {path} phải có ít nhất {min} ký tự.",
-		"validation.too_long":            "Trường {path} phải có tối đa {max} ký tự.",
+		"errors.request.validation_failed.title": "Dữ liệu không hợp lệ",
+		"validation.required":                    "Trường {path} là bắt buộc.",
+		"validation.too_short":                   "Trường {path} phải có ít nhất {min} ký tự.",
+		"validation.too_long":                    "Trường {path} phải có tối đa {max} ký tự.",
 	}
 	body, _, status := decodeWithHandler(t,
-		FiberErrorHandlerWithLocalizer(localizer),
+		New(testCatalog, localizer),
 		func(c fiber.Ctx) error {
 			return apperror.NewValidation("fallback detail", []apperror.FieldError{
 				{Path: "name", Code: "required", Message: "name is required"},
@@ -135,7 +135,7 @@ func TestLocalizedValidationMessages(t *testing.T) {
 
 func TestLocalizerFallbackKeepsEnglish(t *testing.T) {
 	body, _, _ := decodeWithHandler(t,
-		FiberErrorHandlerWithLocalizer(mapLocalizer{}),
+		New(testCatalog, mapLocalizer{}),
 		func(c fiber.Ctx) error {
 			return apperror.NewCode(CodeUserNotFound, "user missing").WithDetailKey("detail.unknown", nil)
 		},
@@ -151,7 +151,7 @@ func TestLocalizerFallbackKeepsEnglish(t *testing.T) {
 func TestNilLocalizerPreservesCurrentBehavior(t *testing.T) {
 	for name, handler := range map[string]fiber.ErrorHandler{
 		"plain":       FiberErrorHandler,
-		"nil wrapped": FiberErrorHandlerWithLocalizer(nil),
+		"nil wrapped": New(testCatalog, nil),
 	} {
 		t.Run(name, func(t *testing.T) {
 			body, _, _ := decodeWithHandler(t, handler, func(c fiber.Ctx) error {

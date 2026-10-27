@@ -12,29 +12,26 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"strconv"
+	"net/http"
 	"strings"
 	"time"
 
-	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/oauth2"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/oauth"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
-const oauthStateCookieName = "oauth_state"
+const oauthStateCookieName = "__Host-oauth_state"
 
 const (
 	// googleExchangeTTL is how long the callback's one-time code can be
@@ -44,13 +41,6 @@ const (
 	googleExchangeCodeBytes = 32
 	googleExchangeKeyPrefix = "oauth:google:exchange:"
 )
-
-// withClientIP returns the request context carrying the client IP that the
-// login lockout keys its per-source budget on. c.IP() honors Fiber's
-// trusted-proxy configuration; the service clones the value.
-func withClientIP(c fiber.Ctx) context.Context {
-	return service.WithClientIP(c.Context(), c.IP())
-}
 
 // oauthStateKeyInfo domain-separates the OAuth state MAC key from every other
 // use of the JWT secret.
@@ -70,32 +60,30 @@ func oauthStateKey(jwtSecret string) []byte {
 // encodeOAuthState binds the OAuth state nonce to the tenant that started the
 // flow and signs both: "<nonce>.<tenantID>.<hex HMAC>". The callback uses
 // this tenant instead of X-Tenant-Slug, otherwise an attacker could start a
-// flow for tenant A and complete it under tenant B. The cookie comparison
-// alone does not prove integrity, because whoever can set the state cookie
-// can choose its tenant; the MAC does.
-func encodeOAuthState(key []byte, nonce string, tenantID int64) string {
-	payload := nonce + "." + strconv.FormatInt(tenantID, 10)
+// flow for tenant A and complete it under tenant B.
+func encodeOAuthState(key []byte, nonce string, tenantID uuid.UUID) string {
+	payload := nonce + "." + tenantID.String()
 	return payload + "." + oauthStateMAC(key, payload)
 }
 
 // decodeOAuthState verifies the MAC in constant time before trusting the
 // tenant carried in state.
-func decodeOAuthState(key []byte, state string) (nonce string, tenantID int64, ok bool) {
+func decodeOAuthState(key []byte, state string) (nonce string, tenantID uuid.UUID, ok bool) {
 	macSep := strings.LastIndexByte(state, '.')
 	if macSep <= 0 || macSep == len(state)-1 {
-		return "", 0, false
+		return "", uuid.Nil, false
 	}
 	payload, mac := state[:macSep], state[macSep+1:]
 	if !hmac.Equal([]byte(mac), []byte(oauthStateMAC(key, payload))) {
-		return "", 0, false
+		return "", uuid.Nil, false
 	}
 	sep := strings.LastIndexByte(payload, '.')
 	if sep <= 0 || sep == len(payload)-1 {
-		return "", 0, false
+		return "", uuid.Nil, false
 	}
-	id, err := strconv.ParseInt(payload[sep+1:], 10, 64)
-	if err != nil || id <= 0 {
-		return "", 0, false
+	id, err := uuid.Parse(payload[sep+1:])
+	if err != nil || id == uuid.Nil {
+		return "", uuid.Nil, false
 	}
 	return payload[:sep], id, true
 }
@@ -154,7 +142,7 @@ type GoogleOAuthProvider interface {
 	AuthURL(state, codeVerifier string) string
 	Exchange(ctx context.Context, code, codeVerifier string) (*oauth.GoogleUserInfo, error)
 	// BuildCodeCallbackURL redirects the browser with a single-use code that
-	// POST /auth/google/exchange redeems for the token pair.
+	// POST /api/v1/auth/google/exchanges redeems for the token pair.
 	BuildCodeCallbackURL(code string) string
 	// BuildMFACallbackURL redirects a first-factor Google sign-in to the
 	// frontend with only a two-step login challenge, never tokens.
@@ -164,18 +152,18 @@ type GoogleOAuthProvider interface {
 // SessionIssuer is the session service surface the auth handlers use.
 // *service.SessionService implements it.
 type SessionIssuer interface {
-	Issue(ctx context.Context, userID int64, tokenVersion int32, amr []string) (service.TokenPair, error)
+	Issue(ctx context.Context, userID uuid.UUID, tokenVersion int32, amr []string) (service.TokenPair, error)
 	Refresh(ctx context.Context, refreshToken string, admit service.Admission) (*service.RefreshResult, error)
 	Logout(ctx context.Context, refreshToken string) error
-	List(ctx context.Context, userID int64, limit int, startingAfter string) ([]service.Session, bool, error)
-	Revoke(ctx context.Context, userID, sessionID int64) error
+	List(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]service.Session, bool, error)
+	Revoke(ctx context.Context, userID, sessionID uuid.UUID) error
 }
 
 // TenantLookup resolves operational tenants for the OAuth flow.
 // *service.TenantService implements it.
 type TenantLookup interface {
 	ResolveOperational(ctx context.Context, slug string) (*service.Tenant, error)
-	GetOperational(ctx context.Context, id int64) (*service.Tenant, error)
+	GetOperational(ctx context.Context, id uuid.UUID) (*service.Tenant, error)
 }
 
 // AuthDeps are the auth handler's collaborators.
@@ -213,11 +201,11 @@ type AuthHandler struct {
 	sealer                   service.SecretSealer
 	// oauthStateKey signs the OAuth state (see encodeOAuthState).
 	oauthStateKey []byte
-	// flags gates registration, Google OAuth, and the email-verification
-	// requirement. The module installs app.Deps.Flags; when unset,
-	// features.Require uses compiled defaults (google_oauth defaults on;
-	// Google credentials remain the real switch).
+	// flags evaluates the email-verification requirement and the sign-up
+	// allowance inside the Google flow. Route-level gates use Policy.Feature.
 	flags features.Evaluator
+	// refreshCookie is the optional BFF refresh-token transport.
+	refreshCookie RefreshCookieConfig
 }
 
 // SetFeatureFlags installs the evaluator used for feature gates. It is called
@@ -258,502 +246,327 @@ func NewAuthHandler(deps AuthDeps) *AuthHandler {
 	}
 }
 
-// withClient returns the request context carrying the client IP (login
-// lockout, session record) and User-Agent (session record).
-func withClient(c fiber.Ctx) context.Context {
-	return service.WithUserAgent(withClientIP(c), c.Get(fiber.HeaderUserAgent))
+type registerInput struct {
+	Body dto.RegisterRequest
 }
 
-// Register godoc
-// @Summary Register a new user
-// @Description Create a new user account
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param request body dto.RegisterRequest true "Register request"
-// @Success 201 {object} dto.UserResponse
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 404 {object} apperror.ProblemDetails "feature.disabled when user_registration is off"
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/register [post]
-func (h *AuthHandler) Register(c fiber.Ctx) error {
-	if err := features.Require(c.Context(), h.flags, identitycatalog.KeyUserRegistration, features.SubjectFromContext(c.Context(), 0)); err != nil {
-		return err
-	}
-	var req dto.RegisterRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
+type loginInput struct {
+	Body dto.LoginRequest
+}
 
-	member, err := h.userSvc.Register(withClientIP(c), service.RegisterInput{
-		Email:    req.Email,
-		Password: req.Password,
-		Name:     req.Name,
+type refreshInput struct {
+	Cookie       string              `header:"Cookie" doc:"__Host-refresh cookie in cookie mode."`
+	SecFetchSite string              `header:"Sec-Fetch-Site" doc:"Browser fetch metadata used for the CSRF decision."`
+	Origin       string              `header:"Origin" doc:"Trusted origin fallback when Sec-Fetch-Site is unavailable."`
+	CSRFToken    string              `header:"X-CSRF-Token" doc:"Required with a trusted Origin when Sec-Fetch-Site is unavailable."`
+	Body         *dto.RefreshRequest `required:"false" doc:"Optional when the request carries the __Host-refresh cookie."`
+}
+
+type logoutInput struct {
+	Cookie       string              `header:"Cookie" doc:"__Host-refresh cookie in cookie mode."`
+	SecFetchSite string              `header:"Sec-Fetch-Site" doc:"Browser fetch metadata used for the CSRF decision."`
+	Origin       string              `header:"Origin" doc:"Trusted origin fallback when Sec-Fetch-Site is unavailable."`
+	CSRFToken    string              `header:"X-CSRF-Token" doc:"Required with a trusted Origin when Sec-Fetch-Site is unavailable."`
+	Body         *dto.RefreshRequest `required:"false" doc:"Optional when the request carries the __Host-refresh cookie."`
+}
+
+type passwordResetRequestInput struct {
+	Body dto.ForgotPasswordRequest
+}
+
+type passwordResetCompleteInput struct {
+	Body dto.ResetPasswordRequest
+}
+
+type emailVerificationRequestInput struct {
+	Body dto.ResendVerificationRequest
+}
+
+type emailVerificationCompleteInput struct {
+	Body dto.VerifyEmailRequest
+}
+
+type googleStartInput struct{}
+
+type googleCallbackInput struct {
+	Code   string `query:"code"`
+	State  string `query:"state"`
+	Cookie string `header:"Cookie"`
+}
+
+type googleExchangeInput struct {
+	Body dto.GoogleExchangeRequest
+}
+
+type acceptInvitationInput struct {
+	Body dto.AcceptInvitationRequest
+}
+
+type signupInvitationInput struct {
+	Body dto.InvitationSignUpRequest
+}
+
+// Register creates a global account and its membership in the request tenant.
+func (h *AuthHandler) Register(ctx context.Context, input *registerInput) (*httpapi.Created[dto.UserResponse], error) {
+	member, err := h.userSvc.Register(withClientMetadata(ctx), service.RegisterInput{
+		Email:    input.Body.Email,
+		Password: input.Body.Password,
+		Name:     input.Body.Name,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// When the user service provisions the verification email in the
-	// registration transaction, sending here would duplicate it. Fall back to
-	// the post-commit send only when registration was not transactional.
-	if h.emailVerifSvc != nil && !h.userSvc.RegistrationEmailsTransactional() {
-		// Carry the registration tenant into the fire-and-forget send. A bare
-		// background context would fall back to the default tenant and write
-		// the verification token to the wrong tenant.
-		tenantID := tenant.EffectiveID(c.Context())
-		if member.Membership.TenantID != 0 {
-			tenantID = member.Membership.TenantID
-		}
-		tenantSlug := tenant.SlugFromContext(c.Context())
-		async.Go(func() {
-			ctx := tenant.WithIdentity(context.Background(), tenantID, tenantSlug)
-			if err := h.emailVerifSvc.SendVerification(ctx, member.User.ID, member.User.Email); err != nil {
-				slog.Error("post-commit verification email failed", slog.Int64("user_id", member.User.ID), slog.Any("error", err))
-			}
-		})
-	}
+	// The verification email is enqueued on the registration transaction by
+	// the user service; there is no post-commit send to duplicate it.
 
-	// Attribute the audit event to the newly registered user. The key matches
-	// middleware.JWTAuth and is read by audithttp.Middleware after the response.
-	fiber.Locals(c, "user_id", member.User.ID)
+	// Attribute the audit fallback to the newly registered user; WithActor
+	// mutates the request info pointer the middleware will read after the
+	// handler returns.
+	auditActor(ctx, member.User.ID)
 
-	return response.Created(c, toUserResponse(member))
+	return httpapi.NewCreated("/api/v1/me/profile", toUserResponse(member)), nil
 }
 
-// Login godoc
-// @Summary Login
-// @Description Authenticate user and return access + refresh tokens
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param request body dto.LoginRequest true "Login request"
-// @Success 200 {object} dto.LoginResponse
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/login [post]
-func (h *AuthHandler) Login(c fiber.Ctx) error {
-	var req dto.LoginRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-
-	ctx := withClient(c)
+// Login authenticates the password and returns a token pair or an MFA
+// challenge.
+func (h *AuthHandler) Login(ctx context.Context, input *loginInput) (*loginOutput, error) {
+	ctx = withClientMetadata(ctx)
 	member, err := h.userSvc.Authenticate(ctx, service.LoginInput{
-		Email:    req.Email,
-		Password: req.Password,
+		Email:    input.Body.Email,
+		Password: input.Body.Password,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// Authenticate requires a membership in the request tenant, but keep the
-	// invariant explicit: a token must never be minted outside it.
-	if member.Membership.TenantID != tenant.EffectiveID(c.Context()) {
-		return apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
+	if member.Membership.TenantID != tenant.IDFromContext(ctx) {
+		return nil, apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
 	}
-	// Authenticate already enforces REQUIRE_EMAIL_VERIFICATION; this adds the
-	// email_verification flag for the user's tenant/user targets.
-	if !member.User.EmailVerified() && h.emailVerificationRequired(c.Context(), member) {
-		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
+	if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
+		return nil, apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}
 
-	// Attribute the audit event to the authenticated user.
-	fiber.Locals(c, "user_id", member.User.ID)
+	auditActor(ctx, member.User.ID)
 
-	// A confirmed factor makes the password only the first step: issue a
-	// short-lived challenge instead of a session.
 	if h.mfa != nil {
-		required, err := h.mfa.Required(c.Context(), member.User.ID)
+		required, err := h.mfa.Required(ctx, member.User.ID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if required {
 			challenge, err := h.mfa.BeginChallenge(ctx, member.User.ID, service.AMRPassword)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			return response.Success(c, dto.LoginResponse{
+			return &loginOutput{Body: dto.LoginResponse{
 				User:              toUserResponse(member),
 				MFARequired:       true,
 				MFAChallengeToken: challenge,
-			})
+			}}, nil
 		}
 	}
 
-	// Issue re-checks the membership and the token version the password was
-	// verified at, so a credential change committed in between fails closed.
 	pair, err := h.sessions.Issue(ctx, member.User.ID, member.User.TokenVersion, []string{service.AMRPassword})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return response.Success(c, dto.LoginResponse{
-		AccessToken:  pair.AccessToken,
-		RefreshToken: pair.RefreshToken,
-		User:         toUserResponse(member),
-	})
+	return &loginOutput{
+		SetCookie: h.refreshCookie.cookieHeader(pair.RefreshToken),
+		Body: dto.LoginResponse{
+			AccessToken:  pair.AccessToken,
+			RefreshToken: h.refreshCookie.jsonRefreshToken(pair.RefreshToken),
+			User:         toUserResponse(member),
+		},
+	}, nil
 }
 
-// Refresh godoc
-// @Summary Refresh access token
-// @Description Exchange a refresh token for a new access token
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param request body dto.RefreshRequest true "Refresh request"
-// @Success 200 {object} dto.LoginResponse
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/refresh [post]
-func (h *AuthHandler) Refresh(c fiber.Ctx) error {
-	var req dto.RefreshRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
+// Refresh rotates a refresh token.
+func (h *AuthHandler) Refresh(ctx context.Context, input *refreshInput) (*loginOutput, error) {
+	ctx = withClientMetadata(ctx)
+	token, err := h.requestRefreshToken(csrfRequest{
+		Cookie:       input.Cookie,
+		SecFetchSite: input.SecFetchSite,
+		Origin:       input.Origin,
+		CSRFToken:    input.CSRFToken,
+	}, input.Body)
+	if err != nil {
+		return nil, err
 	}
-
-	// Refresh validates the token (tenant, reuse, expiry, session, member,
-	// token version) and runs the admission rule before consuming anything,
-	// so a recoverable refusal (email not yet verified) does not burn a valid
-	// token. A token that was already used revokes its whole session.
-	result, err := h.sessions.Refresh(withClient(c), req.RefreshToken, func(ctx context.Context, member *service.Member) error {
+	result, err := h.sessions.Refresh(ctx, token, func(ctx context.Context, member *service.Member) error {
 		if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
 			return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 		}
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	user := toUserResponse(result.Member)
+	auditActor(ctx, user.ID)
 
-	// Attribute the audit event to the authenticated user.
-	fiber.Locals(c, "user_id", user.ID)
-
-	return response.Success(c, dto.LoginResponse{
-		AccessToken:  result.Tokens.AccessToken,
-		RefreshToken: result.Tokens.RefreshToken,
-		User:         user,
-	})
+	return &loginOutput{
+		SetCookie: h.refreshCookie.cookieHeader(result.Tokens.RefreshToken),
+		Body: dto.LoginResponse{
+			AccessToken:  result.Tokens.AccessToken,
+			RefreshToken: h.refreshCookie.jsonRefreshToken(result.Tokens.RefreshToken),
+			User:         user,
+		},
+	}, nil
 }
 
-// Logout godoc
-// @Summary Logout
-// @Description Revoke the session of a refresh token by possession. The tenant header is not required because possession of the opaque token authorizes revocation.
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param request body dto.RefreshRequest true "Refresh token whose session is revoked"
-// @Success 204
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Router /auth/logout [post]
-func (h *AuthHandler) Logout(c fiber.Ctx) error {
-	var req dto.RefreshRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
+// Logout revokes the session that owns the presented refresh token.
+func (h *AuthHandler) Logout(ctx context.Context, input *logoutInput) (*logoutOutput, error) {
+	token, err := h.requestRefreshToken(csrfRequest{
+		Cookie:       input.Cookie,
+		SecFetchSite: input.SecFetchSite,
+		Origin:       input.Origin,
+		CSRFToken:    input.CSRFToken,
+	}, input.Body)
+	if err != nil {
+		return nil, err
 	}
-
-	if err := h.sessions.Logout(c.Context(), req.RefreshToken); err != nil {
-		return err
+	if err := h.sessions.Logout(ctx, token); err != nil {
+		return nil, err
 	}
-	return response.NoContent(c)
+	return &logoutOutput{Status: http.StatusNoContent, SetCookie: h.refreshCookie.clearCookieHeader()}, nil
 }
 
-// LogoutAll godoc
-// @Summary Log out everywhere
-// @Description Revoke every session of the authenticated user in every tenant and invalidate every access token (token version bump)
-// @Tags Auth
-// @Security BearerAuth
-// @Success 204
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/logout-all [post]
-func (h *AuthHandler) LogoutAll(c fiber.Ctx) error {
-	if err := h.userSvc.RevokeSessions(c.Context(), httpx.AuthUserID(c)); err != nil {
-		return err
+type logoutAllInput struct{}
+
+// LogoutAll revokes every session of the caller in every tenant.
+func (h *AuthHandler) LogoutAll(ctx context.Context, _ *logoutAllInput) (*httpapi.Empty, error) {
+	if err := h.userSvc.RevokeSessions(ctx, actorID(ctx)); err != nil {
+		return nil, err
 	}
-	return response.NoContent(c)
+	return &httpapi.Empty{}, nil
 }
 
-// ForgotPassword godoc
-// @Summary Request password reset
-// @Description Send a password reset email
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param request body dto.ForgotPasswordRequest true "Forgot password request"
-// @Success 200 {object} map[string]string
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Router /auth/forgot-password [post]
-func (h *AuthHandler) ForgotPassword(c fiber.Ctx) error {
-	var req dto.ForgotPasswordRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
+// ForgotPassword enqueues a reset email without revealing whether the address
+// exists.
+func (h *AuthHandler) ForgotPassword(ctx context.Context, input *passwordResetRequestInput) (*httpapi.Empty, error) {
+	if err := h.resetSvc.ForgotPassword(ctx, service.ForgotPasswordInput{Email: input.Body.Email}); err != nil {
+		return nil, err
 	}
-
-	if err := h.resetSvc.ForgotPassword(c.Context(), service.ForgotPasswordInput{Email: req.Email}); err != nil {
-		return err
-	}
-
-	return response.Success(c, fiber.Map{"message": "if the email exists, a reset link has been sent"})
+	return &httpapi.Empty{}, nil
 }
 
-// ResetPassword godoc
-// @Summary Reset password
-// @Description Reset password using a token. The tenant query parameter is the browser-link fallback for tenants that cannot send X-Tenant-Slug.
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param tenant query string false "Tenant slug from the emailed reset link (X-Tenant-Slug takes precedence)"
-// @Param request body dto.ResetPasswordRequest true "Reset password request"
-// @Success 200 {object} map[string]string
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Router /auth/reset-password [post]
-func (h *AuthHandler) ResetPassword(c fiber.Ctx) error {
-	var req dto.ResetPasswordRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-
+// ResetPassword consumes a reset token and sets the new password.
+func (h *AuthHandler) ResetPassword(ctx context.Context, input *passwordResetCompleteInput) (*httpapi.Empty, error) {
 	// A live reset token resolves to its account, so the password/email
 	// policy can reject a password built from that address before the reset
-	// stores it. Unknown or expired tokens skip the check and fail below.
+	// stores it.
 	if lookup, ok := h.resetSvc.(service.PasswordResetEmailLookup); ok {
-		email, err := lookup.EmailForResetToken(c.Context(), req.Token)
+		email, err := lookup.EmailForResetToken(ctx, input.Body.Token)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if email != "" {
-			if err := service.ValidatePasswordForEmail(req.Password, email, "password"); err != nil {
-				return err
+			if err := service.ValidatePasswordForEmail(input.Body.Password, email, "password"); err != nil {
+				return nil, err
 			}
 		}
 	}
 
-	if err := h.resetSvc.ResetPassword(service.WithUserAgent(withClientIP(c), c.Get(fiber.HeaderUserAgent)), service.ResetPasswordInput{
-		Token:    req.Token,
-		Password: req.Password,
+	if err := h.resetSvc.ResetPassword(withClientMetadata(ctx), service.ResetPasswordInput{
+		Token:    input.Body.Token,
+		Password: input.Body.Password,
 	}); err != nil {
-		return err
+		return nil, err
 	}
-
-	return response.Success(c, fiber.Map{"message": "password has been reset successfully"})
+	return &httpapi.Empty{}, nil
 }
 
-// VerifyEmail godoc
-// @Summary Verify email address
-// @Description Verify email using a token. The tenant query parameter is the browser-link fallback for tenants that cannot send X-Tenant-Slug.
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param tenant query string false "Tenant slug from the emailed verification link (X-Tenant-Slug takes precedence)"
-// @Param request body dto.VerifyEmailRequest true "Verify email request"
-// @Success 200 {object} map[string]string
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Router /auth/verify-email [post]
-func (h *AuthHandler) VerifyEmail(c fiber.Ctx) error {
-	var req dto.VerifyEmailRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
+// VerifyEmail consumes a verification token.
+func (h *AuthHandler) VerifyEmail(ctx context.Context, input *emailVerificationCompleteInput) (*httpapi.Empty, error) {
+	if err := h.emailVerifSvc.Verify(ctx, input.Body.Token); err != nil {
+		return nil, err
 	}
-
-	if err := h.emailVerifSvc.Verify(c.Context(), req.Token); err != nil {
-		return err
-	}
-
-	return response.Success(c, fiber.Map{"message": "email verified successfully"})
+	return &httpapi.Empty{}, nil
 }
 
-// ResendVerification godoc
-// @Summary Resend verification email
-// @Description Resend email verification link
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param request body dto.ResendVerificationRequest true "Resend verification request"
-// @Success 200 {object} map[string]string
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Router /auth/resend-verification [post]
-func (h *AuthHandler) ResendVerification(c fiber.Ctx) error {
-	var req dto.ResendVerificationRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
+// ResendVerification sends a new verification link if the account exists and
+// is unverified.
+func (h *AuthHandler) ResendVerification(ctx context.Context, input *emailVerificationRequestInput) (*httpapi.Empty, error) {
+	if err := h.emailVerifSvc.ResendVerification(ctx, input.Body.Email); err != nil {
+		return nil, err
 	}
-
-	if err := h.emailVerifSvc.ResendVerification(c.Context(), req.Email); err != nil {
-		return err
-	}
-
-	return response.Success(c, fiber.Map{"message": "if the email exists and is not verified, a verification link has been sent"})
+	return &httpapi.Empty{}, nil
 }
 
-// GoogleRedirect godoc
-// @Summary Redirect to Google OAuth
-// @Description Redirects to Google's OAuth consent screen. Browser navigation may select the tenant with the validated tenant query parameter; the tenant is bound into the signed state.
-// @Tags Auth
-// @Param tenant query string false "Tenant slug for browser navigation (X-Tenant-Slug takes precedence)"
-// @Success 302
-// @Failure 404 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/google [get]
-func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
+// GoogleRedirect starts the OAuth flow with PKCE and a tenant-bound signed
+// state.
+func (h *AuthHandler) GoogleRedirect(ctx context.Context, _ *googleStartInput) (*redirectOutput, error) {
 	if h.googleOAuth == nil {
-		return apperror.NewNotFound("Google OAuth not configured")
+		return nil, apperror.NewNotFound("Google OAuth not configured")
 	}
 
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return apperror.NewInternal("failed to generate state")
+		return nil, apperror.Internal(err, "failed to generate state")
 	}
 
-	// X-Tenant-Slug is normally resolved by the global tenant middleware. When
-	// the handler is mounted without it (tests/minimal deployments), a
-	// validated `tenant` query parameter lets browser navigation start a
-	// non-default flow. Header/resolved context always wins; an explicit
-	// conflicting header therefore cannot be overridden by the query.
-	tenantID := tenanthttp.ID(c)
-	tenantSlug := tenanthttp.Slug(c)
-	if tenantID == 0 {
-		slug := strings.TrimSpace(c.Query(tenant.QueryParam))
-		if slug != "" {
-			if !tenant.IsValidSlug(slug) {
-				return apperror.NewNotFound("tenant not found")
-			}
-			if h.tenants == nil {
-				return apperror.NewInternal("oauth tenant validation is not configured")
-			}
-			found, err := h.tenants.ResolveOperational(c.Context(), slug)
-			if err != nil {
-				if errors.Is(err, apperror.ErrNotFound) {
-					return apperror.NewNotFound("tenant not found")
-				}
-				return apperror.NewInternal("failed to resolve tenant")
-			}
-			tenantID, tenantSlug = found.ID, found.Slug
-		} else {
-			tenantID = tenant.EffectiveID(c.Context())
-			tenantSlug = tenant.SlugFromContext(c.Context())
-		}
+	tenantID := tenant.IDFromContext(ctx)
+	if tenantID == uuid.Nil {
+		return nil, apperror.Internal(nil, "tenant context is required")
 	}
-	if tenantID <= 0 {
-		return apperror.NewInternal("tenant context is required")
-	}
-	if err := features.Require(c.Context(), h.flags, identitycatalog.KeyGoogleOAuth, features.Subject{TenantID: tenantID}); err != nil {
-		return err
-	}
-	fiber.Locals[int64](c, "tenant_id", tenantID)
-	fiber.Locals[string](c, "tenant_slug", tenantSlug)
-	c.SetContext(tenant.WithIdentity(c.Context(), tenantID, tenantSlug))
-
 	state := encodeOAuthState(h.oauthStateKey, hex.EncodeToString(b), tenantID)
 	verifier := oauth2.GenerateVerifier()
+	cookie := oauthStateCookieName + "=" + encodeOAuthFlow(h.oauthStateKey, state, verifier) +
+		"; Path=/; Max-Age=300; HttpOnly; Secure; SameSite=Lax"
 
-	c.Cookie(&fiber.Cookie{
-		Name:     oauthStateCookieName,
-		Value:    encodeOAuthFlow(h.oauthStateKey, state, verifier),
-		HTTPOnly: true,
-		Secure:   true,
-		SameSite: fiber.CookieSameSiteLaxMode,
-		MaxAge:   300, // 5 minutes
-		Path:     "/",
-	})
-
-	return c.Redirect().To(h.googleOAuth.AuthURL(state, verifier))
+	return &redirectOutput{
+		Location:  h.googleOAuth.AuthURL(state, verifier),
+		SetCookie: cookie,
+	}, nil
 }
 
-// GoogleCallback godoc
-// @Summary Google OAuth callback
-// @Description Handles the callback from Google OAuth, creates/finds the user in the tenant bound to the signed state, and redirects with tokens. X-Tenant-Slug is ignored; unknown or suspended state tenants are rejected.
-// @Tags Auth
-// @Param code query string true "Authorization code"
-// @Param state query string true "OAuth state containing the tenant bound at start"
-// @Success 302
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 404 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Failure 502 {object} apperror.ProblemDetails "auth.oauth_upstream_unavailable"
-// @Router /auth/google/callback [get]
-func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
+// GoogleCallback completes the OAuth flow for the tenant bound in the signed
+// state and redirects with a one-time exchange code.
+func (h *AuthHandler) GoogleCallback(ctx context.Context, input *googleCallbackInput) (*redirectOutput, error) {
 	if h.googleOAuth == nil {
-		return apperror.NewNotFound("Google OAuth not configured")
+		return nil, apperror.NewNotFound("Google OAuth not configured")
 	}
-	tenantID, tenantSlug, verifier, err := h.verifyOAuthCallbackState(c)
+	tenantID, tenantSlug, verifier, err := h.verifyOAuthCallbackState(ctx, input)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// Gate on the signed-state tenant: the callback skips tenant middleware,
-	// so the request context tenant is not the one that started the flow.
-	if err := features.Require(c.Context(), h.flags, identitycatalog.KeyGoogleOAuth, features.Subject{TenantID: tenantID}); err != nil {
-		return err
+	if err := features.Require(ctx, h.flags, identitycatalog.KeyGoogleOAuth, features.Subject{TenantID: tenantID}); err != nil {
+		return nil, err
 	}
-	fiber.Locals[int64](c, "tenant_id", tenantID)
-	fiber.Locals[string](c, "tenant_slug", tenantSlug)
-	c.SetContext(tenant.WithIdentity(c.Context(), tenantID, tenantSlug))
-	ctx := c.Context()
-	clearOAuthStateCookie(c)
+	ctx = tenant.WithIdentity(ctx, tenantID, tenantSlug)
 
-	code := c.Query("code")
-	if code == "" {
-		return apperror.NewBadRequest("missing authorization code")
+	if input.Code == "" {
+		return nil, apperror.NewBadRequest("missing authorization code")
 	}
-	info, err := h.googleOAuth.Exchange(ctx, code, verifier)
+	info, err := h.googleOAuth.Exchange(ctx, input.Code, verifier)
 	if err != nil {
 		status := oauthErrorStatus(err)
-		// Log only the error class and upstream status: the code, tokens, and
-		// provider response bodies must never reach the logs.
 		slog.Error("google oauth code exchange failed",
 			slog.String("error_type", oauthErrorType(err)),
 			slog.Int("upstream_status", status),
 		)
-		// A usable token whose user info cannot be trusted is a client-facing
-		// refusal: the user can verify the address (or re-consent) and retry.
-		// It must not masquerade as a provider outage.
 		if errors.Is(err, oauth.ErrEmailNotVerified) {
-			return apperror.NewCode(identitycatalog.CodeAuthOAuthEmailNotVerified, "google account email address is not verified")
+			return nil, apperror.NewCode(identitycatalog.CodeAuthOAuthEmailNotVerified, "google account email address is not verified")
 		}
 		if errors.Is(err, oauth.ErrIncompleteUserInfo) {
-			return apperror.NewCode(identitycatalog.CodeAuthOAuthUserInfoIncomplete, "google did not return an account id and email address")
+			return nil, apperror.NewCode(identitycatalog.CodeAuthOAuthUserInfoIncomplete, "google did not return an account id and email address")
 		}
-		// A 4xx means Google rejected this client's code or credentials; the
-		// caller must start over. A 429 is Google rate-limiting us, and
-		// anything else (5xx, timeout, network) is an upstream outage: neither
-		// may masquerade as a bad request.
-		if status >= 400 && status < 500 && status != fiber.StatusTooManyRequests {
-			return apperror.NewBadRequest("failed to exchange authorization code")
+		if status >= 400 && status < 500 && status != 429 {
+			return nil, apperror.NewBadRequest("failed to exchange authorization code")
 		}
-		return apperror.NewCode(identitycatalog.CodeAuthOAuthUpstreamUnavailable, "oauth provider is unavailable")
+		return nil, apperror.NewCode(identitycatalog.CodeAuthOAuthUpstreamUnavailable, "oauth provider is unavailable")
 	}
 
-	// An existing or linkable account may always sign in; only creating a new
-	// account is a registration, so it honors user_registration.
 	allowSignUp := features.Require(ctx, h.flags, identitycatalog.KeyUserRegistration, features.Subject{TenantID: tenantID}) == nil
-	result, err := h.userSvc.SignInWithGoogle(service.WithUserAgent(service.WithClientIP(ctx, c.IP()), c.Get(fiber.HeaderUserAgent)), service.GoogleSignIn{
+	result, err := h.userSvc.SignInWithGoogle(withClientMetadata(ctx), service.GoogleSignIn{
 		GoogleID:      info.ID,
 		Email:         info.Email,
 		Name:          info.Name,
 		EmailVerified: info.VerifiedEmail,
 		AllowSignUp:   allowSignUp,
-		// Admission runs inside the sign-in transaction, before the session
-		// is issued and auth.google_login is recorded: a refused sign-in
-		// rolls back and is not audited.
 		Complete: func(ctx context.Context, member *service.Member) error {
-			return h.admitGoogleUser(ctx, c, tenantID, member)
+			return h.admitGoogleUser(ctx, tenantID, member)
 		},
 		MFARequired: func(ctx context.Context, member *service.Member) (bool, error) {
 			if h.mfa == nil {
@@ -763,27 +576,28 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
+	cleared := oauthStateCookieName + "=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax"
 	if result.MFARequired {
 		challenge, err := h.mfa.BeginChallenge(ctx, result.Member.User.ID, service.AMRGoogle)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		return c.Redirect().To(h.googleOAuth.BuildMFACallbackURL(challenge))
+		return &redirectOutput{Location: h.googleOAuth.BuildMFACallbackURL(challenge), SetCookie: cleared}, nil
 	}
 	exchangeCode, err := h.issueGoogleExchangeGrant(ctx, tenantID, result)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return c.Redirect().To(h.googleOAuth.BuildCodeCallbackURL(exchangeCode))
+	return &redirectOutput{Location: h.googleOAuth.BuildCodeCallbackURL(exchangeCode), SetCookie: cleared}, nil
 }
 
 // googleExchangeGrant is the sealed payload behind a callback's one-time
 // code. It carries the tenant that started the flow and the token response
 // the exchange endpoint returns, so the code alone mints nothing.
 type googleExchangeGrant struct {
-	TenantID  int64             `json:"tenantId"`
+	TenantID  uuid.UUID         `json:"tenantId"`
 	ExpiresAt int64             `json:"exp"`
 	Response  dto.LoginResponse `json:"response"`
 }
@@ -798,15 +612,14 @@ func googleExchangeInvalid() error {
 }
 
 // issueGoogleExchangeGrant stores the signed-in user's tokens under a random
-// 256-bit code for googleExchangeTTL and returns the code. The tokens never
-// appear in the redirect URL.
-func (h *AuthHandler) issueGoogleExchangeGrant(ctx context.Context, tenantID int64, result *service.GoogleSignInResult) (string, error) {
+// 256-bit code for googleExchangeTTL and returns the code.
+func (h *AuthHandler) issueGoogleExchangeGrant(ctx context.Context, tenantID uuid.UUID, result *service.GoogleSignInResult) (string, error) {
 	if h.cache == nil || h.sealer == nil {
-		return "", apperror.NewInternal("google exchange store is not configured")
+		return "", apperror.Internal(nil, "google exchange store is not configured")
 	}
 	raw := make([]byte, googleExchangeCodeBytes)
 	if _, err := rand.Read(raw); err != nil {
-		return "", apperror.NewInternal("failed to generate google exchange code")
+		return "", apperror.Internal(err, "failed to generate google exchange code")
 	}
 	code := base64.RawURLEncoding.EncodeToString(raw)
 	grant := googleExchangeGrant{
@@ -820,109 +633,90 @@ func (h *AuthHandler) issueGoogleExchangeGrant(ctx context.Context, tenantID int
 	}
 	payload, err := json.Marshal(grant)
 	if err != nil {
-		return "", apperror.NewInternal("failed to encode google exchange grant")
+		return "", apperror.Internal(err, "failed to encode google exchange grant")
 	}
 	sealed, err := h.sealer.Seal(payload)
 	if err != nil {
-		return "", apperror.NewInternal("failed to seal google exchange grant")
+		return "", apperror.Internal(err, "failed to seal google exchange grant")
 	}
 	if err := h.cache.Set(ctx, googleExchangeKey(code), sealed, googleExchangeTTL); err != nil {
-		return "", apperror.NewInternal("failed to store google exchange code")
+		return "", apperror.Internal(err, "failed to store google exchange code")
 	}
 	return code, nil
 }
 
-// GoogleExchange godoc
-// @Summary Redeem a Google sign-in code
-// @Description Exchange the single-use code from the Google callback's URL fragment for the normal access and refresh token pair. The code expires after 60 seconds, works once, and is bound to the tenant that started the flow.
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param request body dto.GoogleExchangeRequest true "One-time code from the callback fragment"
-// @Success 200 {object} dto.LoginResponse
-// @Failure 401 {object} apperror.ProblemDetails "auth.oauth_code_invalid"
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/google/exchange [post]
-func (h *AuthHandler) GoogleExchange(c fiber.Ctx) error {
-	var req dto.GoogleExchangeRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
+// GoogleExchange redeems a Google sign-in code for the token pair.
+func (h *AuthHandler) GoogleExchange(ctx context.Context, input *googleExchangeInput) (*loginOutput, error) {
 	if h.cache == nil || h.sealer == nil {
-		return apperror.NewInternal("google exchange store is not configured")
+		return nil, apperror.Internal(nil, "google exchange store is not configured")
 	}
-	key := googleExchangeKey(req.Code)
-	sealed, err := h.cache.Get(c.Context(), key)
+	key := googleExchangeKey(input.Body.Code)
+	sealed, err := h.cache.Get(ctx, key)
 	if err != nil {
 		slog.Error("failed to read google exchange code", slog.Any("error", err))
-		return apperror.NewInternal("failed to read google exchange code")
+		return nil, apperror.Internal(err, "failed to read google exchange code")
 	}
 	if len(sealed) == 0 {
-		return googleExchangeInvalid()
+		return nil, googleExchangeInvalid()
 	}
 	plain, err := h.sealer.Open(sealed)
 	if err != nil {
-		return googleExchangeInvalid()
+		return nil, googleExchangeInvalid()
 	}
 	var grant googleExchangeGrant
 	if err := json.Unmarshal(plain, &grant); err != nil {
-		return googleExchangeInvalid()
+		return nil, googleExchangeInvalid()
 	}
-	if grant.TenantID != tenant.EffectiveID(c.Context()) || !time.Now().Before(time.Unix(grant.ExpiresAt, 0)) {
-		return googleExchangeInvalid()
+	if grant.TenantID != tenant.IDFromContext(ctx) || !time.Now().Before(time.Unix(grant.ExpiresAt, 0)) {
+		return nil, googleExchangeInvalid()
 	}
-	// Read-then-compare-and-delete keeps redemption single-use: when two
-	// callers hold the same code, exactly one CompareAndDelete succeeds.
 	cd, ok := h.cache.(cache.CompareDeleter)
 	if !ok {
-		return apperror.NewCode(apperror.CodeSystemUnavailable, "unable to redeem google sign-in code")
+		return nil, apperror.NewCode(apperror.CodeSystemUnavailable, "unable to redeem google sign-in code")
 	}
-	consumed, err := cd.CompareAndDelete(c.Context(), key, sealed)
+	consumed, err := cd.CompareAndDelete(ctx, key, sealed)
 	if err != nil {
 		slog.Error("failed to consume google exchange code", slog.Any("error", err))
-		return apperror.NewInternal("failed to consume google exchange code")
+		return nil, apperror.Internal(err, "failed to consume google exchange code")
 	}
 	if !consumed {
-		return googleExchangeInvalid()
+		return nil, googleExchangeInvalid()
 	}
-	fiber.Locals(c, "user_id", grant.Response.User.ID)
-	return response.Success(c, grant.Response)
+	auditActor(ctx, grant.Response.User.ID)
+	refreshToken := grant.Response.RefreshToken
+	grant.Response.RefreshToken = h.refreshCookie.jsonRefreshToken(refreshToken)
+	return &loginOutput{
+		SetCookie: h.refreshCookie.cookieHeader(refreshToken),
+		Body:      grant.Response,
+	}, nil
 }
 
 // verifyOAuthCallbackState checks the CSRF state against its cookie and
-// returns the active tenant bound into it plus the PKCE verifier stored in the
-// same signed cookie. The callback ignores X-Tenant-Slug: the signed state is
-// the only trusted tenant source for this browser redirect.
-func (h *AuthHandler) verifyOAuthCallbackState(c fiber.Ctx) (tenantID int64, tenantSlug, verifier string, err error) {
-	state := c.Query("state")
-	cookieValue := c.Cookies(oauthStateCookieName)
-	if state == "" || cookieValue == "" {
-		return 0, "", "", apperror.NewBadRequest("invalid oauth state")
+// returns the active tenant bound into it plus the PKCE verifier.
+func (h *AuthHandler) verifyOAuthCallbackState(ctx context.Context, input *googleCallbackInput) (tenantID uuid.UUID, tenantSlug, verifier string, err error) {
+	cookieValue := cookieValue(input.Cookie, oauthStateCookieName)
+	if input.State == "" || cookieValue == "" {
+		return uuid.Nil, "", "", apperror.NewBadRequest("invalid oauth state")
 	}
 	cookieState, verifier, ok := decodeOAuthFlow(h.oauthStateKey, cookieValue)
-	if !ok || subtle.ConstantTimeCompare([]byte(state), []byte(cookieState)) != 1 {
-		return 0, "", "", apperror.NewBadRequest("invalid oauth state")
+	if !ok || subtle.ConstantTimeCompare([]byte(input.State), []byte(cookieState)) != 1 {
+		return uuid.Nil, "", "", apperror.NewBadRequest("invalid oauth state")
 	}
-	_, stateTenantID, ok := decodeOAuthState(h.oauthStateKey, state)
+	_, stateTenantID, ok := decodeOAuthState(h.oauthStateKey, input.State)
 	if !ok {
-		return 0, "", "", apperror.NewBadRequest("invalid oauth state")
+		return uuid.Nil, "", "", apperror.NewBadRequest("invalid oauth state")
 	}
 	if h.tenants == nil {
-		return 0, "", "", apperror.NewInternal("oauth tenant validation is not configured")
+		return uuid.Nil, "", "", apperror.Internal(nil, "oauth tenant validation is not configured")
 	}
-	// GetOperational only returns operational tenants, so a tenant suspended during the
-	// consent round-trip cannot complete the login.
-	stateTenant, err := h.tenants.GetOperational(c.Context(), stateTenantID)
+	stateTenant, err := h.tenants.GetOperational(ctx, stateTenantID)
 	if err != nil {
-		return 0, "", "", apperror.NewBadRequest("invalid oauth state")
+		return uuid.Nil, "", "", apperror.NewBadRequest("invalid oauth state")
 	}
 	return stateTenant.ID, stateTenant.Slug, verifier, nil
 }
 
-// oauthErrorStatus extracts the upstream HTTP status from the provider error,
-// or 0 when the failure never reached an HTTP response (timeout, DNS, TLS).
+// oauthErrorStatus extracts the upstream HTTP status from the provider error.
 func oauthErrorStatus(err error) int {
 	var retrieve *oauth2.RetrieveError
 	if errors.As(err, &retrieve) && retrieve.Response != nil {
@@ -936,7 +730,7 @@ func oauthErrorStatus(err error) int {
 }
 
 // oauthErrorType names the recognized error class for logs without exposing
-// the wrapped message (which may contain the code or a response body).
+// the wrapped message.
 func oauthErrorType(err error) string {
 	var retrieve *oauth2.RetrieveError
 	if errors.As(err, &retrieve) {
@@ -955,28 +749,13 @@ func oauthErrorType(err error) string {
 	return "transport"
 }
 
-func clearOAuthStateCookie(c fiber.Ctx) {
-	c.Cookie(&fiber.Cookie{
-		Name:     oauthStateCookieName,
-		Value:    "",
-		HTTPOnly: true,
-		Secure:   true,
-		SameSite: fiber.CookieSameSiteLaxMode,
-		MaxAge:   -1,
-		Path:     "/",
-		Expires:  time.Now().Add(-1 * time.Hour),
-	})
-}
-
 // admitGoogleUser applies the Login/Refresh sign-in rules to the account a
-// Google identity resolved to. A Google-linked account whose email was later
-// changed (which clears email_verified_at) must not mint a session.
-func (h *AuthHandler) admitGoogleUser(ctx context.Context, c fiber.Ctx, tenantID int64, member *service.Member) error {
+// Google identity resolved to.
+func (h *AuthHandler) admitGoogleUser(ctx context.Context, tenantID uuid.UUID, member *service.Member) error {
 	if member.Membership.TenantID != tenantID {
 		return apperror.NewUnauthorized("account is not active")
 	}
-	// Attribute request-level audit/logging to the signed-in user, as Login does.
-	fiber.Locals(c, "user_id", member.User.ID)
+	auditActor(ctx, member.User.ID)
 	if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
 		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}

@@ -6,7 +6,7 @@ support many business modules without microservice overhead.
 
 Related: [Data Model](data-model.md) (ER diagrams and table ownership),
 [API Design](api-design.md), [Module Template](module-template.md),
-[Operations](operations.md).
+[Operations](operations.md), [Security Model](security-model.md).
 
 ## Module map
 
@@ -53,7 +53,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | `internal/platform/*` and `pkg/*` never import `internal/modules/*`. | no-business-imports check |
 | `internal/app` never imports modules; only `cmd/*` imports `internal/bootstrap`. | composition-root check |
 | `internal/contracts` is stdlib-only (no repositories, DTOs, sqlc, storage, database, or session). | stdlib-only check |
-| `admin` never imports identity/files, sqlc, `pkg/storage`, `pkg/database`, or the session store. | admin check |
+| `admin` never imports identity/files, sqlc, `pkg/storage`, `internal/database`, or the session store. | admin check |
 | The deleted shared `internal/{handler,service,dto,repository}` and `internal/sqlc` packages cannot return. | legacy-package checks |
 | SQL queries touch only owned tables; `pkg/**` and `cmd/**` may not read module tables; dynamic `Exec`/`Query`/`QueryRow`/`Batch.Queue` SQL is rejected. | `test/arch/table_ownership_test.go`, `test/arch/sql_literals_test.go` |
 | A Tier 1 route's audit action is recorded by `RecordInTx`/`RecordTx` in the mutation transaction, tied to the action literal through the same function or a local call chain. | `test/arch/audit_routes_test.go` |
@@ -77,7 +77,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 
 | Module | Owns |
 |---|---|
-| `identity` | Auth, global users, memberships, RBAC roles and assignments, invitations, sessions, tokens, data exports/erasure, tenant lifecycle (including platform tenant administration); dto/repository/service/handler + adapter + queries/sqlc |
+| `identity` | Auth, global users, memberships, RBAC roles and assignments, invitations, sessions, tokens, data exports/erasure, tenant lifecycle (including platform tenant administration); `service/{core,authn,mfa,membership,tenancy,privacy}` subpackages, dto/repository/handler + adapter + queries/sqlc |
 | `files` | Upload, metadata, download, soft delete, restore (+ adapter + queries/sqlc) |
 | `features` | Admin feature-flag catalogue surface (+ queries/sqlc) |
 | `notifications` | In-app feed, channel preferences, durable email channel (+ queries/sqlc) |
@@ -88,7 +88,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | Platform package | Responsibility |
 |---|---|
 | `apikey` | Key generation/hash, verifier, rotation grace; `apikeyhttp.Authenticate` is the `ApiKey` middleware |
-| `authz` | Subject/policies, permission catalog and system-role scopes, ABAC, `Authorize`, `SystemContext`; route middleware in `authzhttp` (`Require`, `RequireAny`, `SetSubject`, `SubjectFromFiber`) |
+| `authz` | Subject/policies, the injected `Catalog` (permissions + system-role scopes) and `Authorizer`, ABAC, `SystemContext`; route middleware in `authzhttp` (`Require`, `RequireAny`, `SetSubject`, `SubjectFromFiber`) |
 | `audit` | Audit recorder and Tier 1 `TxRecorder`; `audithttp` holds `Guard`, `Policy`/`Mode*`, `AddMetadata`, and the fallback mutating-request middleware |
 | `events` | Typed in-process bus + durable job-backed subscriptions |
 | `features` | Compile-time flag catalog, evaluator, snapshot cache, DB store; route gate in `featureshttp` |
@@ -99,7 +99,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | `session` | Token-version/session cache |
 | `tenant` | Request tenant resolver and context helpers; `tenanthttp` holds the `X-Tenant-Slug` middleware and `ID`/`Slug` readers for `fiber.Ctx` |
 | `tracing` | OpenTelemetry provider (no-op when disabled) |
-| `versioning` | V1/V2 policy, `Accept-Version` assertions, deprecation headers |
+| `httpapi` | huma API construction, the one operation registration helper, policy metadata, RFC 9457 error model, ETag helpers |
 
 ## Request lifecycle
 
@@ -108,7 +108,6 @@ sequenceDiagram
     autonumber
     participant C as Client
     participant G as Global middleware
-    participant V as /api versioning
     participant T as tenanthttp.Middleware
     participant A as Authenticate
     participant R as Route chain
@@ -118,17 +117,15 @@ sequenceDiagram
 
     C->>G: HTTP request
     Note over G: Recovery, CORS, security headers,<br/>RequestID, i18n, tracing, metrics, logger,<br/>Recovery, body limit (JSON cap; multipart only on the upload route), audit fallback, timeout
-    G->>V: versioning.Guard on /api (unknown vN: 406)
-    Note over V: group versioning.Middleware:<br/>Accept-Version must match path (406)
-    V->>T: resolve X-Tenant-Slug, ?tenant= (browser auth paths) or default
+    G->>T: resolve X-Tenant-Slug, ?tenant= (browser auth paths) or default
     Note over T: unknown/suspended tenant: 404
-    T->>A: per-IP auth limiter, then ApiKey or Bearer JWT
+    T->>A: route limiter, then per-IP auth limiter + ApiKey/JWT
     Note over A: 429, 401 bad credential,<br/>403 tenant mismatch
-    A->>R: route limiter (strict/normal/relaxed)
-    Note over R: authzhttp.Require (403) then optional feature gate (404)<br/>then Idempotency (replay, 409 in progress, 422 key mismatch) then audithttp.Guard (503)
+    A->>R: huma operation policy chain
+    Note over R: authzhttp.Require (403), RequireMFA (403), optional feature gate (404),<br/>Idempotency (replay, 409 in progress, 422 key mismatch), audithttp.Guard (503)
     R->>H: c.Next()
     H->>S: validated DTO
-    S->>DB: query scoped by tenant.EffectiveID(ctx)
+    S->>DB: query scoped by tenant.Require(ctx)
     DB-->>S: rows
     S-->>H: result or *apperror.AppError
     H-->>C: response.* JSON, or RFC 9457 problem via the error handler
@@ -137,18 +134,18 @@ sequenceDiagram
 | Stage | Mounted on | Notes |
 |---|---|---|
 | Global middleware | every route, in the order shown | `i18n.Middleware` runs right after request ID so every response, errors included, carries the negotiated locale. `audithttp.Middleware` is a fallback and skips routes guarded by `audithttp.Guard`. |
-| `versioning.Guard` | `/api` | Rejects unknown `/api/vN` before routing. |
-| `versioning.Middleware` + `tenanthttp.Middleware` | `/api/v1` and `/api/v2` groups | v2 exists only when a module implements `app.V2Module`. Probes (`/healthz`, `/readyz`, `/metrics`) stay outside tenant resolution. |
+| `httpapi` | every operation | Registers the huma operation, its OpenAPI security requirement, and the exact policy chain. |
+| `tenanthttp.Middleware` | `/api/v1` operations | Resolves the tenant per operation. Probes (`/healthz`, `/readyz`, `/metrics`) stay outside tenant resolution. |
 | `deps.Authenticate()` | module group or route | Per-IP `auth` limiter first, then `apikeyhttp.Authenticate` wrapping `JWTAuth`. |
-| Route chain | each route | `limiter → authzhttp.Require → [features gate] → deps.Idempotency → audithttp.Guard → handler`. Idempotency replays short-circuit before the guard, so replays are never re-audited. |
+| Route chain | each operation | `rate limit → authenticate → authz → MFA → Idempotency → audithttp.Guard → handler`. Idempotency replays short-circuit before the guard, so replays are never re-audited. |
 
 ### Tenant and credential resolution
 
 - `tenanthttp.Middleware` validates `[a-z0-9-]{1,63}` and resolves the slug: header;
   validated `?tenant=` fallback only on `/auth/google`, `/auth/reset-password`,
   and `/auth/verify-email`; otherwise `TENANT_DEFAULT_SLUG`
-  (`TENANT_REQUIRE_HEADER=true` disables the default). It stores
-  `tenant_id`/`tenant_slug` in Fiber locals and the request context.
+  (`TENANT_REQUIRE_HEADER=true` disables the default). It stores the tenant id
+  and slug in the request context (`tenant.IDFromContext`/`SlugFromContext`).
 - The Google OAuth callback is exempt so require-header mode cannot reject it
   before the handler validates the signed `state`; the handler installs the
   state tenant itself. Exemption and query-fallback path checks compare the
@@ -161,7 +158,7 @@ sequenceDiagram
 - `JWTAuth` loads the session snapshot (session/membership/user/tenant state
   plus the effective permission set) and installs an `authz.Subject` from it.
 - `Authorization: ApiKey ...` verifies the credential, re-reads the owner
-  principal, and installs the same locals plus an `authz.Subject` limited to
+  principal, and installs the same context values plus an `authz.Subject` limited to
   the key's scopes intersected with the owner's current permissions. See
   [API Design](api-design.md#authentication-and-authorization).
 - The public webhook receiver (`POST /webhooks/inbound/:id`) mounts auth per
@@ -179,7 +176,7 @@ flowchart LR
         nt[notifications] -->|NotificationRecipientLookup| ad2
     end
     subgraph outbox["2 - Transactional outbox"]
-        svc["service<br/>business tx"] -->|EnqueueTx / EnqueueOnceTx| j1[("jobs<br/>email.send, ...")]
+        svc["service<br/>business tx"] -->|EnqueueTx / EnqueueOnceTx| j1[("jobs<br/>email.send.encrypted, ...")]
         j1 -->|worker| h1["job handler"]
     end
     subgraph bus["3 - Domain events"]
@@ -247,10 +244,11 @@ flowchart LR
     webhooks -->|Dispatcher| deps
 ```
 
-Arrows read "provider supplies X to consumer". Notifications exposes
-`notifications.Notifier` (`internal/contracts/notifications`) for other
-modules and never imports identity or reads `users`; the identity export job
-consumes it through a late-bound `SetNotifier` after both modules are built.
+Arrows read "provider supplies X to consumer". Notifications never imports
+identity or reads `users`. Identity publishes `identity.data_export.ready`
+(payload in `internal/contracts/identity`) when an export becomes ready, and
+notifications consumes it through a durable `app.EventProvider` subscription;
+there is no late binding between the two modules.
 The privacy registry is wired the same way: each module implements
 `app.PrivacyProvider`, `bootstrap` owns the `privacy.Registry`, and identity's
 export/erase jobs call the registered exporters/erasers.
@@ -263,7 +261,9 @@ of several tenants, each membership with its own roles and status. Tenant `1` (`
 the baseline and keeps header-less local/test requests and pre-tenancy rows
 working; production sets `TENANT_REQUIRE_HEADER=true`. Startup checks tenant
 **existence** regardless of status, so a suspended default tenant starts
-normally and its requests return 404.
+normally and its requests return 404. The threat model and the exact isolation
+guarantees (and non-guarantees) are in
+[Security Model](security-model.md).
 
 | Area | Isolation rule |
 |---|---|
@@ -273,24 +273,23 @@ normally and its requests return 404.
 | Notifications | Every query filters `(tenant_id, user_id)`; another user's or tenant's id is not found. |
 | Webhooks | Endpoints, secrets, deliveries, attempts, sources, and inbound events all lead with `tenant_id`. The only unscoped lookup is the public receiver's source-by-ID, which then authenticates with HMAC and installs the source tenant. |
 | API keys | Tenant/user-bound rows with only a SHA-256 hash at rest; scopes are a subset of the owner's effective permissions. Rotation marks the old row and creates the new key in one transaction (grace window); revocation is immediate; last use is touched on a throttled interval. |
-| Feature flags | Targets are tenant-owned (`tenant.EffectiveID(ctx)`); a composite FK keeps user targets in their tenant. Definitions, defaults, and kill switches are process-wide. See [Feature Flags](feature-flags.md). |
+| Feature flags | Targets are tenant-owned (`tenant.IDFromContext(ctx)`); a composite FK keeps user targets in their tenant. Definitions, defaults, and kill switches are process-wide. See [Feature Flags](feature-flags.md). |
 | Jobs, events, audit | Enqueue writes `jobs.tenant_id` from the context; the worker restores it with `tenant.WithID`. Event metadata carries tenant/request/actor; audit rows record the request tenant. Retention and metrics stay global. |
 | Scheduler | One global leader. Each schedule chooses a tenant in its spec; the job stores it. `scheduler_leases`/`scheduler_runs` have no tenant column. |
 | OAuth | The tenant is bound into the signed `state` and the state cookie (which also holds the PKCE verifier); the callback rejects unknown/suspended tenants instead of trusting `X-Tenant-Slug`. The callback redirects with a single-use 60-second code, redeemed through `POST /auth/google/exchange`. |
-| Sessions | Tokens without a positive `tenant_id` or `sid` claim are rejected. The session validator loads the token's session and compares its tenant, the membership role and status, the user status and token version, the tenant status, and the session's absolute expiry (`SESSION_MAX_LIFETIME`), so a revocation, ban, role change, suspension, or expired session takes effect within the 5-second session-cache TTL. The same snapshot carries `mfa_verified_at` (set by an `otp`/`rc` sign-in or `POST /auth/mfa/step-up`), which `authzhttp.RequireMFA` compares with `MFA_MAX_AGE` (default `12h`). |
+| Sessions | Tokens without a positive `tenant_id` or `sid` claim are rejected. The session validator loads the token's session and compares its tenant, the membership role and status, the user status and token version, the tenant status, and the session's absolute expiry (`SESSION_MAX_LIFETIME`), so a revocation, ban, role change, suspension, or expired session takes effect within the 5-second session-cache TTL. The same snapshot carries `mfa_verified_at` (set by an `otp`/`rc`/`hwk`/`swk` sign-in or `POST /me/mfa/step-up`), which `authzhttp.RequireMFA` compares with `MFA_MAX_AGE` (default `12h`); a platform permission instead uses `RequirePasskeyMFA`, which only accepts `hwk`/`swk`. |
 | Idempotency | Cache keys include tenant ID/slug, method, path, and caller, so a replayed `201` cannot cross tenants. |
 | Logout | Revokes the refresh token's session by possession, so it works even without the header. A reused refresh token revokes its whole session. |
 
-Repositories derive the tenant from `tenant.EffectiveID(ctx)` where they must
-name a tenant on a row; the tenant-1 fallback is only for jobs, internal
-callers, and tests. The row-level-security scope is stricter: it comes from
-`tenant.IDFromContext(ctx)` and nowhere else, so a path with no tenant in its
-context sees no tenant-owned rows instead of silently reading or writing the
-compatibility tenant. Background work installs the tenant explicitly (the job
-worker restores the job's `tenant_id` before running the handler), and
-deliberate global work marks the context with `database.WithRLSBypass`.
-Cross-tenant ids or tokens behave as not found. As a second line, every
-tenant-owned table has forced row-level security:
+Repositories derive the tenant with `tenant.Require(ctx)` where they must
+name a tenant on a row; a context without one is an error, never a fallback.
+The row-level-security scope comes from `tenant.IDFromContext(ctx)` and
+nowhere else, so a path with no tenant in its context sees no tenant-owned
+rows. Background work installs the tenant explicitly (the job worker restores
+the job's `tenant_id` before running the handler and dead-letters a job that
+has none), and deliberate global work marks the context with
+`database.WithRLSBypass`. Cross-tenant ids or tokens behave as not found. As a
+second line, every tenant-owned table has forced row-level security:
 `database.TxManager` and `database.Scoped` set the transaction-local
 `app.tenant_id` setting, so a query that forgot its predicate still cannot
 read or write another tenant's rows. Isolation is a role property, not a
@@ -339,7 +338,7 @@ limits remain future work.
   Fiber-free; Fiber adapters live in `*http` subpackages (`apperrorhttp`,
   `authzhttp`, `tenanthttp`, `audithttp`, `apikeyhttp`, `featureshttp`).
   `test/arch/framework_free_test.go` enforces it, and keeps the AWS SDK in
-  `pkg/storage/s3store` (driver selection: `pkg/storage/drivers`).
+  `internal/storage/s3store` (driver selection: `internal/storage/drivers`).
 
 | Decision | HTTP |
 |---|---|
@@ -391,14 +390,17 @@ keeps the repository's tenant scoping.
 
 - Only `cmd/migrate` applies DDL. The API and seed assume the schema exists;
   `cmd/migrate` also verifies required tenant tables/columns/indexes and that
-  the `default` tenant exists with id 1.
+  the `default` tenant exists at the pinned UUIDv7 constant `tenant.DefaultID`.
+- Every surrogate key is a UUIDv7 (`UUID DEFAULT uuidv7()`); Go code that needs
+  the id before insert calls `uuid.NewV7()`, foreign keys are `UUID`, and token
+  hashes are 32-byte `BYTEA` digests.
 - Fresh installs apply the single init:
   `migrations/20260101000000_platform_init_schema.{up,down}.sql`, one `-- owner:`
   section per owner, shared functions first, then identity, platform tables,
   and modules in FK order.
 - Once a database is deployed, add timestamped migrations
   (`make migrate-create module=<owner> name=<purpose>`); never edit a shipped
-  migration. Legacy databases keep their recorded history (see README).
+  migration.
 - `feature_flags` is global configuration; `scheduler_leases` and
   `scheduler_runs` are tenant-independent with no foreign keys; identity's
   `users`, `user_passwords`, `user_identities`, and reset/verification tokens
@@ -424,7 +426,7 @@ Table-by-table details, keys, and FK actions: [Data Model](data-model.md).
 | Audit | Privileged mutations are fail-closed. Tier 1 services (identity registration/profile/password/delete, invitations create/revoke/accept/sign-up, tenant lifecycle, role definitions/member roles, admin role/ban/unban, admin file delete/restore, API-key lifecycle) call `audit.TxRecorder.RecordTx` in the mutation transaction. Tier 2 routes use `audithttp.Guard`: an `outcome=started` intent row before the handler, completed as succeeded/failed/denied; a required guard returns `503 system.audit_unavailable` when the intent cannot be stored. Rows carry actor type/role, source, request ID, IP, route, and tenant. `audit.NewServiceEvent` enriches domain events from the context. |
 | Errors | `*apperror.AppError` with a stable catalog code, rendered as RFC 9457 `application/problem+json`. With `Deps.I18n`, titles and validation messages follow `Accept-Language`; `DetailKey` opts a detail in. A nil localizer keeps English. |
 | i18n | `en`/`vi` catalogs must keep identical keys and `{placeholders}` (`i18n.New` fails otherwise). `vi-VN` truncates to `vi`; unsupported languages fall back to `I18N_DEFAULT_LOCALE`. |
-| API versions | `/api/v1` always; opt-in `/api/v2` via `app.V2Module`. `Accept-Version` must match the path (406 `api.version_unsupported`). Responses carry `API-Version`, `Vary: Accept-Version`, and configured deprecation metadata. Swagger stays on v1. |
+| API surface | `/api/v1` only. There is no `/api/v2`, `Accept-Version`, or deprecation-header machinery. `docs/openapi.yaml` is generated from the huma operations. |
 | Idempotency | Opt-in `Idempotency-Key` on mutating routes, cache-backed, 24h replay, body-bound for non-multipart requests. Secret-returning creates are excluded so plaintext secrets never enter the shared cache. |
 | Feature flags | Module-declared catalog (`catalog/flags.go`, `app.FlagProvider`), precedence force-off > kill switch > user > tenant > database default > environment > compiled default. Admin writes invalidate the local snapshot. |
 | Observability | Request IDs, structured `slog`, Prometheus HTTP/job/event/scheduler/audit metrics, readiness checks for DB/cache. Labels stay bounded (`event`, `schedule`, `outcome`), never tenant IDs. |
@@ -435,22 +437,31 @@ Table-by-table details, keys, and FK actions: [Data Model](data-model.md).
 flowchart TD
     cfg["config.Load<br/>(FEATURE_FLAGS syntax only)"] --> infra["Infra: tracing, pool, storage, cache,<br/>flag evaluator, email, tx, audit, job queue/worker,<br/>event bus, queued email sender"]
     infra --> build["bootstrap.Build(cfg, infra)<br/>every module's Build + Settings<br/>+ contract wiring"]
-    build --> cat["app.RegisterCatalogs<br/>permissions, error codes, flags"]
+    build --> cat["app.Catalogs.Register<br/>permissions, error codes, flags"]
     cat --> keys["cfg.FeatureFlags.ValidateKnownKeys<br/>unknown FEATURE_FLAGS keys fail here"]
     keys --> i18n["i18n.New(locale, app.LocaleSources)<br/>merge + parity check"]
     i18n --> startup["Modules.Startup<br/>tenant existence, permission sync"]
     startup --> appnew["app.New + app.Register<br/>routes, jobs, events, schedules"]
-    appnew --> run["email.send handlers, scheduler,<br/>worker, Modules.Background, HTTP listen"]
+    appnew --> run["email.send.encrypted handlers, scheduler,<br/>worker, Modules.Background, HTTP listen"]
 ```
 
-- Catalog registries (`authz`, `apperror`, `features`) are process-wide
-  copy-on-write snapshots behind an `atomic.Pointer`, so the per-request read
-  path takes no lock. Registration fails on invalid identifiers, unknown roles,
-  or a key owned by another module; identical re-registration by the same
-  owner is a no-op so tests can build the app repeatedly.
-- Platform-wide entries stay central: `permission.denied`, `feature.disabled`,
-  `rate_limit.exceeded`, `api.version_unsupported`, `system.*`, generic status
-  titles, validation messages, the shared back-office permissions
+- Catalogs are injected instances, not process-wide registries. The
+  composition root creates `app.Catalogs{Errors, Permissions, Features}` before
+  building modules, passes the same instances through `app.Infra`, adds every
+  module provider after `Build`, and seals them before serving. `Add` fails on
+  invalid identifiers, unknown roles, duplicate keys, a key owned by another
+  module, or a different definition for the same key; a failed call adds
+  nothing. Tests build independent catalogs from the same providers.
+- `apperror.NewCode` is a pure constructor: status, title, and type are resolved
+  only when `apperrorhttp`/`httpapi` render through the injected
+  `*apperror.Catalog`. An unknown code still renders 500 `system.internal` and
+  logs. Module catalogs expose `Errors() []apperror.Spec`.
+- Services receive `authz.Authorizer` in their dependencies; the evaluator and
+  feature admin service receive the injected `*features.Catalog`. There is no
+  package-level `Register`, `Authorize`, or catalog lookup.
+- Platform-wide entries stay central: `request.*`, `auth.unauthenticated`,
+  `permission.denied`, `resource.*`, `feature.disabled`, `rate_limit.exceeded`,
+  `system.*`, validation messages, the shared back-office permissions
   (`admin:users:*`, `admin:files:*`, `admin:stats:read`), and the platform
   permissions (`platform:tenants:*`, `platform:features:write`,
   `platform:users:mfa_reset`).
@@ -497,6 +508,6 @@ Use the generator [`cmd/gen`](../cmd/gen/main.go) and the
    `app.ScheduleProvider`, or `app.FlagProvider` hooks instead of wiring work
    imperatively.
 6. Add unit + integration tests; run `make check`, `go test -race ./...`, and
-   `make swagger`.
+   `make openapi`.
 7. For durable work, enqueue a job transactionally; never use `async.Go` for
    work that must survive a restart.

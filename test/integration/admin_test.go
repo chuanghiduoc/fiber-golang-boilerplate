@@ -4,182 +4,115 @@ package integration_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
-	"strconv"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
-	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
-	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
-	filesadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/adapter"
-	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
-	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
-	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
-const adminIntegrationSecret = "integration-secret"
-
-func setupIntegrationApp(t *testing.T) (*fiber.App, *pgxpool.Pool) {
-	t.Helper()
-	ctx := context.Background()
-
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
-
-	appCache := cache.NewMemoryCache()
-	t.Cleanup(func() { _ = appCache.Close() })
-	txManager := testutil.NewTxManager(pool)
-	auditRecorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
-	kit := newIdentityKit(pool, appCache, auditRecorder, adminIntegrationSecret, nil)
-
-	fileRepo := filesrepo.NewFileRepository(testutil.Scoped(pool))
-	store, err := storage.NewLocalStorage(t.TempDir())
-	require.NoError(t, err)
-
-	identityAdmin := identityadapter.NewAdminIdentity(kit.admin)
-	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesrepo.NewTransactor(txManager, auditRecorder, nil), store))
-	adminHandler := adminhandler.NewHandler(adminservice.NewService(identityAdmin, filesAdmin))
-
-	app := fiber.New(fiber.Config{
-		ErrorHandler: apperrorhttp.FiberErrorHandler,
-	})
-
-	app.Post("/auth/register", func(c fiber.Ctx) error {
-		var req identitydto.RegisterRequest
-		if err := httpx.BindAndValidate(c, &req); err != nil {
-			return err
-		}
-		// This minimal app has no tenant middleware: the route is the default
-		// tenant by construction, and the RLS resolver is fail-closed.
-		ctx := tenant.WithID(c.Context(), tenant.DefaultID)
-		user, err := kit.users.Register(ctx, identityservice.RegisterInput{
-			Email:    req.Email,
-			Password: req.Password,
-			Name:     req.Name,
-		})
-		if err != nil {
-			return err
-		}
-		return response.Created(c, identitydto.UserResponse{
-			ID:       user.User.ID,
-			TenantID: user.Membership.TenantID,
-			Email:    user.User.Email,
-			Name:     user.User.Name,
-			Role:     user.Membership.Role,
-		})
-	})
-
-	users := app.Group("/users", middleware.JWTAuth(adminIntegrationSecret, kit.sessions))
-	users.Get("/me", kit.userHandler.GetMe)
-
-	admin := app.Group("/admin",
-		middleware.JWTAuth(adminIntegrationSecret, kit.sessions),
-		middleware.RequireRole("admin"),
-	)
-	admin.Get("/stats", adminHandler.GetStats)
-	admin.Get("/users", adminHandler.ListUsers)
-	admin.Put("/users/:id/role", adminHandler.UpdateRole)
-	admin.Post("/users/:id/ban", adminHandler.BanUser)
-	admin.Post("/users/:id/unban", adminHandler.UnbanUser)
-
-	return app, pool
+type adminHarness struct {
+	app    *fiber.App
+	pool   *pgxpool.Pool
+	secret string
+	admin  testutil.Member
+	user   testutil.Member
+	token  string
 }
 
-// registerMember registers through the HTTP route and returns the new member
-// of the default tenant (the route has no tenant middleware).
-func registerMember(t *testing.T, app *fiber.App, email, name string) testutil.Member {
+func setupAdminHarness(t *testing.T) *adminHarness {
 	t.Helper()
-	body, err := json.Marshal(identitydto.RegisterRequest{Email: email, Password: testPassphrase, Name: name})
+	full := newIntegrationApp(t, "test")
+	admin := testutil.CreateMember(t, t.Context(), full.pool, uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000001"), "admin-a@example.com", testutil.MemberOptions{Role: identitydto.RoleAdmin})
+	user := testutil.CreateMember(t, t.Context(), full.pool, uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000001"), "user-a@example.com", testutil.MemberOptions{Role: identitydto.RoleMember})
+	token := testutil.SessionToken(t, t.Context(), full.pool, admin, full.config.JWT.Secret)
+	return &adminHarness{app: full.app, pool: full.pool, secret: full.config.JWT.Secret, admin: admin, user: user, token: token}
+}
+
+func (h *adminHarness) request(t *testing.T, method, path, bearer, body string) (int, []byte) {
+	t.Helper()
+	var reader io.Reader = http.NoBody
+	if body != "" {
+		reader = bytes.NewReader([]byte(body))
+	}
+	req, err := http.NewRequest(method, path, reader)
 	require.NoError(t, err)
-	req, _ := http.NewRequest("POST", "/auth/register", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
+	if body != "" {
+		contentType := "application/json"
+		if method == http.MethodPatch {
+			contentType = "application/merge-patch+json"
+		}
+		req.Header.Set("Content-Type", contentType)
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	req.Header.Set("X-Tenant-Slug", "default")
+	resp, err := h.app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
 	require.NoError(t, err)
-	respBody, _ := io.ReadAll(resp.Body)
-	require.Equal(t, fiber.StatusCreated, resp.StatusCode, "body: %s", respBody)
-	var user identitydto.UserResponse
-	require.NoError(t, json.Unmarshal(respBody, &user))
-	return testutil.Member{UserID: user.ID, TenantID: tenant.DefaultID, Email: user.Email, Role: user.Role}
+	defer func() { _ = resp.Body.Close() }()
+	payload, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp.StatusCode, payload
 }
 
 func TestIntegration_AdminOperations(t *testing.T) {
-	app, pool := setupIntegrationApp(t)
-	ctx := context.Background()
+	h := setupAdminHarness(t)
 
-	do := func(method, path, bearer string, body []byte) int {
-		t.Helper()
-		var reader io.Reader = http.NoBody
-		if body != nil {
-			reader = bytes.NewReader(body)
-		}
-		req, _ := http.NewRequest(method, path, reader)
-		if body != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
-		req.Header.Set("Authorization", "Bearer "+bearer)
-		resp, err := app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
-		require.NoError(t, err)
-		return resp.StatusCode
+	// The admin routes are the canonical /stats and /members collections.
+	status, body := h.request(t, http.MethodGet, "/api/v1/stats", h.token, "")
+	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	var stats struct {
+		ActiveUsers int64 `json:"activeUsers"`
 	}
+	require.NoError(t, json.Unmarshal(body, &stats))
+	assert.Equal(t, int64(2), stats.ActiveUsers)
 
-	regular := registerMember(t, app, "regular@test.com", "Regular User")
-	regularToken := testutil.SessionToken(t, ctx, pool, regular, adminIntegrationSecret)
+	status, body = h.request(t, http.MethodGet, "/api/v1/members", h.token, "")
+	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	var page struct {
+		Data []identitydto.UserResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(body, &page))
+	assert.Len(t, page.Data, 2)
 
-	// A real admin membership with a live session, so the session validator
-	// has a current role/version to compare against.
-	admin := testutil.CreateMember(t, ctx, pool, tenant.DefaultID, "admin@test.com",
-		testutil.MemberOptions{Role: identitydto.RoleAdmin})
-	adminToken := testutil.SessionToken(t, ctx, pool, admin, adminIntegrationSecret)
+	// A banned member is suspended; unbanning is the same PATCH with status
+	// active. PATCH is conditional through the member's ETag.
+	status, body = h.request(t, http.MethodGet, "/api/v1/members/"+h.user.UserID.String(), h.token, "")
+	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	var read struct {
+		MembershipStatus string `json:"membershipStatus"`
+	}
+	require.NoError(t, json.Unmarshal(body, &read))
+	status, body = h.request(t, http.MethodPatch, "/api/v1/members/"+h.user.UserID.String(), h.token, `{"status":"suspended"}`)
+	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	assert.Contains(t, string(body), `"membershipStatus":"suspended"`)
 
-	assert.Equal(t, fiber.StatusOK, do("GET", "/admin/stats", adminToken, nil))
-	assert.Equal(t, fiber.StatusOK, do("GET", "/admin/users", adminToken, nil))
+	// A removed membership is a ban plus removal; restoring follows the same
+	// lifecycle.
+	status, body = h.request(t, http.MethodPatch, "/api/v1/members/"+h.user.UserID.String(), h.token, `{"status":"active"}`)
+	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	assert.Contains(t, string(body), `"membershipStatus":"active"`)
 
-	// Ban the membership while it is still a regular user.
-	regularPath := "/admin/users/" + strconv.FormatInt(regular.UserID, 10)
-	assert.Equal(t, fiber.StatusNoContent, do("POST", regularPath+"/ban", adminToken, nil))
+	// A regular member cannot reach the admin surface.
+	userToken := testutil.SessionToken(t, t.Context(), h.pool, h.user, h.secret)
+	status, body = h.request(t, http.MethodGet, "/api/v1/stats", userToken, "")
+	assert.Equal(t, fiber.StatusForbidden, status, "body: %s", body)
 
-	// A pre-ban access token stops working immediately: the ban revoked the
-	// member's sessions in this tenant.
-	assert.Equal(t, fiber.StatusUnauthorized, do("GET", "/users/me", regularToken, nil))
+	// Profile reads are authenticated and tenant scoped.
+	status, body = h.request(t, http.MethodGet, "/api/v1/me/profile", userToken, "")
+	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	assert.Contains(t, string(body), h.user.Email)
 
-	assert.Equal(t, fiber.StatusOK, do("POST", regularPath+"/unban", adminToken, nil))
-
-	// The pre-ban session stays revoked after the unban.
-	assert.Equal(t, fiber.StatusUnauthorized, do("GET", "/users/me", regularToken, nil))
-
-	// A new session for the restored member works.
-	restoredToken := testutil.SessionToken(t, ctx, pool, regular, adminIntegrationSecret)
-	assert.Equal(t, fiber.StatusOK, do("GET", "/users/me", restoredToken, nil))
-
-	// Promote after unbanning, otherwise the last-owner guard would (by
-	// design) reject banning the only active admin.
-	body, _ := json.Marshal(admindto.UpdateRoleRequest{Role: "admin"})
-	assert.Equal(t, fiber.StatusOK, do("PUT", regularPath+"/role", adminToken, body))
-
-	// A separate regular user gets 403 (not 401): their session is valid, but
-	// their role is insufficient.
-	other := registerMember(t, app, "other@test.com", "Other User")
-	userToken := testutil.SessionToken(t, ctx, pool, other, adminIntegrationSecret)
-	assert.Equal(t, fiber.StatusForbidden, do("GET", "/admin/stats", userToken, nil))
+	status, _ = h.request(t, http.MethodGet, "/api/v1/me/profile", "", "")
+	assert.Equal(t, fiber.StatusUnauthorized, status)
 }

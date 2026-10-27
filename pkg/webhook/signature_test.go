@@ -25,7 +25,7 @@ func TestSign_StandardWebhooksVector(t *testing.T) {
 		t.Fatalf("DecodeSecret: %v", err)
 	}
 	got := Sign(key, "msg_p5jXN8AQM9LWM0D4loKWxJek", time.Unix(1614265330, 0), []byte(`{"test": 2432232314}`))
-	const want = "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="
+	const want = "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=" // ggignore: Standard Webhooks spec test vector, not a credential
 	if got != want {
 		t.Fatalf("Sign() = %q, want %q", got, want)
 	}

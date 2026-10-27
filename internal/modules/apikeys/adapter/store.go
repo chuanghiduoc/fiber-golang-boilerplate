@@ -6,6 +6,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
+
 	apikeysvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 )
@@ -21,7 +23,7 @@ func NewVerifierStore(repo apikeysvc.APIKeyRepository) *VerifierStore {
 	return &VerifierStore{repo: repo}
 }
 
-func (s *VerifierStore) FindByHash(ctx context.Context, hash string) (apikey.Key, error) {
+func (s *VerifierStore) FindByHash(ctx context.Context, hash []byte) (apikey.Key, error) {
 	key, err := s.repo.GetByHash(ctx, hash)
 	if err != nil {
 		return apikey.Key{}, err
@@ -34,7 +36,7 @@ func (s *VerifierStore) FindByHash(ctx context.Context, hash string) (apikey.Key
 		Prefix:             key.Prefix,
 		Hash:               key.Hash,
 		Scopes:             key.Scopes,
-		ExpiresAt:          key.ExpiresAt,
+		ExpiresAt:          &key.ExpiresAt,
 		RevokedAt:          key.RevokedAt,
 		RotatedAt:          key.RotatedAt,
 		RotationGraceUntil: key.RotationGraceUntil,
@@ -44,6 +46,6 @@ func (s *VerifierStore) FindByHash(ctx context.Context, hash string) (apikey.Key
 	}, nil
 }
 
-func (s *VerifierStore) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
+func (s *VerifierStore) TouchLastUsed(ctx context.Context, id uuid.UUID, at time.Time) error {
 	return s.repo.TouchLastUsed(ctx, id, at)
 }

@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
+
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 )
 
 // Notification is one in-app feed row.
 type Notification struct {
-	ID        int64
+	ID        uuid.UUID
 	Type      string
 	Title     string
 	Body      string
@@ -32,9 +34,9 @@ type Preference struct {
 
 // Store is the module's privacy persistence port.
 type Store interface {
-	ListNotifications(ctx context.Context, tenantID, userID int64) ([]Notification, error)
-	ListPreferences(ctx context.Context, tenantID, userID int64) ([]Preference, error)
-	DeleteAll(ctx context.Context, tenantID, userID int64) error
+	ListNotifications(ctx context.Context, tenantID, userID uuid.UUID) ([]Notification, error)
+	ListPreferences(ctx context.Context, tenantID, userID uuid.UUID) ([]Preference, error)
+	DeleteAll(ctx context.Context, tenantID, userID uuid.UUID) error
 }
 
 // Provider implements privacy.Exporter and privacy.Eraser.
@@ -44,7 +46,7 @@ type Provider struct {
 
 func New(store Store) *Provider { return &Provider{store: store} }
 
-func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacycontracts.Section, error) {
+func (p *Provider) Export(ctx context.Context, tenantID, userID uuid.UUID) (privacycontracts.Section, error) {
 	notifications, err := p.store.ListNotifications(ctx, tenantID, userID)
 	if err != nil {
 		return privacycontracts.Section{}, err
@@ -55,7 +57,7 @@ func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacyc
 	}
 
 	type notificationExport struct {
-		ID        int64           `json:"id"`
+		ID        uuid.UUID       `json:"id"`
 		Type      string          `json:"type"`
 		Title     string          `json:"title"`
 		Body      string          `json:"body"`
@@ -96,6 +98,6 @@ func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacyc
 	return privacycontracts.Section{Name: "notifications", Data: raw}, nil
 }
 
-func (p *Provider) Erase(ctx context.Context, tenantID, userID int64) error {
+func (p *Provider) Erase(ctx context.Context, tenantID, userID uuid.UUID) error {
 	return p.store.DeleteAll(ctx, tenantID, userID)
 }

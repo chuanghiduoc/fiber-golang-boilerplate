@@ -7,17 +7,19 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const deleteFeatureFlagTargetsForPrivacy = `-- name: DeleteFeatureFlagTargetsForPrivacy :execrows
 DELETE FROM feature_flag_targets
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
 `
 
 type DeleteFeatureFlagTargetsForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) DeleteFeatureFlagTargetsForPrivacy(ctx context.Context, arg DeleteFeatureFlagTargetsForPrivacyParams) (int64, error) {
@@ -31,14 +33,14 @@ func (q *Queries) DeleteFeatureFlagTargetsForPrivacy(ctx context.Context, arg De
 const listFeatureFlagTargetsForPrivacy = `-- name: ListFeatureFlagTargetsForPrivacy :many
 
 SELECT id, flag_key, tenant_id, user_id, enabled, created_at, updated_at FROM feature_flag_targets
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
 ORDER BY id
 `
 
 type ListFeatureFlagTargetsForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 // Privacy export/erasure for per-user feature-flag targets only. Tenant-wide

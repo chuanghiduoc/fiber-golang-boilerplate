@@ -16,14 +16,20 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/google/uuid"
 )
 
-func memberContext(userID int64, role string) context.Context {
+func memberContext(userID uuid.UUID, role string) context.Context {
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
-	return authz.WithSubject(ctx, authz.NewSubject(userID, tenant.DefaultID, role))
+	granted := testCatalog.PermissionsForRole(role)
+	permissions := make([]authz.Permission, 0, len(granted))
+	for permission := range granted {
+		permissions = append(permissions, permission)
+	}
+	return authz.WithSubject(ctx, authz.NewSubjectWithPermissions(userID, tenant.DefaultID, role, permissions...))
 }
 
-func memberContextWithPermissions(userID int64, role string, permissions ...authz.Permission) context.Context {
+func memberContextWithPermissions(userID uuid.UUID, role string, permissions ...authz.Permission) context.Context {
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	return authz.WithSubject(ctx, authz.NewSubjectWithPermissions(userID, tenant.DefaultID, role, permissions...))
 }
@@ -45,13 +51,15 @@ func TestRoleHierarchy_DelegatedAdminManagesMembersNotPeers(t *testing.T) {
 	target := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "delegated-target@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleMember})
 
-	memberPermissions := []string{
-		string(identitycatalog.PermissionProfileRead), string(identitycatalog.PermissionProfileWrite),
-		string(identitycatalog.PermissionSessionsRevoke), string(identitycatalog.PermissionMFARead),
-		string(identitycatalog.PermissionMFAWrite),
-		string(authz.PermissionAdminUsersRole),
-		string(authz.PermissionAdminUsersBan),
-		string(authz.PermissionAdminUsersDelete),
+	// The delegated role holds every member grant (so it may grant member) plus
+	// the member-management permissions that give it the admin rank.
+	delegatedGrants := []authz.Permission{authz.PermissionAdminUsersRole, authz.PermissionAdminUsersBan, authz.PermissionAdminUsersDelete}
+	for permission := range testCatalog.PermissionsForRole(identityservice.RoleMember) {
+		delegatedGrants = append(delegatedGrants, permission)
+	}
+	memberPermissions := make([]string, 0, len(delegatedGrants))
+	for _, permission := range delegatedGrants {
+		memberPermissions = append(memberPermissions, string(permission))
 	}
 	_, err := e.stores.Roles.Create(ctx, identityservice.NewRole{
 		Key: "delegated_admin", Name: "Delegated Admin", Permissions: memberPermissions,
@@ -59,11 +67,7 @@ func TestRoleHierarchy_DelegatedAdminManagesMembersNotPeers(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, e.stores.Roles.ReplaceMemberRoles(ctx, delegated.UserID, []string{"delegated_admin"}))
 
-	delegatedCtx := memberContextWithPermissions(delegated.UserID, identityservice.RoleMember,
-		identitycatalog.PermissionProfileRead, identitycatalog.PermissionProfileWrite,
-		identitycatalog.PermissionSessionsRevoke, identitycatalog.PermissionMFARead,
-		identitycatalog.PermissionMFAWrite,
-		authz.PermissionAdminUsersRole, authz.PermissionAdminUsersBan, authz.PermissionAdminUsersDelete)
+	delegatedCtx := memberContextWithPermissions(delegated.UserID, identityservice.RoleMember, delegatedGrants...)
 
 	require.NoError(t, e.admin.BanUser(delegatedCtx, member.UserID),
 		"a delegated admin manages a member")
@@ -172,7 +176,7 @@ func TestInvitations_AdminCannotInviteOwner(t *testing.T) {
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	admin := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "invite-admin@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleAdmin})
-	invitations := identityservice.NewInvitationService(e.stores, e.tx, e.mail, "https://app.example.test")
+	invitations := identityservice.NewInvitationService(e.stores, e.tx, "https://app.example.test")
 
 	_, err := invitations.Invite(memberContext(admin.UserID, identityservice.RoleAdmin), identityservice.InviteInput{
 		InviterID: admin.UserID, Email: "owner-invite@example.com", Role: identityservice.RoleOwner,
@@ -197,7 +201,7 @@ func TestInvitations_AcceptRechecksInviterAuthority(t *testing.T) {
 	invitee := testutil.CreateMember(t, ctx, e.pool, otherTenant, "recheck-invitee@example.com",
 		testutil.MemberOptions{})
 
-	invitations := identityservice.NewInvitationService(e.stores, e.tx, e.mail, "https://app.example.test")
+	invitations := identityservice.NewInvitationService(e.stores, e.tx, "https://app.example.test")
 	_, err := invitations.Invite(memberContext(inviter.UserID, identityservice.RoleOwner), identityservice.InviteInput{
 		InviterID: inviter.UserID, Email: invitee.Email, Role: identityservice.RoleOwner,
 	})
@@ -224,7 +228,7 @@ func TestInvitations_SignUpRechecksInviterAuthority(t *testing.T) {
 	coOwner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "signup-coowner@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleOwner})
 
-	invitations := identityservice.NewInvitationService(e.stores, e.tx, e.mail, "https://app.example.test")
+	invitations := identityservice.NewInvitationService(e.stores, e.tx, "https://app.example.test")
 	_, err := invitations.Invite(memberContext(inviter.UserID, identityservice.RoleOwner), identityservice.InviteInput{
 		InviterID: inviter.UserID, Email: "signup-invitee@example.com", Role: identityservice.RoleOwner,
 	})
@@ -252,7 +256,7 @@ func TestInvitations_BanOrRemovalRevokesPendingInvitations(t *testing.T) {
 		testutil.MemberOptions{Role: identityservice.RoleAdmin})
 	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "revoke-owner@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleOwner})
-	invitations := identityservice.NewInvitationService(e.stores, e.tx, e.mail, "https://app.example.test")
+	invitations := identityservice.NewInvitationService(e.stores, e.tx, "https://app.example.test")
 	invite := func(email string) {
 		t.Helper()
 		_, err := invitations.Invite(memberContext(inviter.UserID, identityservice.RoleAdmin), identityservice.InviteInput{
@@ -263,12 +267,12 @@ func TestInvitations_BanOrRemovalRevokesPendingInvitations(t *testing.T) {
 	invite("revoked-a@example.com")
 	invite("revoked-b@example.com")
 	assert.Equal(t, int64(2), scalar[int64](t, e.pool,
-		`SELECT count(*) FROM invitations WHERE tenant_id = 1 AND invited_by = $1 AND accepted_at IS NULL`, inviter.UserID))
+		`SELECT count(*) FROM invitations WHERE tenant_id = '0192c9b0-7e4a-7000-8000-000000000001' AND invited_by = $1 AND accepted_at IS NULL`, inviter.UserID))
 
 	ownerCtx := memberContext(owner.UserID, identityservice.RoleOwner)
 	require.NoError(t, e.admin.BanUser(ownerCtx, inviter.UserID))
 	assert.Zero(t, scalar[int64](t, e.pool,
-		`SELECT count(*) FROM invitations WHERE tenant_id = 1 AND invited_by = $1 AND accepted_at IS NULL`, inviter.UserID),
+		`SELECT count(*) FROM invitations WHERE tenant_id = '0192c9b0-7e4a-7000-8000-000000000001' AND invited_by = $1 AND accepted_at IS NULL`, inviter.UserID),
 		"a ban revokes the inviter's pending invitations")
 
 	// A removed inviter's invitations are revoked too.
@@ -280,6 +284,6 @@ func TestInvitations_BanOrRemovalRevokesPendingInvitations(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, e.users.RemoveMember(ownerCtx, removed.UserID))
 	assert.Zero(t, scalar[int64](t, e.pool,
-		`SELECT count(*) FROM invitations WHERE tenant_id = 1 AND invited_by = $1 AND accepted_at IS NULL`, removed.UserID),
+		`SELECT count(*) FROM invitations WHERE tenant_id = '0192c9b0-7e4a-7000-8000-000000000001' AND invited_by = $1 AND accepted_at IS NULL`, removed.UserID),
 		"a removal revokes the inviter's pending invitations")
 }

@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -24,23 +25,76 @@ func (q *Queries) DeleteFeatureFlag(ctx context.Context, flagKey string) (string
 	return flag_key, err
 }
 
-const deleteFeatureFlagTarget = `-- name: DeleteFeatureFlagTarget :one
-DELETE FROM feature_flag_targets
-WHERE id = $1 AND tenant_id = $2 AND flag_key = $3
-RETURNING id
+const deleteFeatureFlagIfUnchanged = `-- name: DeleteFeatureFlagIfUnchanged :one
+DELETE FROM feature_flags
+WHERE flag_key = $1
+  AND updated_at = $2
+RETURNING flag_key
 `
 
-type DeleteFeatureFlagTargetParams struct {
-	ID       int64  `json:"id"`
-	TenantID int64  `json:"tenant_id"`
-	FlagKey  string `json:"flag_key"`
+type DeleteFeatureFlagIfUnchangedParams struct {
+	FlagKey           string             `json:"flag_key"`
+	ExpectedUpdatedAt pgtype.Timestamptz `json:"expected_updated_at"`
 }
 
-func (q *Queries) DeleteFeatureFlagTarget(ctx context.Context, arg DeleteFeatureFlagTargetParams) (int64, error) {
-	row := q.db.QueryRow(ctx, deleteFeatureFlagTarget, arg.ID, arg.TenantID, arg.FlagKey)
-	var id int64
-	err := row.Scan(&id)
-	return id, err
+func (q *Queries) DeleteFeatureFlagIfUnchanged(ctx context.Context, arg DeleteFeatureFlagIfUnchangedParams) (string, error) {
+	row := q.db.QueryRow(ctx, deleteFeatureFlagIfUnchanged, arg.FlagKey, arg.ExpectedUpdatedAt)
+	var flag_key string
+	err := row.Scan(&flag_key)
+	return flag_key, err
+}
+
+const deleteFeatureFlagTenantTarget = `-- name: DeleteFeatureFlagTenantTarget :one
+DELETE FROM feature_flag_targets
+WHERE flag_key = $1 AND tenant_id = $2 AND user_id IS NULL
+RETURNING id, flag_key, tenant_id, user_id, enabled, created_at, updated_at
+`
+
+type DeleteFeatureFlagTenantTargetParams struct {
+	FlagKey  string    `json:"flag_key"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+func (q *Queries) DeleteFeatureFlagTenantTarget(ctx context.Context, arg DeleteFeatureFlagTenantTargetParams) (FeatureFlagTarget, error) {
+	row := q.db.QueryRow(ctx, deleteFeatureFlagTenantTarget, arg.FlagKey, arg.TenantID)
+	var i FeatureFlagTarget
+	err := row.Scan(
+		&i.ID,
+		&i.FlagKey,
+		&i.TenantID,
+		&i.UserID,
+		&i.Enabled,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const deleteFeatureFlagUserTarget = `-- name: DeleteFeatureFlagUserTarget :one
+DELETE FROM feature_flag_targets
+WHERE flag_key = $1 AND tenant_id = $2 AND user_id = $3
+RETURNING id, flag_key, tenant_id, user_id, enabled, created_at, updated_at
+`
+
+type DeleteFeatureFlagUserTargetParams struct {
+	FlagKey  string        `json:"flag_key"`
+	TenantID uuid.UUID     `json:"tenant_id"`
+	UserID   uuid.NullUUID `json:"user_id"`
+}
+
+func (q *Queries) DeleteFeatureFlagUserTarget(ctx context.Context, arg DeleteFeatureFlagUserTargetParams) (FeatureFlagTarget, error) {
+	row := q.db.QueryRow(ctx, deleteFeatureFlagUserTarget, arg.FlagKey, arg.TenantID, arg.UserID)
+	var i FeatureFlagTarget
+	err := row.Scan(
+		&i.ID,
+		&i.FlagKey,
+		&i.TenantID,
+		&i.UserID,
+		&i.Enabled,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const getFeatureFlag = `-- name: GetFeatureFlag :one
@@ -62,6 +116,105 @@ func (q *Queries) GetFeatureFlag(ctx context.Context, flagKey string) (FeatureFl
 	return i, err
 }
 
+const insertFeatureFlag = `-- name: InsertFeatureFlag :one
+INSERT INTO feature_flags (flag_key, enabled, kill_switch, description)
+VALUES ($1, $2, $3, $4)
+RETURNING flag_key, enabled, kill_switch, description, created_at, updated_at
+`
+
+type InsertFeatureFlagParams struct {
+	FlagKey     string      `json:"flag_key"`
+	Enabled     pgtype.Bool `json:"enabled"`
+	KillSwitch  bool        `json:"kill_switch"`
+	Description string      `json:"description"`
+}
+
+func (q *Queries) InsertFeatureFlag(ctx context.Context, arg InsertFeatureFlagParams) (FeatureFlag, error) {
+	row := q.db.QueryRow(ctx, insertFeatureFlag,
+		arg.FlagKey,
+		arg.Enabled,
+		arg.KillSwitch,
+		arg.Description,
+	)
+	var i FeatureFlag
+	err := row.Scan(
+		&i.FlagKey,
+		&i.Enabled,
+		&i.KillSwitch,
+		&i.Description,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const insertFeatureFlagIfAbsent = `-- name: InsertFeatureFlagIfAbsent :one
+INSERT INTO feature_flags (flag_key, enabled, kill_switch, description)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (flag_key) DO NOTHING
+RETURNING flag_key, enabled, kill_switch, description, created_at, updated_at
+`
+
+type InsertFeatureFlagIfAbsentParams struct {
+	FlagKey     string      `json:"flag_key"`
+	Enabled     pgtype.Bool `json:"enabled"`
+	KillSwitch  bool        `json:"kill_switch"`
+	Description string      `json:"description"`
+}
+
+func (q *Queries) InsertFeatureFlagIfAbsent(ctx context.Context, arg InsertFeatureFlagIfAbsentParams) (FeatureFlag, error) {
+	row := q.db.QueryRow(ctx, insertFeatureFlagIfAbsent,
+		arg.FlagKey,
+		arg.Enabled,
+		arg.KillSwitch,
+		arg.Description,
+	)
+	var i FeatureFlag
+	err := row.Scan(
+		&i.FlagKey,
+		&i.Enabled,
+		&i.KillSwitch,
+		&i.Description,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const listAllFeatureFlagTargets = `-- name: ListAllFeatureFlagTargets :many
+SELECT id, flag_key, tenant_id, user_id, enabled, created_at, updated_at FROM feature_flag_targets
+WHERE flag_key = $1
+ORDER BY tenant_id, user_id NULLS FIRST, id
+`
+
+func (q *Queries) ListAllFeatureFlagTargets(ctx context.Context, flagKey string) ([]FeatureFlagTarget, error) {
+	rows, err := q.db.Query(ctx, listAllFeatureFlagTargets, flagKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []FeatureFlagTarget{}
+	for rows.Next() {
+		var i FeatureFlagTarget
+		if err := rows.Scan(
+			&i.ID,
+			&i.FlagKey,
+			&i.TenantID,
+			&i.UserID,
+			&i.Enabled,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listFeatureFlagTargets = `-- name: ListFeatureFlagTargets :many
 SELECT id, flag_key, tenant_id, user_id, enabled, created_at, updated_at FROM feature_flag_targets
 WHERE tenant_id = $1 AND flag_key = $2
@@ -69,8 +222,8 @@ ORDER BY user_id NULLS FIRST, id
 `
 
 type ListFeatureFlagTargetsParams struct {
-	TenantID int64  `json:"tenant_id"`
-	FlagKey  string `json:"flag_key"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	FlagKey  string    `json:"flag_key"`
 }
 
 func (q *Queries) ListFeatureFlagTargets(ctx context.Context, arg ListFeatureFlagTargetsParams) ([]FeatureFlagTarget, error) {
@@ -142,6 +295,45 @@ func (q *Queries) ListFeatureFlags(ctx context.Context) ([]FeatureFlag, error) {
 	return items, nil
 }
 
+const updateFeatureFlagIfUnchanged = `-- name: UpdateFeatureFlagIfUnchanged :one
+UPDATE feature_flags
+SET enabled = $1,
+    kill_switch = $2,
+    description = $3,
+    updated_at = NOW()
+WHERE flag_key = $4
+  AND updated_at = $5
+RETURNING flag_key, enabled, kill_switch, description, created_at, updated_at
+`
+
+type UpdateFeatureFlagIfUnchangedParams struct {
+	Enabled           pgtype.Bool        `json:"enabled"`
+	KillSwitch        bool               `json:"kill_switch"`
+	Description       string             `json:"description"`
+	FlagKey           string             `json:"flag_key"`
+	ExpectedUpdatedAt pgtype.Timestamptz `json:"expected_updated_at"`
+}
+
+func (q *Queries) UpdateFeatureFlagIfUnchanged(ctx context.Context, arg UpdateFeatureFlagIfUnchangedParams) (FeatureFlag, error) {
+	row := q.db.QueryRow(ctx, updateFeatureFlagIfUnchanged,
+		arg.Enabled,
+		arg.KillSwitch,
+		arg.Description,
+		arg.FlagKey,
+		arg.ExpectedUpdatedAt,
+	)
+	var i FeatureFlag
+	err := row.Scan(
+		&i.FlagKey,
+		&i.Enabled,
+		&i.KillSwitch,
+		&i.Description,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const upsertFeatureFlag = `-- name: UpsertFeatureFlag :one
 INSERT INTO feature_flags (flag_key, enabled, kill_switch, description)
 VALUES ($1, $2, $3, $4)
@@ -193,9 +385,9 @@ RETURNING id, flag_key, tenant_id, user_id, enabled, created_at, updated_at
 `
 
 type UpsertFeatureFlagTenantTargetParams struct {
-	FlagKey  string `json:"flag_key"`
-	TenantID int64  `json:"tenant_id"`
-	Enabled  bool   `json:"enabled"`
+	FlagKey  string    `json:"flag_key"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Enabled  bool      `json:"enabled"`
 }
 
 func (q *Queries) UpsertFeatureFlagTenantTarget(ctx context.Context, arg UpsertFeatureFlagTenantTargetParams) (FeatureFlagTarget, error) {
@@ -227,10 +419,10 @@ RETURNING id, flag_key, tenant_id, user_id, enabled, created_at, updated_at
 `
 
 type UpsertFeatureFlagUserTargetParams struct {
-	FlagKey  string      `json:"flag_key"`
-	TenantID int64       `json:"tenant_id"`
-	UserID   pgtype.Int8 `json:"user_id"`
-	Enabled  bool        `json:"enabled"`
+	FlagKey  string        `json:"flag_key"`
+	TenantID uuid.UUID     `json:"tenant_id"`
+	UserID   uuid.NullUUID `json:"user_id"`
+	Enabled  bool          `json:"enabled"`
 }
 
 func (q *Queries) UpsertFeatureFlagUserTarget(ctx context.Context, arg UpsertFeatureFlagUserTargetParams) (FeatureFlagTarget, error) {

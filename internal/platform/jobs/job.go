@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -44,9 +46,9 @@ var (
 	// ErrInvalidRetention is returned when a retention window is not positive.
 	ErrInvalidRetention = errors.New("jobs: retention must be positive")
 	// ErrInvalidTenant is returned when a job cannot be associated with a
-	// tenant. Enqueue resolves a zero TenantID from the context, so this
-	// indicates a non-positive explicit value.
-	ErrInvalidTenant = errors.New("jobs: tenant id must be positive")
+	// tenant. Enqueue resolves a nil TenantID from the context, so this
+	// indicates an explicit zero UUID.
+	ErrInvalidTenant = errors.New("jobs: tenant id is required")
 	// ErrEmptyIdempotencyKey is returned by EnqueueOnce when no key is given.
 	// A deterministic key is required to deduplicate producer retries.
 	ErrEmptyIdempotencyKey = errors.New("jobs: idempotency key is required")
@@ -61,8 +63,9 @@ const maxIdempotencyKeyLength = 512
 // Job describes a unit of work to enqueue.
 type Job struct {
 	// TenantID owns the job. Enqueue and EnqueueTx resolve a zero value from
-	// the context via tenant.EffectiveID; a positive explicit value is kept.
-	TenantID int64
+	// the context; a positive explicit value is kept. The row must always name
+	// a tenant (there is no database default).
+	TenantID uuid.UUID
 	// Kind selects the registered handler that processes the job.
 	Kind string
 	// Payload is passed verbatim to the handler. Nil or empty payloads are

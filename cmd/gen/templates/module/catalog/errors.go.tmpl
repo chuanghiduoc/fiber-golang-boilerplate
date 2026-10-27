@@ -15,10 +15,11 @@ const (
 	// gen:codes
 )
 
-// ErrorCodes returns the module's error catalog for app.ErrorProvider.
-func ErrorCodes() map[apperror.Code]apperror.Spec {
-	return map[apperror.Code]apperror.Spec{
-		CodeNotImplemented: {
+// Errors returns the module's error catalog for app.ErrorProvider.
+func Errors() []apperror.Spec {
+	return []apperror.Spec{
+		{
+			Code:    CodeNotImplemented,
 			Status:  http.StatusNotImplemented,
 			Title:   "Not implemented",
 			DocPath: "/errors/{{.M.Route}}-not-implemented",

@@ -17,40 +17,47 @@ const (
 	CodeFileScanUnavailable apperror.Code = "file.scan_unavailable"
 )
 
-// ErrorCodes returns the files error catalog for app.ErrorProvider.
-func ErrorCodes() map[apperror.Code]apperror.Spec {
-	return map[apperror.Code]apperror.Spec{
-		CodeFileNotFound: {
+// Errors returns the files error catalog for app.ErrorProvider.
+func Errors() []apperror.Spec {
+	return []apperror.Spec{
+		{
+			Code:    CodeFileNotFound,
 			Status:  http.StatusNotFound,
 			Title:   "File not found",
 			DocPath: "/errors/file-not-found",
 		},
-		CodeFileTooLarge: {
+		{
+			Code:    CodeFileTooLarge,
 			Status:  http.StatusRequestEntityTooLarge,
 			Title:   "File too large",
 			DocPath: "/errors/file-too-large",
 		},
-		CodeFileUnsupportedType: {
+		{
+			Code:    CodeFileUnsupportedType,
 			Status:  http.StatusUnsupportedMediaType,
 			Title:   "Unsupported file type",
 			DocPath: "/errors/file-unsupported-type",
 		},
-		CodeFileNotDeleted: {
+		{
+			Code:    CodeFileNotDeleted,
 			Status:  http.StatusConflict,
 			Title:   "File was not deleted",
 			DocPath: "/errors/file-not-deleted",
 		},
-		CodeFileQuotaExceeded: {
+		{
+			Code:    CodeFileQuotaExceeded,
 			Status:  http.StatusRequestEntityTooLarge,
 			Title:   "Storage quota exceeded",
 			DocPath: "/errors/file-quota-exceeded",
 		},
-		CodeFileInfected: {
+		{
+			Code:    CodeFileInfected,
 			Status:  http.StatusUnprocessableEntity,
 			Title:   "File failed the malware scan",
 			DocPath: "/errors/file-infected",
 		},
-		CodeFileScanUnavailable: {
+		{
+			Code:    CodeFileScanUnavailable,
 			Status:  http.StatusServiceUnavailable,
 			Title:   "File scanning is unavailable",
 			DocPath: "/errors/file-scan-unavailable",

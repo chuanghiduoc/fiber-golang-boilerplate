@@ -7,7 +7,7 @@ The fresh-install schema is one init migration,
 | Section owner | Creates |
 |---|---|
 | `platform` | `update_updated_at()` trigger function |
-| `identity` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `data_exports`, `permissions`, `roles`, `role_permissions`, `membership_roles`, `platform_role_assignments`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
+| `identity` | `tenants` (seeds the pinned UUIDv7 `default` tenant), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `data_exports`, `permissions`, `roles`, `role_permissions`, `membership_roles`, `platform_role_assignments`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes`, `webauthn_credentials` |
 | `platform` | `jobs` |
 | `platform` | `scheduler_leases`, `scheduler_runs` |
 | `platform` | `audit_events` and its append-only triggers |
@@ -28,7 +28,7 @@ migration policy.
 
 | Owner | Tables |
 |---|---|
-| `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `data_exports`, `permissions`, `roles`, `role_permissions`, `membership_roles`, `platform_role_assignments`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
+| `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `data_exports`, `permissions`, `roles`, `role_permissions`, `membership_roles`, `platform_role_assignments`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes`, `webauthn_credentials` |
 | `apikeys` | `api_keys`, `api_key_scopes` |
 | `files` | `files` |
 | `notifications` | `notifications`, `notification_preferences` |
@@ -38,15 +38,17 @@ migration policy.
 
 Conventions that apply to every diagram below:
 
-- Every tenant-owned table has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES
-  tenants(id)` (identity's `memberships` and `invitations` declare it without
-  the default, `ON DELETE RESTRICT`); the diagrams draw that edge only where
-  it matters to keep them readable. Tenant `1` (`default`) is seeded by the
-  baseline. Exceptions: `api_key_scopes`, a child fully owned by its key, has
-  no `tenant_id` of its own (the key id is global; the parent row holds the
-  tenant); `users` and the per-user rows `user_passwords`, `user_identities`,
-  `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, and
-  `mfa_recovery_codes` are global and have no `tenant_id`.
+- Every tenant-owned table has `tenant_id UUID NOT NULL REFERENCES
+  tenants(id)` with **no default**: a row must always state its tenant (RLS
+  `WITH CHECK` additionally requires it to match the transaction scope).
+  `tenant.DefaultID` (`0192c9b0-7e4a-7000-8000-000000000001`, slug
+  `default`) is a real seeded tenant, the tenant of the default slug, not a
+  fallback. Exceptions: `api_key_scopes`, a child fully owned by
+  its key, has no `tenant_id` of its own (the key id is global; the parent row
+  holds the tenant); `users` and the per-user rows `user_passwords`,
+  `user_identities`, `password_reset_tokens`, `email_verification_tokens`,
+  `mfa_factors`, `mfa_recovery_codes`, and `webauthn_credentials` are global
+  and have no `tenant_id`.
 - Every table with a `tenant_id` has `ENABLE`/`FORCE ROW LEVEL SECURITY` and a
   `tenant_isolation` policy on `app_tenant_visible(tenant_id)`;
   `roles` additionally lets every tenant read the system roles (`tenant_id IS
@@ -59,11 +61,15 @@ Conventions that apply to every diagram below:
   user_id)` `ON DELETE RESTRICT`; identity's own children use
   `(tenant_id, session_id) → sessions(tenant_id, id)` and
   `(tenant_id, invited_by | accepted_by) → memberships(tenant_id, user_id)`.
-- Primary keys are `BIGINT GENERATED ALWAYS AS IDENTITY`, except
-  `feature_flags.flag_key`, `scheduler_leases.name`, and the natural keys of
-  `api_key_scopes (api_key_id, permission_key)`,
+- Every surrogate primary key is `UUID DEFAULT uuidv7()` (PostgreSQL 18's
+  native function). Go code that needs the id before insert calls
+  `uuid.NewV7()`; foreign keys and reference columns are `UUID`. Exceptions
+  are `feature_flags.flag_key`, `scheduler_leases.name`, and the natural
+  keys of `api_key_scopes (api_key_id, permission_key)`,
   `webhook_endpoint_subscriptions (endpoint_id, pattern)`, and
-  `webhook_events (tenant_id, event_id)`. Timestamps are `TIMESTAMPTZ`.
+  `webhook_events (tenant_id, event_id)` (the event id itself is a UUID).
+  Token hashes are `BYTEA` with an exact 32-byte (SHA-256) `CHECK`.
+  Timestamps are `TIMESTAMPTZ`.
 - Delete actions: `CASCADE` only for rows fully owned by their parent
   (`tenant_settings`, a user's password, identities, and reset/verification
   tokens, a membership's sessions, a session's refresh tokens, API-key scopes, endpoint subscriptions and secrets, delivery
@@ -88,6 +94,7 @@ erDiagram
     users ||--o| email_verification_tokens : "one per user, CASCADE"
     users ||--o{ mfa_factors : "one confirmed TOTP, CASCADE"
     users ||--o{ mfa_recovery_codes : "ten per set, CASCADE"
+    users ||--o{ webauthn_credentials : "passkeys, CASCADE"
     tenants ||--o{ invitations : "RESTRICT"
     memberships ||--o{ invitations : "invited_by, accepted_by, RESTRICT"
     memberships ||--o{ sessions : "(tenant_id, user_id), CASCADE"
@@ -104,7 +111,7 @@ erDiagram
     users ||--o{ platform_role_assignments : "CASCADE"
 
     tenants {
-        bigint id PK
+        uuid id PK
         varchar slug UK "[a-z0-9-]{1,63}"
         varchar name
         varchar status "trialing | active | suspended | pending_deletion | deleted"
@@ -112,16 +119,16 @@ erDiagram
         timestamptz trial_ends_at "required while trialing"
         timestamptz deletion_scheduled_at "set iff pending_deletion or deleted"
         timestamptz purged_at "set once the deleted-tenant purge completes"
-        bigint purge_cursor "highest membership user id whose erasers succeeded"
+        uuid purge_cursor "highest membership user id whose erasers succeeded"
         timestamptz purge_progress_at "orders unfinished purges by least recent progress"
     }
     tenant_settings {
-        bigint tenant_id PK, FK
+        uuid tenant_id PK, FK
         varchar locale "BCP 47"
         varchar timezone "IANA, validated by the service"
     }
     users {
-        bigint id PK
+        uuid id PK
         varchar email "normalized, unique among live rows"
         varchar name
         timestamptz email_verified_at
@@ -131,31 +138,33 @@ erDiagram
         timestamptz deleted_at "set iff status = deleted"
     }
     user_passwords {
-        bigint user_id PK, FK
-        varchar password_hash "bcrypt"
+        uuid user_id PK, FK
+        text password_hash "argon2id PHC"
         timestamptz changed_at
     }
     user_identities {
-        bigint id PK
-        bigint user_id FK "unique with provider"
+        uuid id PK
+        uuid user_id FK "unique with provider"
         varchar provider "google"
         varchar subject "unique with provider"
         varchar email "address reported at link time"
     }
     memberships {
-        bigint id PK
-        bigint tenant_id FK "unique with user_id"
-        bigint user_id FK
+        uuid id PK
+        uuid tenant_id FK "unique with user_id"
+        uuid user_id FK
         varchar status "active | suspended | removed"
         timestamptz banned_at "ban marker, kept through removal"
+        bytea banned_email_hash "keyed HMAC-SHA256 marker, kept through removal"
+        varchar banned_email_hash_kid "key that wrote the marker"
         timestamptz erasure_requested_at "reserves a suspended member for erasure"
         timestamptz removed_at "set iff removed"
         timestamptz credentials_revoked_at "never cleared"
     }
     data_exports {
-        bigint id PK
-        bigint tenant_id FK
-        bigint user_id FK
+        uuid id PK
+        uuid tenant_id FK
+        uuid user_id FK
         varchar status "queued | running | ready | failed | expired"
         varchar storage_path "ready export blob key"
         timestamptz expires_at "ready + 7 days"
@@ -163,20 +172,20 @@ erDiagram
         timestamptz updated_at
     }
     invitations {
-        bigint id PK
-        bigint tenant_id FK
+        uuid id PK
+        uuid tenant_id FK
         varchar email_normalized "one pending row per tenant"
-        varchar role "owner | admin | member"
-        varchar token_hash UK "SHA-256 only"
-        bigint invited_by FK
+        uuid role_id FK "tenant role granted by the invitation"
+        bytea token_hash UK "SHA-256 only"
+        uuid invited_by FK
         timestamptz expires_at
         timestamptz accepted_at "set together with accepted_by"
-        bigint accepted_by FK
+        uuid accepted_by FK
     }
     sessions {
-        bigint id PK
-        bigint tenant_id FK
-        bigint user_id FK
+        uuid id PK
+        uuid tenant_id FK
+        uuid user_id FK
         int token_version "user version at sign-in"
         varchar user_agent
         inet ip
@@ -188,46 +197,60 @@ erDiagram
         varchar revoked_reason "logout | logout_all | revoked | refresh_reuse | mfa_changed | ..."
     }
     refresh_tokens {
-        bigint id PK
-        bigint tenant_id FK
-        bigint session_id FK
-        varchar token_hash UK "SHA-256 only"
+        uuid id PK
+        uuid tenant_id FK
+        uuid session_id FK
+        bytea token_hash UK "SHA-256 only"
         timestamptz expires_at
         timestamptz used_at "rotation marker"
     }
     password_reset_tokens {
-        bigint id PK
-        bigint user_id FK, UK
-        varchar token_hash UK
+        uuid id PK
+        uuid user_id FK, UK
+        bytea token_hash UK
         timestamptz expires_at
     }
     email_verification_tokens {
-        bigint id PK
-        bigint user_id FK, UK
+        uuid id PK
+        uuid user_id FK, UK
         varchar email "target address"
-        varchar token_hash UK
+        bytea token_hash UK
         timestamptz expires_at
     }
     mfa_factors {
-        bigint id PK
-        bigint user_id FK "unique when confirmed; unique when pending"
+        uuid id PK
+        uuid user_id FK "unique when confirmed; unique when pending"
         varchar type "totp"
         text secret_ciphertext "sealed with DATA_ENCRYPTION_KEY"
         timestamptz confirmed_at
         bigint last_used_step "RFC 6238 replay guard"
     }
     mfa_recovery_codes {
-        bigint id PK
-        bigint user_id FK
-        varchar code_hash "SHA-256, unique per user"
+        uuid id PK
+        uuid user_id FK
+        bytea code_hash "SHA-256, unique per user"
         timestamptz used_at "single use"
     }
+    webauthn_credentials {
+        uuid id PK
+        uuid user_id FK
+        bytea credential_id UK "WebAuthn credential id"
+        bytea public_key "COSE public key"
+        bigint sign_count "monotonic signature counter"
+        uuid aaguid "authenticator model"
+        text_array transports
+        boolean backup_eligible
+        boolean backup_state
+        varchar name
+        timestamptz created_at
+        timestamptz last_used_at
+    }
     api_keys {
-        bigint id PK
-        bigint tenant_id FK
-        bigint user_id FK
+        uuid id PK
+        uuid tenant_id FK
+        uuid user_id FK
         varchar prefix
-        varchar key_hash UK "SHA-256 only"
+        bytea key_hash UK "SHA-256 only"
         timestamptz expires_at
         timestamptz revoked_at
         timestamptz rotated_at "set together with rotation_grace_until"
@@ -235,7 +258,7 @@ erDiagram
         timestamptz last_used_at
     }
     api_key_scopes {
-        bigint api_key_id PK, FK
+        uuid api_key_id PK, FK
         text permission_key PK, FK "authz permission format"
     }
     permissions {
@@ -243,24 +266,24 @@ erDiagram
         text owner "module or platform"
     }
     roles {
-        bigint id PK
-        bigint tenant_id FK "NULL = system role"
+        uuid id PK
+        uuid tenant_id FK "NULL = system role"
         varchar scope "tenant | platform"
         varchar key "unique per tenant, NULLS NOT DISTINCT"
         varchar name
     }
     role_permissions {
-        bigint role_id PK, FK
+        uuid role_id PK, FK
         text permission_key PK, FK
     }
     membership_roles {
-        bigint tenant_id PK, FK "with user_id -> memberships"
-        bigint user_id PK
-        bigint role_id PK, FK
+        uuid tenant_id PK, FK "with user_id -> memberships"
+        uuid user_id PK
+        uuid role_id PK, FK
     }
     platform_role_assignments {
-        bigint user_id PK, FK
-        bigint role_id PK, FK "platform role only"
+        uuid user_id PK, FK
+        uuid role_id PK, FK "platform role only"
     }
 ```
 
@@ -275,8 +298,8 @@ erDiagram
   `identity.tenants.finalize_deletions` job performs the due transition as a
   system actor. Only `trialing` and `active` tenants serve requests, and a
   `trialing` tenant stops serving the moment `trial_ends_at` passes (its status
-  is then moved to `suspended` by the hourly audited trial-expiry job). Tenant 1
-  can never enter `pending_deletion` or `deleted`. Tenants are never
+  is then moved to `suspended` by the hourly audited trial-expiry job). The default
+  tenant can never enter `pending_deletion` or `deleted`. Tenants are never
   hard-deleted, so every `tenants` reference is `RESTRICT`/`NO ACTION`. A
   `deleted` tenant keeps its row and `audit_events`; the hourly purge erases
   each member's data, then every module's tenant-wide rows in bounded 500-row
@@ -308,17 +331,21 @@ erDiagram
   `credentials_revoked_at` is set by a ban, an erasure reservation, or removal
   and never cleared, so API keys created at or before it stay invalid after an
   unban or re-join.
-  `banned_email_hash` is the lowercase hex SHA-256 of the normalized address,
-  written by a ban. A removed membership keeps `banned_at` and the hash, so a
-  ban survives removal and erasure (the user's email may since have been
-  anonymized); an unban while the membership is still suspended clears both.
-  `EmailBannedInTenant` matches the hash on
-  registration, invitation acceptance, and email change (GDPR Art.17(3)(e)).
-  Residual risk: the hash is unkeyed, so anyone with read access to the
-  table (a dump or backup) can confirm whether a known address was banned
-  or recover common addresses by dictionary attack. It is pseudonymous, not
-  anonymous, data; a keyed HMAC would need a stable key outside the
-  rotating encryption keys.
+  `banned_email_hash` is a keyed pseudonymous marker of the normalized
+  address: HMAC-SHA256 under a key derived with HKDF-SHA256 from the active
+  data-encryption key (`DATA_ENCRYPTION_KEY`, the same key set that seals job
+  payloads), computed in Go and written by a ban. `banned_email_hash_kid`
+  records which key wrote it (a short fingerprint). A removed membership keeps
+  `banned_at` and the marker, so a ban survives removal and erasure (the
+  user's email may since have been anonymized); an unban while the membership
+  is still suspended clears all three. `EmailBannedInTenant` matches the
+  marker computed under the active key and every configured previous key, and
+  is used by registration, invitation acceptance/sign-up, Google sign-up, the
+  admin seed, and email changes (GDPR Art.17(3)(e)). A database reader cannot
+  confirm a banned address or dictionary-recover it without the key. Removing
+  a previous key from `DATA_ENCRYPTION_PREVIOUS_KEYS` makes bans it wrote
+  ineffective, because after erasure the address is gone and the marker cannot
+  be re-hashed; API startup warns and counts the affected rows.
 - **Data exports** belong to one membership. A `queued`/`running`
   row is the active request (partial unique index); `ready` rows carry the
   document key and a 7-day `expires_at`; a failed export is retried only while
@@ -326,7 +353,8 @@ erDiagram
   are removed by `privacy.exports.purge` (blob, then row); erasure removes them
   immediately. The export's identity section covers the profile, membership,
   sessions, linked `user_identities` (no tokens), MFA state (no secret or
-  recovery hashes), current `membership_roles` with grant times, invitations
+  recovery hashes), passkeys by name/created/last-used (never key material),
+  current `membership_roles` with grant times, invitations
   sent/received, and the user's own `audit_events` (capped at 1000, newest
   first).
 - **RBAC**: `permissions` is the code-owned catalog synchronized at
@@ -349,14 +377,15 @@ erDiagram
   `membership_roles`: removing the last active system `owner` of an
   operational tenant is refused. Counting and locking are scoped to the
   tenant; services take the same per-tenant advisory lock, and the repository
-  maps the trigger exception (`P0001`) or a deadlock (`40P01`) to `409`.
+  maps the trigger exception (private SQLSTATE `LO001`, class `LO` for
+  last-owner) or a deadlock (`40P01`) to `409`.
   Concurrent owner removals serialize on the advisory lock, so two requests
   cannot each observe the other owner and both commit. The platform tenant
   create endpoint makes the caller the tenant's first owner, so an HTTP-created
   tenant never starts ownerless.
 - **Invitations**: one pending row per `(tenant_id, email_normalized)`
   (partial unique `WHERE accepted_at IS NULL`); re-inviting refreshes the
-  token, role, and expiry. Revoking deletes the pending row (the trail is in
+  token, `role_id`, and expiry. Revoking deletes the pending row (the trail is in
   `audit_events`); accepting stamps `accepted_at`/`accepted_by` in the
   transaction that creates or reactivates the membership. A ban or removal
   deletes the member's pending invitations in the same transaction, and
@@ -383,6 +412,12 @@ erDiagram
   or reset deletes a pending enrollment in the same transaction.
   `mfa_recovery_codes` stores SHA-256 hashes; `used_at` makes each code single
   use.
+- **Passkeys are per user**: `webauthn_credentials` stores the COSE public key,
+  the globally unique credential id, the monotonic signature counter, the
+  AAGUID, transport hints, and the backup flags. The private key never leaves
+  the authenticator. A counter that does not advance is rejected as a possible
+  clone. The table has no `tenant_id` (a passkey signs in to every tenant the
+  user belongs to) and is erased with the global account.
 - `api_keys.key_hash` is the only global (pre-tenant) lookup: the request
   tenant cannot be trusted until the key is verified, so that statement runs
   with the RLS bypass while the request's last-used write stays under the key's
@@ -401,7 +436,7 @@ erDiagram
 | `users` | partial unique `(email) WHERE status <> 'deleted'` | One live account per address, globally. |
 | `tenants` | partial `(id) WHERE status = 'deleted' AND purged_at IS NULL` | The hourly deleted-tenant purge scans only unfinished deletions. |
 | `data_exports` | partial unique `(tenant_id, user_id) WHERE status IN ('queued','running')`; `(tenant_id, user_id, created_at DESC, id DESC)`; partial `(expires_at)` | One active export per membership; caller list cursor; hourly expiry purge. |
-| `memberships` | unique `(tenant_id, user_id)`; `(user_id)`; `(tenant_id, created_at DESC, user_id DESC)`; partial `(tenant_id, user_id)` for suspended rows | Cross-module FK parent; per-user lookups (login, account deletion); member-list cursor (`joinedAt`, id); ban check. |
+| `memberships` | unique `(tenant_id, user_id)`; `(user_id)`; `(tenant_id, created_at DESC, user_id DESC)`; partial `(tenant_id, banned_email_hash)` for banned rows | Cross-module FK parent; per-user lookups (login, account deletion); member-list cursor (`joinedAt`, id); keyed ban check. |
 | `roles` | unique `(tenant_id, key) NULLS NOT DISTINCT` | One system role per key, one tenant role per key. |
 | `membership_roles` | primary key `(tenant_id, user_id, role_id)`; `(role_id)` | Load a member's roles; invalidate the holders of a changed role and reject a role delete in use. |
 | `role_permissions` | primary key `(role_id, permission_key)`; `(permission_key)` | Grant set; catalog prune and permission delete. |
@@ -422,9 +457,9 @@ erDiagram
     memberships |o--o{ feature_flag_targets : "user target (nullable), RESTRICT"
 
     files {
-        bigint id PK
-        bigint tenant_id FK
-        bigint user_id FK
+        uuid id PK
+        uuid tenant_id FK
+        uuid user_id FK
         varchar storage_path UK "blob key"
         varchar mime_type
         bigint size "CHECK >= 0"
@@ -434,17 +469,17 @@ erDiagram
         timestamptz purge_retry_after "per-row backoff; claim skips until due"
     }
     notifications {
-        bigint id PK
-        bigint tenant_id FK
-        bigint user_id FK
+        uuid id PK
+        uuid tenant_id FK
+        uuid user_id FK
         varchar type
         jsonb data
         timestamptz read_at
     }
     notification_preferences {
-        bigint id PK
-        bigint tenant_id FK
-        bigint user_id FK
+        uuid id PK
+        uuid tenant_id FK
+        uuid user_id FK
         varchar type
         varchar channel "in_app | email"
         bool enabled
@@ -455,10 +490,10 @@ erDiagram
         bool kill_switch
     }
     feature_flag_targets {
-        bigint id PK
+        uuid id PK
         varchar flag_key FK
-        bigint tenant_id FK
-        bigint user_id FK "NULL = tenant-wide target"
+        uuid tenant_id FK
+        uuid user_id FK "NULL = tenant-wide target"
         bool enabled
     }
 ```
@@ -481,10 +516,11 @@ erDiagram
     webhook_deliveries ||--o{ webhook_delivery_attempts : "(tenant_id, delivery_id), CASCADE"
     webhook_deliveries |o--o{ webhook_deliveries : "replayed_from_id, SET NULL"
     webhook_inbound_sources ||--o{ webhook_inbound_events : "RESTRICT"
+    webhook_inbound_sources ||--|{ webhook_inbound_source_secrets : "versions, CASCADE"
 
     webhook_endpoints {
-        bigint id PK
-        bigint tenant_id FK
+        uuid id PK
+        uuid tenant_id FK
         varchar url
         varchar status "active | disabled"
         int max_attempts "1..50"
@@ -492,62 +528,70 @@ erDiagram
         timestamptz deleted_at
     }
     webhook_endpoint_subscriptions {
-        bigint tenant_id FK
-        bigint endpoint_id PK, FK
+        uuid tenant_id FK
+        uuid endpoint_id PK, FK
         varchar pattern PK "exact type, prefix.*, or *"
     }
     webhook_endpoint_secrets {
-        bigint id PK
-        bigint tenant_id FK
-        bigint endpoint_id FK
+        uuid id PK
+        uuid tenant_id FK
+        uuid endpoint_id FK
         int version "unique per endpoint"
         text secret_ciphertext "AES-256-GCM"
         bool active
     }
     webhook_events {
-        bigint tenant_id PK, FK
-        varchar event_id PK "envelope id (UUIDv7), webhook-id"
+        uuid tenant_id PK, FK
+        uuid event_id PK "envelope id (UUIDv7), webhook-id"
         varchar event_type
         int data_version "envelope dataVersion"
         varchar actor_type "user | service | system"
-        varchar actor_id "NULL iff system"
+        uuid actor_id "NULL iff system"
         timestamptz occurred_at "envelope occurredAt"
         jsonb payload "envelope data"
         timestamptz created_at "retention clock"
     }
     webhook_deliveries {
-        bigint id PK
-        bigint tenant_id FK
-        bigint endpoint_id FK
-        varchar event_id FK "unique per endpoint"
+        uuid id PK
+        uuid tenant_id FK
+        uuid endpoint_id FK
+        uuid event_id FK "unique per endpoint"
+        uuid secret_id FK "snapshot of the signing secret row"
         varchar url "snapshot"
-        text secret_ciphertext "snapshot"
         int timeout_ms "snapshot"
         int max_attempts "snapshot"
         varchar status "pending | succeeded | dead"
         int attempts
         timestamptz next_attempt_at
-        bigint replayed_from_id FK
+        uuid replayed_from_id FK
     }
     webhook_delivery_attempts {
-        bigint id PK
-        bigint tenant_id FK
-        bigint delivery_id FK
+        uuid id PK
+        uuid tenant_id FK
+        uuid delivery_id FK
         int attempt "unique per delivery"
         int status_code
         int duration_ms
     }
     webhook_inbound_sources {
-        bigint id PK
-        bigint tenant_id FK
+        uuid id PK
+        uuid tenant_id FK
         varchar slug "unique per tenant (active)"
-        text secret_ciphertext
         varchar status "active | disabled"
     }
+    webhook_inbound_source_secrets {
+        uuid id PK
+        uuid tenant_id FK
+        uuid source_id FK
+        int version "unique per source"
+        text secret_ciphertext "AES-256-GCM"
+        bool active
+        timestamptz grace_expires_at "NULL on the active row"
+    }
     webhook_inbound_events {
-        bigint id PK
-        bigint tenant_id FK
-        bigint source_id FK
+        uuid id PK
+        uuid tenant_id FK
+        uuid source_id FK
         varchar external_event_id "webhook-id"
         jsonb payload
     }
@@ -567,7 +611,7 @@ erDiagram
 - `(tenant_id, endpoint_id, event_id)` is unique, so re-dispatching the same
   domain event never creates a second delivery.
 - `(tenant_id, source_id, external_event_id)` is unique: the inbound dedupe key.
-- Delivery `url`/`secret_ciphertext`/`timeout_ms`/`max_attempts` are snapshots
+- Delivery `url`/`secret_id`/`timeout_ms`/`max_attempts` are snapshots
   taken at dispatch; editing or rotating an endpoint cannot change a queued
   request. Deliveries use `RESTRICT` because endpoints are soft-deleted and the
   delivery log is history.
@@ -588,8 +632,8 @@ erDiagram
     scheduler_runs }o..o| jobs : "job_id (logical, no FK)"
 
     jobs {
-        bigint id PK
-        bigint tenant_id FK
+        uuid id PK
+        uuid tenant_id FK
         text kind
         jsonb payload "sealed for email jobs"
         text status "queued | running | succeeded | failed | dead"
@@ -602,9 +646,9 @@ erDiagram
         text trace_parent "W3C span link"
     }
     audit_events {
-        bigint id PK
-        bigint tenant_id FK
-        bigint parent_id FK "intent row"
+        uuid id PK
+        uuid tenant_id FK
+        uuid parent_id FK "intent row"
         text actor_type "user | service | job | system | anonymous | unknown"
         text actor_role "owner | admin | member | ..."
         text action
@@ -620,11 +664,11 @@ erDiagram
         timestamptz expires_at
     }
     scheduler_runs {
-        bigint id PK
+        uuid id PK
         text schedule
         timestamptz scheduled_for "unique with schedule"
         text status "enqueued | skipped | failed"
-        bigint job_id
+        uuid job_id
     }
 ```
 
@@ -643,7 +687,9 @@ erDiagram
   principal acted; an administrator is `actor_type = 'user'` with
   `actor_role = 'admin'`. The recorder stores a canonical address in `ip`
   (IPv6 zone dropped) and NULL for anything that does not parse, never the raw
-  value. `parent_id` references the intent row a domain event belongs to.
+  value. `parent_id` names the intent row a domain event belongs to. It is indexed but
+  has no self-foreign-key: `audit_events` is partitioned, so a child may even be
+  written before its parent.
 - `scheduler_leases` and `scheduler_runs` are deliberately tenant-independent
   with no foreign keys; the unique `(schedule, scheduled_for)` ledger is the
   exactly-once boundary across leader changes. `scheduler_runs` has no

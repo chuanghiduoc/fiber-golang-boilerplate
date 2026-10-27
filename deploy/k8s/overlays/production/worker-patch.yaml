@@ -1,0 +1,21 @@
+# Production worker envelope. GOMEMLIMIT follows the memory limit through a
+# resourceFieldRef. Both worker replicas open normal and bypass pools, so count
+# them in the database connection budget alongside the API pods.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: fiber-boilerplate
+  name: fiber-boilerplate-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi

@@ -3,11 +3,11 @@
 
 -- name: ListFeatureFlagTargetsForPrivacy :many
 SELECT * FROM feature_flag_targets
-WHERE tenant_id = @tenant_id::bigint
-  AND user_id = @user_id::bigint
+WHERE tenant_id = @tenant_id::uuid
+  AND user_id = @user_id::uuid
 ORDER BY id;
 
 -- name: DeleteFeatureFlagTargetsForPrivacy :execrows
 DELETE FROM feature_flag_targets
-WHERE tenant_id = @tenant_id::bigint
-  AND user_id = @user_id::bigint;
+WHERE tenant_id = @tenant_id::uuid
+  AND user_id = @user_id::uuid;

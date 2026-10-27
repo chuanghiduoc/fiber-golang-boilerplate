@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/keyring"
 )
 
@@ -37,23 +39,23 @@ const (
 // source, or tenant by someone with database write access.
 type SecretBinding struct {
 	Purpose  SecretPurpose
-	TenantID int64
-	EntityID int64
+	TenantID uuid.UUID
+	EntityID uuid.UUID
 }
 
 // EndpointSecretBinding binds a secret to one tenant-owned endpoint. Delivery
 // snapshots are copies of the endpoint secret, so they use the same binding.
-func EndpointSecretBinding(tenantID, endpointID int64) SecretBinding {
+func EndpointSecretBinding(tenantID, endpointID uuid.UUID) SecretBinding {
 	return SecretBinding{Purpose: PurposeEndpointSecret, TenantID: tenantID, EntityID: endpointID}
 }
 
 // InboundSourceSecretBinding binds a secret to one tenant-owned inbound source.
-func InboundSourceSecretBinding(tenantID, sourceID int64) SecretBinding {
+func InboundSourceSecretBinding(tenantID, sourceID uuid.UUID) SecretBinding {
 	return SecretBinding{Purpose: PurposeInboundSourceSecret, TenantID: tenantID, EntityID: sourceID}
 }
 
 func (b SecretBinding) valid() bool {
-	return b.Purpose != "" && b.TenantID > 0 && b.EntityID > 0
+	return b.Purpose != "" && b.TenantID != uuid.Nil && b.EntityID != uuid.Nil
 }
 
 var (
@@ -106,7 +108,7 @@ func NewSecretCodec(secret string, previous ...string) (*SecretCodec, error) {
 // secretAAD binds the envelope version, key id, and the secret's purpose,
 // tenant, and owning entity to the ciphertext.
 func secretAAD(keyID string, binding SecretBinding) []byte {
-	return []byte(fmt.Sprintf("%s|v%d|%s|%s|%d|%d",
+	return []byte(fmt.Sprintf("%s|v%d|%s|%s|%s|%s",
 		secretKeyInfo, secretEnvelopeVer, keyID, binding.Purpose, binding.TenantID, binding.EntityID))
 }
 

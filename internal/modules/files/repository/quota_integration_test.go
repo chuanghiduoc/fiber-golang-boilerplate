@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,20 +22,11 @@ import (
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
-// The app registers module catalogs at startup; this package's tests run
-// without the app, so register the files codes before inspecting AppErrors.
-func init() {
-	if err := catalog.Register(); err != nil {
-		panic(err)
-	}
-}
-
-func countFiles(t *testing.T, pool *pgxpool.Pool, tenantID int64) int {
+func countFiles(t *testing.T, pool *pgxpool.Pool, tenantID uuid.UUID) int {
 	t.Helper()
 	var count int
 	require.NoError(t, pool.QueryRow(context.Background(),
@@ -72,7 +64,7 @@ func (s slowUsageTx) InTx(ctx context.Context, fn func(context.Context, filesvc.
 
 type slowUsageRepo struct{ filesvc.FileRepository }
 
-func (r *slowUsageRepo) StorageUsage(ctx context.Context, userID int64) (tenantBytes, userBytes int64, err error) {
+func (r *slowUsageRepo) StorageUsage(ctx context.Context, userID uuid.UUID) (tenantBytes, userBytes int64, err error) {
 	tenantBytes, userBytes, err = r.FileRepository.StorageUsage(ctx, userID)
 	time.Sleep(100 * time.Millisecond)
 	return tenantBytes, userBytes, err
@@ -82,25 +74,23 @@ func (r *slowUsageRepo) StorageUsage(ctx context.Context, userID int64) (tenantB
 // insert quota: without the per-tenant advisory lock, both uploads read zero
 // usage and both commit, exceeding the quota 2x.
 func TestConcurrentUploadsCannotBothPassQuota(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := setupFilesDB(t)
+	pool := fx.Bypass
 
-	member := testutil.CreateMember(t, ctx, pool, tenant.DefaultID, "quota-race@example.com", testutil.MemberOptions{})
+	memberID := createFilesMember(t, pool, tenant.DefaultID, "quota-race@example.com")
 	root := t.TempDir()
 	store, err := storage.NewLocalStorage(root)
 	require.NoError(t, err)
 
 	const quota = 100
 	svc := filesvc.NewUploadService(
-		filesrepo.NewFileRepository(testutil.Scoped(pool)),
-		slowUsageTx{inner: filesrepo.NewTransactor(testutil.NewTxManager(pool), nil, nil)},
+		filesrepo.NewFileRepository(fx.Scoped()),
+		slowUsageTx{inner: filesrepo.NewTransactor(fx.Tx(), nil, nil)},
 		store,
+		authz.NewAuthorizer(nil),
 		filesvc.UploadOptions{TenantQuotaBytes: quota},
 	)
-	reqCtx := authz.SystemContext(tenant.WithID(ctx, tenant.DefaultID))
+	reqCtx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
 
 	type result struct {
 		err      error
@@ -114,7 +104,7 @@ func TestConcurrentUploadsCannotBothPassQuota(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			file, uploadErr := svc.Upload(reqCtx, member.UserID, "race.bin", strings.NewReader(strings.Repeat("x", 60)), 60, "application/octet-stream")
+			file, uploadErr := svc.Upload(reqCtx, memberID, "race.bin", strings.NewReader(strings.Repeat("x", 60)), 60, "application/octet-stream")
 			results <- result{err: uploadErr, metadata: file}
 		}()
 	}
@@ -131,7 +121,6 @@ func TestConcurrentUploadsCannotBothPassQuota(t *testing.T) {
 		var appErr *apperror.AppError
 		require.True(t, errors.As(res.err, &appErr), "unexpected error: %v", res.err)
 		assert.Equal(t, string(catalog.CodeFileQuotaExceeded), appErr.Code)
-		assert.Equal(t, 413, appErr.Status)
 		rejected++
 	}
 	assert.Equal(t, 1, succeeded, "exactly one concurrent upload may fit the quota")

@@ -7,25 +7,29 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const deleteTenantNotificationPreferencesBatch = `-- name: DeleteTenantNotificationPreferencesBatch :execrows
 
 DELETE FROM notification_preferences
-WHERE id IN (
-    SELECT id FROM notification_preferences
-    WHERE tenant_id = $1::bigint
+WHERE (tenant_id, user_id, type, channel) IN (
+    SELECT tenant_id, user_id, type, channel FROM notification_preferences
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantNotificationPreferencesBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 // Tenant purge. Preferences and feed rows are erased in bounded id batches,
 // preferences first so a failure leaves a resumable state.
+// Preferences have a natural primary key, not a surrogate id: delete one
+// bounded page selected by its natural key.
 func (q *Queries) DeleteTenantNotificationPreferencesBatch(ctx context.Context, arg DeleteTenantNotificationPreferencesBatchParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteTenantNotificationPreferencesBatch, arg.TenantID, arg.BatchSize)
 	if err != nil {
@@ -38,14 +42,14 @@ const deleteTenantNotificationsBatch = `-- name: DeleteTenantNotificationsBatch 
 DELETE FROM notifications
 WHERE id IN (
     SELECT id FROM notifications
-    WHERE tenant_id = $1::bigint
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantNotificationsBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 func (q *Queries) DeleteTenantNotificationsBatch(ctx context.Context, arg DeleteTenantNotificationsBatchParams) (int64, error) {

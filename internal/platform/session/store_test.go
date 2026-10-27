@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/google/uuid"
 )
 
 type fakeStates struct {
@@ -15,7 +16,7 @@ type fakeStates struct {
 	err   error
 }
 
-func (f *fakeStates) SessionState(_ context.Context, _, _ int64) (State, error) {
+func (f *fakeStates) SessionState(_ context.Context, _, _ uuid.UUID) (State, error) {
 	f.calls++
 	if f.err != nil {
 		return State{}, f.err
@@ -25,13 +26,13 @@ func (f *fakeStates) SessionState(_ context.Context, _, _ int64) (State, error) 
 
 func activeState() State {
 	return State{
-		TenantID: 1, Role: "member", Permissions: []string{"profile:read"},
+		TenantID: testID(1), Role: "member", Permissions: []string{"profile:read"},
 		TokenVersion: 0, ExpiresAt: time.Now().Add(time.Hour), Active: true, TenantActive: true,
 	}
 }
 
 func claims() Claims {
-	return Claims{UserID: 1, TenantID: 1, SessionID: 7, TokenVersion: 0}
+	return Claims{UserID: testID(1), TenantID: testID(1), SessionID: testID(7), TokenVersion: 0}
 }
 
 func TestStore_CachesAndInvalidates(t *testing.T) {
@@ -56,7 +57,7 @@ func TestStore_CachesAndInvalidates(t *testing.T) {
 		t.Fatalf("reader calls = %d, want 1 (second validation should hit cache)", states.calls)
 	}
 
-	if err := store.Invalidate(ctx, 1); err != nil {
+	if err := store.Invalidate(ctx, testID(1)); err != nil {
 		t.Fatalf("invalidate: %v", err)
 	}
 	if _, err := store.Validate(ctx, claims()); err != nil {
@@ -89,7 +90,7 @@ func TestStore_SnapshotIsPerSession(t *testing.T) {
 		t.Fatalf("validate: %v", err)
 	}
 	other := claims()
-	other.SessionID = 8
+	other.SessionID = testID(8)
 	states.state.Active = false // session 8 is revoked
 	if _, err := store.Validate(ctx, other); err == nil {
 		t.Fatal("a revoked session must not reuse another session's cached snapshot")
@@ -108,12 +109,12 @@ func TestStore_RejectsMissingClaims(t *testing.T) {
 	store := NewStore(states, nil)
 
 	noTenant := claims()
-	noTenant.TenantID = 0
+	noTenant.TenantID = uuid.Nil
 	if _, err := store.Validate(context.Background(), noTenant); err == nil {
 		t.Fatal("a token without a tenant must be rejected")
 	}
 	noSession := claims()
-	noSession.SessionID = 0
+	noSession.SessionID = uuid.Nil
 	if _, err := store.Validate(context.Background(), noSession); err == nil {
 		t.Fatal("a token without a session must be rejected")
 	}
@@ -123,9 +124,9 @@ func TestStore_RejectsMissingClaims(t *testing.T) {
 }
 
 func TestStateOf(t *testing.T) {
-	snap := snapshot{TenantID: 1, Role: "admin", Permissions: []string{"admin:users:read"},
+	snap := snapshot{TenantID: testID(1), Role: "admin", Permissions: []string{"admin:users:read"},
 		TokenVersion: 3, ExpiresAt: time.Now().Add(time.Hour), Active: true, TenantActive: true}
-	ok := Claims{UserID: 1, TenantID: 1, SessionID: 1, TokenVersion: 3}
+	ok := Claims{UserID: testID(1), TenantID: testID(1), SessionID: testID(1), TokenVersion: 3}
 
 	state, err := stateOf(snap, ok)
 	if err != nil {
@@ -136,7 +137,7 @@ func TestStateOf(t *testing.T) {
 	}
 	for name, mutate := range map[string]func(*Claims){
 		"version": func(c *Claims) { c.TokenVersion = 2 },
-		"tenant":  func(c *Claims) { c.TenantID = 2 },
+		"tenant":  func(c *Claims) { c.TenantID = testID(2) },
 	} {
 		c := ok
 		mutate(&c)

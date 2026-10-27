@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -18,14 +19,14 @@ import (
 
 type fakePrivacyFiles struct {
 	files   []File
-	deleted []int64
+	deleted []uuid.UUID
 }
 
-func (f *fakePrivacyFiles) ListForUser(context.Context, int64, int64) ([]File, error) {
+func (f *fakePrivacyFiles) ListForUser(context.Context, uuid.UUID, uuid.UUID) ([]File, error) {
 	return f.files, nil
 }
 
-func (f *fakePrivacyFiles) HardDelete(_ context.Context, _, _, id int64) error {
+func (f *fakePrivacyFiles) HardDelete(_ context.Context, _, _, id uuid.UUID) error {
 	f.deleted = append(f.deleted, id)
 	for i, file := range f.files {
 		if file.ID == id {
@@ -42,10 +43,10 @@ func TestFilesExporterIncludesMetadataAndContent(t *testing.T) {
 	path := "1/10/a.txt"
 	require.NoError(t, store.Put(context.Background(), path, strings.NewReader("hello"), 5, "text/plain"))
 	repo := &fakePrivacyFiles{files: []File{{
-		ID: 1, TenantID: 1, UserID: 10, OriginalName: "a.txt", StoragePath: path,
+		ID: testID(1), TenantID: testID(1), UserID: testID(10), OriginalName: "a.txt", StoragePath: path,
 		MimeType: "text/plain", Size: 5, CreatedAt: time.Now(),
 	}}}
-	section, err := NewPrivacyExporter(repo, store).Export(context.Background(), 1, 10)
+	section, err := NewPrivacyExporter(repo, store).Export(context.Background(), testID(1), testID(10))
 	require.NoError(t, err)
 	assert.Equal(t, "files", section.Name)
 	var out struct {
@@ -65,18 +66,18 @@ func TestFilesEraserDeletesBlobThenRowIdempotently(t *testing.T) {
 	require.NoError(t, err)
 	path := "1/10/a.txt"
 	require.NoError(t, store.Put(context.Background(), path, strings.NewReader("hello"), 5, "text/plain"))
-	repo := &fakePrivacyFiles{files: []File{{ID: 1, TenantID: 1, UserID: 10, StoragePath: path}}}
+	repo := &fakePrivacyFiles{files: []File{{ID: testID(1), TenantID: testID(1), UserID: testID(10), StoragePath: path}}}
 	eraser := NewPrivacyEraser(repo, store)
-	require.NoError(t, eraser.Erase(context.Background(), 1, 10))
-	assert.Equal(t, []int64{1}, repo.deleted)
+	require.NoError(t, eraser.Erase(context.Background(), testID(1), testID(10)))
+	assert.Equal(t, []uuid.UUID{testID(1)}, repo.deleted)
 	_, err = store.Get(context.Background(), path)
 	assert.ErrorIs(t, err, storage.ErrNotFound)
 }
 
 func TestFilesEraserKeepsRowWhenBlobDeleteFails(t *testing.T) {
-	repo := &fakePrivacyFiles{files: []File{{ID: 1, TenantID: 1, UserID: 10, StoragePath: "1/10/a.txt"}}}
+	repo := &fakePrivacyFiles{files: []File{{ID: testID(1), TenantID: testID(1), UserID: testID(10), StoragePath: "1/10/a.txt"}}}
 	eraser := NewPrivacyEraser(repo, failingDeleteStorage{})
-	err := eraser.Erase(context.Background(), 1, 10)
+	err := eraser.Erase(context.Background(), testID(1), testID(10))
 	assert.Error(t, err)
 	assert.Empty(t, repo.deleted)
 }
@@ -111,12 +112,12 @@ func TestFilesExporterOmitsContentPastTheInlineBudget(t *testing.T) {
 		path := fmt.Sprintf("1/10/%d.txt", i)
 		require.NoError(t, store.Put(ctx, path, strings.NewReader(body), int64(len(body)), "text/plain"))
 		// Size is understated on purpose: the budget must count real bytes.
-		repo.files = append(repo.files, File{ID: int64(i + 1), TenantID: 1, UserID: 10, StoragePath: path, Size: 1})
+		repo.files = append(repo.files, File{ID: testID(i + 1), TenantID: testID(1), UserID: testID(10), StoragePath: path, Size: 1})
 	}
 	exporter := NewPrivacyExporter(repo, store)
 	exporter.inlineLimit = 6
 
-	section, err := exporter.Export(ctx, 1, 10)
+	section, err := exporter.Export(ctx, testID(1), testID(10))
 	require.NoError(t, err)
 	var out struct {
 		Files []struct {

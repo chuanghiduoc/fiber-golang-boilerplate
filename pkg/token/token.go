@@ -8,21 +8,22 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
-// Claims represents the JWT claims used across the application.
+// Claims represents the JWT claims used across the application. It carries no
+// email claim: RFC 9068 access tokens stay minimal, and a token holder must not
+// be able to read a stale address from it.
 type Claims struct {
-	UserID   int64 `json:"user_id"`
-	TenantID int64 `json:"tenant_id,omitempty"`
+	UserID   uuid.UUID `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id,omitempty"`
 	// SessionID is the sign-in session (sessions.id) the token belongs to.
-	SessionID int64  `json:"sid,omitempty"`
-	Email     string `json:"email"`
-	// Role is legacy and no longer minted: authorization comes from the
-	// permission snapshot. It stays readable so older tokens still verify.
-	Role         string `json:"role,omitempty"`
-	TokenVersion int32  `json:"token_version"`
+	SessionID uuid.UUID `json:"sid,omitempty"`
+	// Authorization comes from the session's permission snapshot, never from
+	// the token: a legacy "role" claim is ignored.
+	TokenVersion int32 `json:"token_version"`
 	// AMR is the Authentication Methods References set (RFC 8176): pwd,
-	// google, otp, rc. Tokens issued before MFA have no amr and still verify.
+	// google, otp, rc.
 	AMR []string `json:"amr,omitempty"`
 	jwt.RegisteredClaims
 }
@@ -30,48 +31,47 @@ type Claims struct {
 const (
 	jwtIssuer   = "fiber-golang-boilerplate"
 	jwtAudience = "fiber-golang-boilerplate-api"
+	// accessTokenType is the RFC 9068 "typ" header for OAuth 2.0 access
+	// tokens. Every token this package issues carries it, and Parse rejects a
+	// token without it (pre-RFC-9068 tokens must be rotated).
+	accessTokenType = "at+jwt"
 )
 
 // Generate creates a signed JWT token with token version 0 and no tenant
 // claim. Prefer GenerateWithVersion in production so password changes, bans,
 // and role changes can invalidate existing access tokens, and
 // GenerateWithVersionAndTenant so the token is bound to its tenant.
-func Generate(userID int64, email, role, secret string, expireHour int) (string, error) {
-	return GenerateWithVersion(userID, email, role, 0, secret, expireHour)
+func Generate(userID uuid.UUID, secret string, ttl time.Duration) (string, error) {
+	return GenerateWithVersion(userID, 0, secret, ttl)
 }
 
 // GenerateWithTenant creates a signed JWT token carrying the user's tenant.
-func GenerateWithTenant(userID, tenantID int64, email, role, secret string, expireHour int) (string, error) {
-	return GenerateWithVersionAndTenant(userID, tenantID, email, role, 0, secret, expireHour)
+func GenerateWithTenant(userID, tenantID uuid.UUID, secret string, ttl time.Duration) (string, error) {
+	return GenerateWithVersionAndTenant(userID, tenantID, 0, secret, ttl)
 }
 
 // GenerateWithVersion creates a signed JWT token carrying the user's current
-// token version. It omits the tenant claim for backward compatibility.
-func GenerateWithVersion(userID int64, email, role string, tokenVersion int32, secret string, expireHour int) (string, error) {
-	return GenerateWithVersionAndTenant(userID, 0, email, role, tokenVersion, secret, expireHour)
+// token version. It does not bind the token to a tenant or session.
+func GenerateWithVersion(userID uuid.UUID, tokenVersion int32, secret string, ttl time.Duration) (string, error) {
+	return GenerateWithVersionAndTenant(userID, uuid.Nil, tokenVersion, secret, ttl)
 }
 
 // GenerateWithVersionAndTenant creates a signed JWT token carrying both the
-// user's current token version and tenant ID. A negative tenant ID is rejected;
-// zero remains reserved for legacy tokens that predate multi-tenancy.
-func GenerateWithVersionAndTenant(userID, tenantID int64, email, role string, tokenVersion int32, secret string, expireHour int) (string, error) {
+// user's current token version and tenant ID. A nil tenant ID produces a token without a tenant claim.
+func GenerateWithVersionAndTenant(userID, tenantID uuid.UUID, tokenVersion int32, secret string, ttl time.Duration) (string, error) {
 	return GenerateForSession(SessionClaims{
 		UserID:       userID,
 		TenantID:     tenantID,
-		Email:        email,
-		Role:         role,
 		TokenVersion: tokenVersion,
-	}, secret, expireHour)
+	}, secret, ttl)
 }
 
 // SessionClaims are the application claims of an access token issued for a
 // sign-in session.
 type SessionClaims struct {
-	UserID       int64
-	TenantID     int64
-	SessionID    int64
-	Email        string
-	Role         string
+	UserID       uuid.UUID
+	TenantID     uuid.UUID
+	SessionID    uuid.UUID
 	TokenVersion int32
 	AMR          []string
 }
@@ -80,23 +80,15 @@ type SessionClaims struct {
 // session. The session validator rejects a token whose session was revoked;
 // a zero SessionID produces a token without the sid claim, which the
 // validator rejects fail-closed.
-func GenerateForSession(c SessionClaims, secret string, expireHour int) (string, error) {
-	if c.TenantID < 0 {
-		return "", errors.New("tenant ID must not be negative")
-	}
-	if c.SessionID < 0 {
-		return "", errors.New("session ID must not be negative")
-	}
+func GenerateForSession(c SessionClaims, secret string, ttl time.Duration) (string, error) {
 	claims := Claims{
 		UserID:       c.UserID,
 		TenantID:     c.TenantID,
 		SessionID:    c.SessionID,
-		Email:        c.Email,
-		Role:         c.Role,
 		TokenVersion: c.TokenVersion,
 		AMR:          c.AMR,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(expireHour) * time.Hour)),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    jwtIssuer,
 			Audience:  jwt.ClaimStrings{jwtAudience},
@@ -108,6 +100,7 @@ func GenerateForSession(c SessionClaims, secret string, expireHour int) (string,
 	// JWT_SECRET rotation. It is derived from the secret, so every replica
 	// stamps the same kid for the same key without coordination.
 	t.Header[kidHeader] = KeyID(secret)
+	t.Header["typ"] = accessTokenType
 	return t.SignedString([]byte(secret))
 }
 
@@ -128,7 +121,14 @@ const (
 // Keyring errors.
 var (
 	ErrInvalidKeyID = errors.New("token kid header must be a string")
+	// ErrMissingKeyID is returned for a token without the kid header. Every
+	// current token records the key that signed it, so a kid-less token cannot
+	// be attributed to a key and is rejected.
+	ErrMissingKeyID = errors.New("token kid header is required")
 	ErrUnknownKeyID = errors.New("token is signed with an unknown key")
+	// ErrInvalidTokenType is returned for a token whose typ header is not
+	// at+jwt (RFC 9068).
+	ErrInvalidTokenType = errors.New("token typ header must be at+jwt")
 )
 
 // KeyID returns the kid stamped on tokens signed with secret: the first 8 hex
@@ -145,12 +145,9 @@ func KeyID(secret string) string {
 // secret kept during a rotation. Signing always uses the active secret (the
 // Generate functions); previous secrets only verify.
 //
-// A token's kid header selects its key. Tokens without a kid were issued
-// before kid headers existed and verify against the active secret only, so a
-// rotation that retires a secret must wait until every kid-less token signed
-// with it has expired (JWT_EXPIRE_HOUR). An unknown kid is rejected. Distinct
-// secrets that collide on the 32-bit kid are all tried, so a collision can
-// never reject a valid token.
+// A token's kid header selects its key; a token without one is rejected, and
+// so is an unknown kid. Distinct secrets that collide on the 32-bit kid are
+// all tried, so a collision can never reject a valid token.
 type Keyring struct {
 	active []byte
 	byKID  map[string][][]byte
@@ -175,9 +172,13 @@ func NewKeyring(active string, previous ...string) *Keyring {
 
 // candidates returns the secrets that may have signed a token with header.
 func (k *Keyring) candidates(header map[string]any) ([][]byte, error) {
+	typ, _ := header["typ"].(string)
+	if typ != accessTokenType {
+		return nil, ErrInvalidTokenType
+	}
 	raw, present := header[kidHeader]
 	if !present {
-		return [][]byte{k.active}, nil
+		return nil, ErrMissingKeyID
 	}
 	kid, ok := raw.(string)
 	if !ok {

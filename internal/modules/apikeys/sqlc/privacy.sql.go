@@ -8,17 +8,18 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const deleteAPIKeysForPrivacy = `-- name: DeleteAPIKeysForPrivacy :execrows
 DELETE FROM api_keys
-WHERE tenant_id = $1::bigint AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid AND user_id = $2::uuid
 `
 
 type DeleteAPIKeysForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) DeleteAPIKeysForPrivacy(ctx context.Context, arg DeleteAPIKeysForPrivacyParams) (int64, error) {
@@ -37,20 +38,20 @@ SELECT id, tenant_id, user_id, name, prefix, expires_at, revoked_at,
              WHERE s.api_key_id = api_keys.id
              ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
 FROM api_keys
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
 ORDER BY id
 `
 
 type ListAPIKeysForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 type ListAPIKeysForPrivacyRow struct {
-	ID                 int64              `json:"id"`
-	TenantID           int64              `json:"tenant_id"`
-	UserID             int64              `json:"user_id"`
+	ID                 uuid.UUID          `json:"id"`
+	TenantID           uuid.UUID          `json:"tenant_id"`
+	UserID             uuid.UUID          `json:"user_id"`
 	Name               string             `json:"name"`
 	Prefix             string             `json:"prefix"`
 	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`

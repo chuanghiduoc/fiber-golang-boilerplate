@@ -8,7 +8,10 @@
 .golangci.yml
 .dockerignore
 .github/
+.superpowers/
 deploy/
+.opencode-brief.md
+REPORT-*.md
 tmp/
 bin/
 vendor/

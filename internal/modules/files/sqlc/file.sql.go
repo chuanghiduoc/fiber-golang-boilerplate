@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -16,7 +17,7 @@ SELECT count(*) FROM files
 WHERE tenant_id = $1
 `
 
-func (q *Queries) AdminCountFiles(ctx context.Context, tenantID int64) (int64, error) {
+func (q *Queries) AdminCountFiles(ctx context.Context, tenantID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, adminCountFiles, tenantID)
 	var count int64
 	err := row.Scan(&count)
@@ -36,7 +37,7 @@ type AdminFileStatsRow struct {
 	TotalFileSize int64 `json:"total_file_size"`
 }
 
-func (q *Queries) AdminFileStats(ctx context.Context, tenantID int64) (AdminFileStatsRow, error) {
+func (q *Queries) AdminFileStats(ctx context.Context, tenantID uuid.UUID) (AdminFileStatsRow, error) {
 	row := q.db.QueryRow(ctx, adminFileStats, tenantID)
 	var i AdminFileStatsRow
 	err := row.Scan(&i.TotalFiles, &i.TotalFileSize)
@@ -51,9 +52,9 @@ LIMIT $2 OFFSET $3
 `
 
 type AdminListFilesParams struct {
-	TenantID int64 `json:"tenant_id"`
-	Limit    int32 `json:"limit"`
-	Offset   int32 `json:"offset"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Limit    int32     `json:"limit"`
+	Offset   int32     `json:"offset"`
 }
 
 func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) ([]File, error) {
@@ -92,16 +93,16 @@ func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) 
 
 const adminListFilesCursor = `-- name: AdminListFilesCursor :many
 SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at, purge_attempts, purge_retry_after FROM files
-WHERE tenant_id = $1::bigint
-  AND (created_at, id) < ($2::timestamptz, $3::bigint)
+WHERE tenant_id = $1::uuid
+  AND (created_at, id) < ($2::timestamptz, $3::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT $4::int
 `
 
 type AdminListFilesCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -150,8 +151,8 @@ WHERE tenant_id = $1 AND user_id = $2 AND deleted_at IS NULL
 `
 
 type CountFilesByUserIDParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) CountFilesByUserID(ctx context.Context, arg CountFilesByUserIDParams) (int64, error) {
@@ -168,12 +169,12 @@ RETURNING id, tenant_id, user_id, original_name, storage_path, mime_type, size, 
 `
 
 type CreateFileParams struct {
-	TenantID     int64  `json:"tenant_id"`
-	UserID       int64  `json:"user_id"`
-	OriginalName string `json:"original_name"`
-	StoragePath  string `json:"storage_path"`
-	MimeType     string `json:"mime_type"`
-	Size         int64  `json:"size"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	UserID       uuid.UUID `json:"user_id"`
+	OriginalName string    `json:"original_name"`
+	StoragePath  string    `json:"storage_path"`
+	MimeType     string    `json:"mime_type"`
+	Size         int64     `json:"size"`
 }
 
 func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, error) {
@@ -211,8 +212,8 @@ RETURNING id, tenant_id, user_id, original_name, storage_path, mime_type, size, 
 `
 
 type DeleteFileParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) DeleteFile(ctx context.Context, arg DeleteFileParams) (File, error) {
@@ -239,14 +240,14 @@ func (q *Queries) DeleteFile(ctx context.Context, arg DeleteFileParams) (File, e
 const filesStorageUsage = `-- name: FilesStorageUsage :one
 SELECT
     COALESCE(SUM(size), 0)::bigint AS tenant_bytes,
-    COALESCE(SUM(size) FILTER (WHERE user_id = $1::bigint), 0)::bigint AS user_bytes
+    COALESCE(SUM(size) FILTER (WHERE user_id = $1::uuid), 0)::bigint AS user_bytes
 FROM files
-WHERE tenant_id = $2::bigint
+WHERE tenant_id = $2::uuid
 `
 
 type FilesStorageUsageParams struct {
-	UserID   int64 `json:"user_id"`
-	TenantID int64 `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type FilesStorageUsageRow struct {
@@ -268,8 +269,8 @@ WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 `
 
 type GetFileByIDParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) GetFileByID(ctx context.Context, arg GetFileByIDParams) (File, error) {
@@ -299,8 +300,8 @@ WHERE id = $1 AND tenant_id = $2
 `
 
 type GetFileByIDIncludingDeletedParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, arg GetFileByIDIncludingDeletedParams) (File, error) {
@@ -326,13 +327,13 @@ func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, arg GetFileBy
 
 const listFileStoragePaths = `-- name: ListFileStoragePaths :many
 SELECT storage_path FROM files
-WHERE tenant_id = $1::bigint
+WHERE tenant_id = $1::uuid
   AND storage_path = ANY($2::text[])
 `
 
 type ListFileStoragePathsParams struct {
-	TenantID int64    `json:"tenant_id"`
-	Paths    []string `json:"paths"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Paths    []string  `json:"paths"`
 }
 
 // The orphan sweep checks candidate storage keys against the owning tenant's
@@ -359,20 +360,20 @@ func (q *Queries) ListFileStoragePaths(ctx context.Context, arg ListFileStorageP
 
 const listFilesByUserCursor = `-- name: ListFilesByUserCursor :many
 SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at, purge_attempts, purge_retry_after FROM files
-WHERE tenant_id = $1::bigint
-  AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid
+  AND user_id = $2::uuid
   AND (deleted_at IS NULL OR $3::boolean)
-  AND (created_at, id) < ($4::timestamptz, $5::bigint)
+  AND (created_at, id) < ($4::timestamptz, $5::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT $6::int
 `
 
 type ListFilesByUserCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
-	UserID          int64              `json:"user_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	UserID          uuid.UUID          `json:"user_id"`
 	IncludeDeleted  bool               `json:"include_deleted"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -425,10 +426,10 @@ LIMIT $3 OFFSET $4
 `
 
 type ListFilesByUserIDParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
-	Limit    int32 `json:"limit"`
-	Offset   int32 `json:"offset"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	Limit    int32     `json:"limit"`
+	Offset   int32     `json:"offset"`
 }
 
 func (q *Queries) ListFilesByUserID(ctx context.Context, arg ListFilesByUserIDParams) ([]File, error) {
@@ -470,13 +471,72 @@ func (q *Queries) ListFilesByUserID(ctx context.Context, arg ListFilesByUserIDPa
 	return items, nil
 }
 
+const listFilesCursor = `-- name: ListFilesCursor :many
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at, purge_attempts, purge_retry_after FROM files
+WHERE tenant_id = $1::uuid
+  AND (deleted_at IS NULL OR $2::boolean)
+  AND (created_at, id) < ($3::timestamptz, $4::uuid)
+ORDER BY created_at DESC, id DESC
+LIMIT $5::int
+`
+
+type ListFilesCursorParams struct {
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	IncludeDeleted  bool               `json:"include_deleted"`
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
+	RowLimit        int32              `json:"row_limit"`
+}
+
+// Tenant-wide page used by the collection route for an admin caller.
+// include_deleted is the caller's includeDeleted query (admins also use it).
+func (q *Queries) ListFilesCursor(ctx context.Context, arg ListFilesCursorParams) ([]File, error) {
+	rows, err := q.db.Query(ctx, listFilesCursor,
+		arg.TenantID,
+		arg.IncludeDeleted,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []File{}
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.UserID,
+			&i.OriginalName,
+			&i.StoragePath,
+			&i.MimeType,
+			&i.Size,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+			&i.PurgeStartedAt,
+			&i.PurgeAttempts,
+			&i.PurgeRetryAfter,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockFilesQuota = `-- name: LockFilesQuota :exec
-SELECT pg_advisory_xact_lock(hashtextextended('files.quota:' || $1::bigint, 0))
+SELECT pg_advisory_xact_lock(hashtextextended('files.quota:' || $1::uuid, 0))
 `
 
 // Serializes uploads of one tenant for the rest of the metadata transaction,
 // so a concurrent upload cannot read the same free space and also pass.
-func (q *Queries) LockFilesQuota(ctx context.Context, tenantID int64) error {
+func (q *Queries) LockFilesQuota(ctx context.Context, tenantID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, lockFilesQuota, tenantID)
 	return err
 }
@@ -489,8 +549,8 @@ RETURNING id, tenant_id, user_id, original_name, storage_path, mime_type, size, 
 `
 
 type RestoreFileParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) RestoreFile(ctx context.Context, arg RestoreFileParams) (File, error) {

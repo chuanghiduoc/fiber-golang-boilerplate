@@ -3,13 +3,13 @@ package service
 import (
 	"context"
 	"errors"
-	"strconv"
 	"testing"
 	"time"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/google/uuid"
 )
 
 // The user.registered envelope carries the contracts payload (not the REST
@@ -19,11 +19,11 @@ func TestUserRegisteredEvent(t *testing.T) {
 	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	event, err := userRegisteredEvent(&Member{
 		User: User{
-			ID: 7, Email: "new@example.com", Name: "New User",
+			ID: testID(7), Email: "new@example.com", Name: "New User",
 			Status: UserStatusActive, TokenVersion: 4, HasPassword: true,
 			CreatedAt: created,
 		},
-		Membership: Membership{ID: 9, TenantID: 3, UserID: 7, Role: RoleMember, Status: MembershipStatusActive},
+		Membership: Membership{ID: testID(9), TenantID: testID(3), UserID: testID(7), Role: RoleMember, Status: MembershipStatusActive},
 	})
 	if err != nil {
 		t.Fatalf("userRegisteredEvent: %v", err)
@@ -31,10 +31,10 @@ func TestUserRegisteredEvent(t *testing.T) {
 	if event.Type != identitycontracts.EventUserRegistered || event.DataVersion != identitycontracts.UserRegisteredVersion {
 		t.Errorf("event = %s v%d", event.Type, event.DataVersion)
 	}
-	if event.TenantID != 3 || event.Actor.Type != "user" || event.Actor.ID != "7" || event.ID == "" {
+	if event.TenantID != testID(3) || event.Actor.Type != "user" || event.Actor.ID != testID(7).String() || event.ID == uuid.Nil {
 		t.Errorf("envelope = %+v", event)
 	}
-	const want = `{"userId":7,"email":"new@example.com","name":"New User","emailVerified":false,"createdAt":"2026-01-02T03:04:05Z"}`
+	const want = `{"userId":"0192c9b0-7e4a-7000-8000-000000000007","email":"new@example.com","name":"New User","emailVerified":false,"createdAt":"2026-01-02T03:04:05Z"}`
 	if string(event.Data) != want {
 		t.Errorf("data =\n%s\nwant\n%s", event.Data, want)
 	}
@@ -44,7 +44,7 @@ func TestUserRegisteredEvent(t *testing.T) {
 // registration transaction, scoped to the request tenant.
 func TestRegister_PublishesUserRegisteredInRequestTenant(t *testing.T) {
 	db := newMemDB()
-	ctx := tenant.WithID(context.Background(), 2)
+	ctx := tenant.WithID(context.Background(), testID(2))
 	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "e@example.com", Password: testPassphrase, Name: "E"})
 	if err != nil {
 		t.Fatalf("register: %v", err)
@@ -53,7 +53,7 @@ func TestRegister_PublishesUserRegisteredInRequestTenant(t *testing.T) {
 		t.Fatalf("published = %d events, want 1", len(db.published))
 	}
 	event := db.published[0]
-	if event.Type != identitycontracts.EventUserRegistered || event.TenantID != 2 || event.Actor.ID != strconv.FormatInt(user.User.ID, 10) {
+	if event.Type != identitycontracts.EventUserRegistered || event.TenantID != testID(2) || event.Actor.ID != user.User.ID.String() {
 		t.Errorf("event = %+v", event)
 	}
 }
@@ -66,9 +66,9 @@ func (failingPublisher) Publish(context.Context, events.Event) error {
 
 // A publish failure is returned, so the registration transaction rolls back.
 func TestPublishRegisteredTx_FailsClosed(t *testing.T) {
-	err := publishRegisteredTx(context.Background(), failingPublisher{}, &Member{
-		User:       User{ID: 1, Email: "a@example.com", CreatedAt: time.Now()},
-		Membership: Membership{TenantID: 1},
+	err := publishRegisteredTx(testTenantCtx(), failingPublisher{}, &Member{
+		User:       User{ID: testID(1), Email: "a@example.com", CreatedAt: time.Now()},
+		Membership: Membership{TenantID: testID(1)},
 	})
 	if err == nil {
 		t.Fatal("publishRegisteredTx: want error when the publisher fails")

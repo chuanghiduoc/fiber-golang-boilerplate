@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	webhooksvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
@@ -24,19 +27,23 @@ func toEndpoint(row webhooksqlc.WebhookEndpoint, eventTypes []string) webhooksvc
 		TimeoutMS:   row.TimeoutMs,
 		CreatedAt:   row.CreatedAt.Time,
 		UpdatedAt:   row.UpdatedAt.Time,
-		DeletedAt:   timePtr(row.DeletedAt),
+		DeletedAt:   database.TimePtr(row.DeletedAt),
 	}
 }
 
 // CreateEndpoint inserts the endpoint, its subscriptions, and its first
 // secret in one transaction.
 func (r *Postgres) CreateEndpoint(ctx context.Context, draft webhooksvc.CreateEndpointDraft) (*webhooksvc.Endpoint, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
-	tid := tenantID(ctx)
+	tid := tenantID
 	var endpoint *webhooksvc.Endpoint
-	err := r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
+	err = r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
 		created, err := q.CreateWebhookEndpoint(ctx, webhooksqlc.CreateWebhookEndpointParams{
 			TenantID:    tid,
 			Url:         draft.URL,
@@ -80,13 +87,17 @@ func (r *Postgres) CreateEndpoint(ctx context.Context, draft webhooksvc.CreateEn
 	return endpoint, nil
 }
 
-func (r *Postgres) GetEndpoint(ctx context.Context, id int64) (*webhooksvc.Endpoint, error) {
+func (r *Postgres) GetEndpoint(ctx context.Context, id uuid.UUID) (*webhooksvc.Endpoint, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
 	row, err := r.q.GetWebhookEndpoint(ctx, webhooksqlc.GetWebhookEndpointParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 	})
 	if err != nil {
 		return nil, mapNotFound(err)
@@ -96,11 +107,15 @@ func (r *Postgres) GetEndpoint(ctx context.Context, id int64) (*webhooksvc.Endpo
 }
 
 func (r *Postgres) ListEndpoints(ctx context.Context, cur pagination.DBCursor) ([]webhooksvc.Endpoint, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
 	rows, err := r.q.ListWebhookEndpoints(ctx, webhooksqlc.ListWebhookEndpointsParams{
-		TenantID:        tenantID(ctx),
+		TenantID:        tenantID,
 		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
@@ -118,23 +133,45 @@ func (r *Postgres) ListEndpoints(ctx context.Context, cur pagination.DBCursor) (
 // UpdateEndpoint replaces the endpoint configuration and its subscription set
 // in one transaction.
 func (r *Postgres) UpdateEndpoint(ctx context.Context, draft webhooksvc.UpdateEndpointDraft) (*webhooksvc.Endpoint, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
-	tid := tenantID(ctx)
+	tid := tenantID
 	var endpoint *webhooksvc.Endpoint
-	err := r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
-		updated, err := q.UpdateWebhookEndpoint(ctx, webhooksqlc.UpdateWebhookEndpointParams{
-			Url:         draft.URL,
-			Description: draft.Description,
-			Status:      draft.Status,
-			MaxAttempts: draft.MaxAttempts,
-			TimeoutMs:   draft.TimeoutMS,
-			ID:          draft.ID,
-			TenantID:    tid,
-		})
+	err = r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
+		var updated webhooksqlc.WebhookEndpoint
+		var err error
+		if draft.ExpectedUpdatedAt != nil {
+			updated, err = q.UpdateWebhookEndpointIfUnchanged(ctx, webhooksqlc.UpdateWebhookEndpointIfUnchangedParams{
+				Url:               draft.URL,
+				Description:       draft.Description,
+				Status:            draft.Status,
+				MaxAttempts:       draft.MaxAttempts,
+				TimeoutMs:         draft.TimeoutMS,
+				ID:                draft.ID,
+				TenantID:          tid,
+				ExpectedUpdatedAt: timestamptzValue(*draft.ExpectedUpdatedAt),
+			})
+		} else {
+			updated, err = q.UpdateWebhookEndpoint(ctx, webhooksqlc.UpdateWebhookEndpointParams{
+				Url:         draft.URL,
+				Description: draft.Description,
+				Status:      draft.Status,
+				MaxAttempts: draft.MaxAttempts,
+				TimeoutMs:   draft.TimeoutMS,
+				ID:          draft.ID,
+				TenantID:    tid,
+			})
+		}
 		if err != nil {
-			return mapNotFound(err)
+			return mapConditionalUpdate(ctx, q, err, func() error {
+				_, existsErr := q.GetWebhookEndpoint(ctx, webhooksqlc.GetWebhookEndpointParams{ID: draft.ID, TenantID: tid})
+				return existsErr
+			})
 		}
 		// Queued deliveries snapshotted the old URL/timeout. Repoint them in
 		// the same transaction so a retry after an endpoint move cannot keep
@@ -172,13 +209,17 @@ func (r *Postgres) UpdateEndpoint(ctx context.Context, draft webhooksvc.UpdateEn
 
 // DeleteEndpoint soft-deletes and disables the endpoint. Its subscriptions
 // stay: they only cascade on a hard delete.
-func (r *Postgres) DeleteEndpoint(ctx context.Context, id int64) error {
+func (r *Postgres) DeleteEndpoint(ctx context.Context, id uuid.UUID) error {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return err
+	}
 	if r == nil || r.q == nil {
 		return ErrNoPool
 	}
 	affected, err := r.q.DeleteWebhookEndpoint(ctx, webhooksqlc.DeleteWebhookEndpointParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 	})
 	if err != nil {
 		return err
@@ -189,13 +230,17 @@ func (r *Postgres) DeleteEndpoint(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertext string, expirePrevious bool) (*webhooksvc.Endpoint, error) {
+func (r *Postgres) RotateEndpointSecret(ctx context.Context, id uuid.UUID, ciphertext string, expirePrevious bool) (*webhooksvc.Endpoint, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
-	tid := tenantID(ctx)
+	tid := tenantID
 	var endpoint *webhooksvc.Endpoint
-	err := r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
+	err = r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
 		// Lock the endpoint row so concurrent rotations serialize instead of
 		// both reading the same next version and failing the unique index.
 		current, err := q.LockWebhookEndpoint(ctx, webhooksqlc.LockWebhookEndpointParams{ID: id, TenantID: tid})
@@ -253,36 +298,61 @@ func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertex
 	return endpoint, nil
 }
 
-func (r *Postgres) ActiveEndpoints(ctx context.Context, tenant int64) ([]webhooksvc.ActiveEndpoint, error) {
+func (r *Postgres) ActiveEndpoints(ctx context.Context, scopedTenantID uuid.UUID) ([]webhooksvc.ActiveEndpoint, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
-	rows, err := r.q.ListActiveWebhookEndpointsWithSecret(ctx, tenant)
+	rows, err := r.q.ListActiveWebhookEndpointsWithSecret(ctx, scopedTenantID)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]webhooksvc.ActiveEndpoint, len(rows))
 	for i, row := range rows {
 		out[i] = webhooksvc.ActiveEndpoint{
-			ID:               row.ID,
-			TenantID:         row.TenantID,
-			URL:              row.Url,
-			EventTypes:       row.EventTypes,
-			MaxAttempts:      row.MaxAttempts,
-			TimeoutMS:        row.TimeoutMs,
-			SecretCiphertext: row.SecretCiphertext,
+			ID:          row.ID,
+			TenantID:    row.TenantID,
+			URL:         row.Url,
+			EventTypes:  row.EventTypes,
+			MaxAttempts: row.MaxAttempts,
+			TimeoutMS:   row.TimeoutMs,
+			SecretID:    row.SecretID,
 		}
 	}
 	return out, nil
 }
 
-func (r *Postgres) ActiveEndpointSecret(ctx context.Context, endpointID int64) (string, error) {
+// ActiveSecretID returns the id of the endpoint's active secret version.
+func (r *Postgres) ActiveSecretID(ctx context.Context, endpointID uuid.UUID) (uuid.UUID, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if r == nil || r.q == nil {
+		return uuid.Nil, ErrNoPool
+	}
+	secret, err := r.q.GetActiveWebhookEndpointSecret(ctx, webhooksqlc.GetActiveWebhookEndpointSecretParams{
+		TenantID:   tenantID,
+		EndpointID: endpointID,
+	})
+	if err != nil {
+		return uuid.Nil, mapNotFound(err)
+	}
+	return secret.ID, nil
+}
+
+// SnapshotSecret returns the sealed ciphertext of the exact secret version a
+// delivery references.
+func (r *Postgres) SnapshotSecret(ctx context.Context, secretID uuid.UUID) (string, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return "", err
+	}
 	if r == nil || r.q == nil {
 		return "", ErrNoPool
 	}
-	secret, err := r.q.GetActiveWebhookEndpointSecret(ctx, webhooksqlc.GetActiveWebhookEndpointSecretParams{
-		TenantID:   tenantID(ctx),
-		EndpointID: endpointID,
+	secret, err := r.q.GetWebhookEndpointSecretByID(ctx, webhooksqlc.GetWebhookEndpointSecretByIDParams{
+		TenantID: tenantID,
+		ID:       secretID,
 	})
 	if err != nil {
 		return "", mapNotFound(err)
@@ -294,12 +364,16 @@ func (r *Postgres) ActiveEndpointSecret(ctx context.Context, endpointID int64) (
 // explicit grace window is open, its immediately previous sealed secret. The
 // delivery worker co-signs with both so receivers can switch at any time
 // during the window.
-func (r *Postgres) SigningSecrets(ctx context.Context, endpointID int64) (*webhooksvc.SigningSecrets, error) {
+func (r *Postgres) SigningSecrets(ctx context.Context, endpointID uuid.UUID) (*webhooksvc.SigningSecrets, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
 	secrets, err := r.q.GetWebhookEndpointSigningSecrets(ctx, webhooksqlc.GetWebhookEndpointSigningSecretsParams{
-		TenantID:   tenantID(ctx),
+		TenantID:   tenantID,
 		EndpointID: endpointID,
 	})
 	if err != nil {

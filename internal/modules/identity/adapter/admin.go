@@ -8,6 +8,7 @@ import (
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/google/uuid"
 )
 
 // AdminIdentity adapts the identity admin service to identitycontracts.IdentityAdmin.
@@ -33,7 +34,7 @@ func (a *AdminIdentity) ListUsers(ctx context.Context, limit int, startingAfter 
 	return identitycontracts.UserPage{Items: items, HasMore: hasMore}, nil
 }
 
-func (a *AdminIdentity) UpdateRole(ctx context.Context, id int64, role string) (identitycontracts.User, error) {
+func (a *AdminIdentity) UpdateRole(ctx context.Context, id uuid.UUID, role string) (identitycontracts.User, error) {
 	user, err := a.service.UpdateRole(ctx, id, role)
 	if err != nil {
 		return identitycontracts.User{}, err
@@ -41,11 +42,11 @@ func (a *AdminIdentity) UpdateRole(ctx context.Context, id int64, role string) (
 	return toUser(user), nil
 }
 
-func (a *AdminIdentity) BanUser(ctx context.Context, id int64) error {
+func (a *AdminIdentity) BanUser(ctx context.Context, id uuid.UUID) error {
 	return a.service.BanUser(ctx, id)
 }
 
-func (a *AdminIdentity) UnbanUser(ctx context.Context, id int64) (identitycontracts.User, error) {
+func (a *AdminIdentity) UnbanUser(ctx context.Context, id uuid.UUID) (identitycontracts.User, error) {
 	user, err := a.service.UnbanUser(ctx, id)
 	if err != nil {
 		return identitycontracts.User{}, err

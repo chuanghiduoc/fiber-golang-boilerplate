@@ -6,16 +6,39 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strconv"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"{{.M.ModulePath}}/internal/app"
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
 	{{.M.Ident}}repository "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/repository"
 	"{{.M.ModulePath}}/internal/platform/audit"
 	"{{.M.ModulePath}}/internal/platform/authz"
+	"{{.M.ModulePath}}/internal/platform/session"
+	"{{.M.ModulePath}}/internal/platform/tenant"
 	"{{.M.ModulePath}}/internal/testutil"
 )
+
+// integrationSessions is an active administrator snapshot for the module's
+// permissions: this test exercises routing, RLS, and audit, while real session
+// validation is covered by the identity tests. Without a session store the
+// middleware builds an empty subject (a legacy role claim is ignored).
+type integrationSessions struct{}
+
+func (integrationSessions) Validate(context.Context, session.Claims) (session.State, error) {
+	permissions := make([]string, 0, len({{.M.Ident}}catalog.Permissions()))
+	for _, grant := range {{.M.Ident}}catalog.Permissions() {
+		permissions = append(permissions, string(grant.Permission))
+	}
+	return session.State{
+		Role: authz.RoleAdmin, Permissions: permissions, Active: true, TenantActive: true,
+	}, nil
+}
+
+func (integrationSessions) Invalidate(context.Context, uuid.UUID) error { return nil }
+
+func (integrationSessions) InvalidatePermissions(context.Context) error { return nil }
 
 // Test{{.R.Pascal}}CRUDAndTenantIsolation runs the generated routes through the
 // full middleware stack against PostgreSQL (Testcontainers, or
@@ -32,7 +55,7 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	}
 	t.Cleanup(cleanup)
 
-	var tenantB int64
+	var tenantB uuid.UUID
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name) VALUES ('{{.M.Route}}-{{.R.Route}}-b', 'Tenant B') RETURNING id`,
 	).Scan(&tenantB); err != nil {
@@ -41,10 +64,12 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	db := testutil.Scoped(pool)
 	recorder := audit.NewPostgresRecorder(db)
 	fiberApp := testApp(t,
-		app.Infra{Pool: pool, DB: db, Tx: testutil.NewTxManager(pool), Audit: recorder},
-		app.Deps{Audit: recorder})
-	adminA := bearer(t, 1, 1, authz.RoleAdmin)
-	adminB := bearer(t, 2, tenantB, authz.RoleAdmin)
+		app.Infra{DB: db, Tx: testutil.NewTxManager(pool), Audit: recorder},
+		app.Deps{Audit: recorder, Sessions: integrationSessions{}})
+	userA := uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000a1")
+	userB := uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000b1")
+	adminA := bearer(t, userA, tenant.DefaultID, authz.RoleAdmin)
+	adminB := bearer(t, userB, tenantB, authz.RoleAdmin)
 	base := "/api/v1/{{.M.Route}}/{{.R.PluralRoute}}"
 
 	status, body := do(t, fiberApp, http.MethodPost, base, adminA, `{"name":"first"}`)
@@ -52,13 +77,13 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 		t.Fatalf("create = %d %s", status, body)
 	}
 	var created struct {
-		ID   int64  `json:"id"`
+		ID   uuid.UUID  `json:"id"`
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal([]byte(body), &created); err != nil || created.ID == 0 {
+	if err := json.Unmarshal([]byte(body), &created); err != nil || created.ID == uuid.Nil {
 		t.Fatalf("create body %s: %v", body, err)
 	}
-	item := base + "/" + strconv.FormatInt(created.ID, 10)
+	item := base + "/" + created.ID.String()
 
 	if status, body := do(t, fiberApp, http.MethodGet, item, adminA, ""); status != http.StatusOK {
 		t.Fatalf("get = %d %s", status, body)
@@ -71,7 +96,7 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	}
 	var page struct {
 		Data []struct {
-			ID   int64  `json:"id"`
+			ID   uuid.UUID  `json:"id"`
 			Name string `json:"name"`
 		} `json:"data"`
 	}
@@ -112,8 +137,8 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	// Every mutation wrote a completed Tier 2 intent row in its own tenant.
 	var audited int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM audit_events WHERE resource = '{{.R.Table}}' AND tenant_id = 1 AND outcome = 'succeeded'`,
-	).Scan(&audited); err != nil {
+		`SELECT count(*) FROM audit_events WHERE resource = '{{.R.Table}}' AND tenant_id = $1 AND outcome = 'succeeded'`,
+		tenant.DefaultID).Scan(&audited); err != nil {
 		t.Fatalf("count audit rows: %v", err)
 	}
 	if audited != 3 {
@@ -128,17 +153,17 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	if status, body := do(t, fiberApp, http.MethodPost, base, adminB, `{"name":"keep b"}`); status != http.StatusCreated {
 		t.Fatalf("create in tenant B = %d %s", status, body)
 	}
-	if err := {{.M.Ident}}repository.New{{.R.Pascal}}TenantPurger(db).PurgeTenant(ctx, 1); err != nil {
+	if err := {{.M.Ident}}repository.New{{.R.Pascal}}TenantPurger(db).PurgeTenant(ctx, tenant.DefaultID); err != nil {
 		t.Fatalf("PurgeTenant: %v", err)
 	}
-	for tenantID, want := range map[int64]int{1: 0, tenantB: 1} {
+	for tenantID, want := range map[uuid.UUID]int{tenant.DefaultID: 0, tenantB: 1} {
 		var remaining int
 		if err := pool.QueryRow(ctx,
 			`SELECT count(*) FROM {{.R.Table}} WHERE tenant_id = $1`, tenantID).Scan(&remaining); err != nil {
-			t.Fatalf("count tenant %d rows: %v", tenantID, err)
+			t.Fatalf("count tenant %s rows: %v", tenantID, err)
 		}
 		if remaining != want {
-			t.Errorf("tenant %d rows after purge = %d, want %d", tenantID, remaining, want)
+			t.Errorf("tenant %s rows after purge = %d, want %d", tenantID, remaining, want)
 		}
 	}
 }

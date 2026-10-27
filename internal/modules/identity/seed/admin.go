@@ -8,17 +8,13 @@ import (
 	"log/slog"
 	"strings"
 
-	"golang.org/x/crypto/bcrypt"
-
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
+	"github.com/google/uuid"
 )
-
-const adminBcryptCost = 12
 
 // Admin creates the bootstrap admin when ADMIN_EMAIL and ADMIN_PASSWORD are
 // set and no account has that address: a verified global user, its password,
@@ -33,16 +29,16 @@ const adminBcryptCost = 12
 // existing account, and never fails the run over it.
 //
 // The optional tenant ID selects the tenant of the admin membership. Callers
-// pass the configured default tenant; when omitted, the compatibility tenant
+// pass the configured default tenant; when omitted, the seeded default tenant
 // (id 1, slug "default") is used.
-func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.Stores, tx identityservice.Transactor, tenantIDs ...int64) error {
+func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.Stores, tx identityservice.Transactor, tenantIDs ...uuid.UUID) error {
 	if cfg.Email == "" || cfg.Password == "" {
 		slog.Debug("ADMIN_EMAIL or ADMIN_PASSWORD not set, skipping admin seed")
 		return nil
 	}
 
 	tenantID := tenant.DefaultID
-	if len(tenantIDs) > 0 && tenantIDs[0] > 0 {
+	if len(tenantIDs) > 0 && tenantIDs[0] != uuid.Nil {
 		tenantID = tenantIDs[0]
 	}
 	// The seeder is a trusted system caller: it acts for the platform with no
@@ -62,17 +58,17 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.S
 	if !errors.Is(err, apperror.ErrNotFound) {
 		return fmt.Errorf("look up admin user: %w", err)
 	}
-	banned, err := stores.Memberships.EmailBanned(ctx, email)
+	banned, err := stores.EmailBanned(ctx, email)
 	if err != nil {
 		return fmt.Errorf("check banned admin email: %w", err)
 	}
 	if banned {
 		slog.Warn("ADMIN_EMAIL is banned in the tenant; skipping admin seed",
-			slog.String("email", email), slog.Int64("tenant_id", tenantID))
+			slog.String("email", email), slog.String("tenant_id", tenantID.String()))
 		return nil
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(validator.NormalizePassword(cfg.Password)), adminBcryptCost)
+	hash, err := identityservice.HashPassword(cfg.Password)
 	if err != nil {
 		return fmt.Errorf("hash admin password: %w", err)
 	}
@@ -81,7 +77,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.S
 		if err != nil {
 			return err
 		}
-		if err := tx.Users.CreatePassword(ctx, user.ID, string(hash)); err != nil {
+		if err := tx.Users.CreatePassword(ctx, user.ID, hash); err != nil {
 			return err
 		}
 		if _, err = tx.Memberships.Create(ctx, user.ID, identityservice.RoleOwner); err != nil {
@@ -99,19 +95,19 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.S
 		return fmt.Errorf("create admin user: %w", err)
 	}
 
-	slog.Info("admin user created", slog.String("email", email), slog.Int64("tenant_id", tenantID))
+	slog.Info("admin user created", slog.String("email", email), slog.String("tenant_id", tenantID.String()))
 	return nil
 }
 
 // keepExisting leaves an existing account untouched unless it is already an
 // active admin member whose email is unverified (a pre-hardening seed), which
 // is repaired.
-func keepExisting(ctx context.Context, stores identityservice.Stores, user *identityservice.User, tenantID int64) error {
+func keepExisting(ctx context.Context, stores identityservice.Stores, user *identityservice.User, tenantID uuid.UUID) error {
 	member, err := stores.Memberships.Get(ctx, user.ID)
 	switch {
 	case errors.Is(err, apperror.ErrNotFound):
 		slog.Warn("ADMIN_EMAIL belongs to an account that is not a member of the tenant; skipping admin seed (memberships are never added by the seed)",
-			slog.String("email", user.Email), slog.Int64("tenant_id", tenantID))
+			slog.String("email", user.Email), slog.String("tenant_id", tenantID.String()))
 		return nil
 	case err != nil:
 		return fmt.Errorf("look up admin membership: %w", err)
@@ -119,7 +115,7 @@ func keepExisting(ctx context.Context, stores identityservice.Stores, user *iden
 	if !member.Active() || member.Membership.Role != identityservice.RoleOwner {
 		slog.Warn("ADMIN_EMAIL belongs to a member that is not an active owner; skipping admin seed (accounts are never promoted or restored)",
 			slog.String("email", user.Email),
-			slog.Int64("tenant_id", tenantID),
+			slog.String("tenant_id", tenantID.String()),
 			slog.String("membership_status", string(member.Membership.Status)),
 		)
 		return nil

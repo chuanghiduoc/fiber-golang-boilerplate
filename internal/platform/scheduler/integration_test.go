@@ -1,18 +1,18 @@
+//go:build integration
+
 package scheduler
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -22,8 +22,10 @@ import (
 )
 
 func TestSchedulerIntegrationLeaderLease(t *testing.T) {
-	pool := setupSchedulerIntegrationDB(t)
-	store := newPGStore(pool, pgtest.NewTxManager(pool))
+	fx := setupSchedulerIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
+	store := newPGStore(pool, pgtest.NewTxManager(pools))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -54,19 +56,21 @@ func TestSchedulerIntegrationLeaderLease(t *testing.T) {
 }
 
 func TestSchedulerIntegrationRunLedgerAndEnqueue(t *testing.T) {
-	pool := setupSchedulerIntegrationDB(t)
+	fx := setupSchedulerIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	// tenants.id is GENERATED ALWAYS AS IDENTITY: let the database assign it.
-	var tenantTwo int64
+	var tenantTwo uuid.UUID
 	err := pool.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name) VALUES ('scheduler-tenant-2', 'Scheduler Tenant 2') RETURNING id`,
 	).Scan(&tenantTwo)
 	require.NoError(t, err)
 
-	store := newPGStore(pool, pgtest.NewTxManager(pool))
-	queue := jobs.NewQueue(pgtest.Scoped(pool))
+	store := newPGStore(pool, pgtest.NewTxManager(pools))
+	queue := jobs.NewQueue(pgtest.Scoped(pools))
 	slot := time.Date(2026, 10, 24, 12, 5, 0, 0, time.UTC)
 	run := runRecord{Schedule: "cleanup", ScheduledFor: slot, Status: runStatusEnqueued}
 	job := jobs.Job{
@@ -93,17 +97,17 @@ func TestSchedulerIntegrationRunLedgerAndEnqueue(t *testing.T) {
 	var (
 		runCount int
 		jobCount int
-		jobID    int64
+		jobID    uuid.UUID
 	)
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT count(*) FROM scheduler_runs WHERE schedule = 'cleanup'`).Scan(&runCount))
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT count(*), min(id) FROM jobs WHERE kind = 'maintenance.cleanup'`).Scan(&jobCount, &jobID))
+		`SELECT count(*), (array_agg(id))[1] FROM jobs WHERE kind = 'maintenance.cleanup'`).Scan(&jobCount, &jobID))
 	assert.Equal(t, 1, runCount)
 	assert.Equal(t, 1, jobCount)
 
 	var (
-		storedTenant int64
+		storedTenant uuid.UUID
 		storedKey    string
 		payload      []byte
 	)
@@ -138,7 +142,9 @@ func TestSchedulerIntegrationRunLedgerAndEnqueue(t *testing.T) {
 // deleted a sparse schedule's only (newest) row: the scheduler then treated the
 // schedule as never-run and re-enqueued the already executed slot.
 func TestSchedulerIntegrationPurgeKeepsLatestSlot(t *testing.T) {
-	pool := setupSchedulerIntegrationDB(t)
+	fx := setupSchedulerIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -158,7 +164,7 @@ func TestSchedulerIntegrationPurgeKeepsLatestSlot(t *testing.T) {
 		TenantID: tenant.DefaultID,
 	}))
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
-	sched := New(pool, pgtest.NewTxManager(pool), registry, jobs.NewQueue(pgtest.Scoped(pool)), "integration-node-purge",
+	sched := New(pool, pgtest.NewTxManager(pools), registry, jobs.NewQueue(pgtest.Scoped(pools)), "integration-node-purge",
 		WithPollInterval(10*time.Millisecond),
 		WithHeartbeatInterval(50*time.Millisecond),
 		WithLeaseTTL(time.Second),
@@ -196,7 +202,9 @@ func TestSchedulerIntegrationPurgeKeepsLatestSlot(t *testing.T) {
 }
 
 func TestSchedulerIntegrationSingleLeaderEnqueuesOnce(t *testing.T) {
-	pool := setupSchedulerIntegrationDB(t)
+	fx := setupSchedulerIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -207,15 +215,15 @@ func TestSchedulerIntegrationSingleLeaderEnqueuesOnce(t *testing.T) {
 		Kind:     "integration.scheduler.tick",
 		TenantID: tenant.DefaultID,
 	}))
-	queue := jobs.NewQueue(pgtest.Scoped(pool))
+	queue := jobs.NewQueue(pgtest.Scoped(pools))
 
-	first := New(pool, pgtest.NewTxManager(pool), registry, queue, "integration-node-a",
+	first := New(pool, pgtest.NewTxManager(pools), registry, queue, "integration-node-a",
 		WithPollInterval(10*time.Millisecond),
 		WithHeartbeatInterval(50*time.Millisecond),
 		WithLeaseTTL(time.Second),
 		WithCatchup(CatchupLatest),
 	)
-	second := New(pool, pgtest.NewTxManager(pool), registry, queue, "integration-node-b",
+	second := New(pool, pgtest.NewTxManager(pools), registry, queue, "integration-node-b",
 		WithPollInterval(10*time.Millisecond),
 		WithHeartbeatInterval(50*time.Millisecond),
 		WithLeaseTTL(time.Second),
@@ -258,56 +266,9 @@ func TestSchedulerIntegrationSingleLeaderEnqueuesOnce(t *testing.T) {
 	assert.Equal(t, 1, runCount)
 }
 
-func setupSchedulerIntegrationDB(t *testing.T) *pgxpool.Pool {
+func setupSchedulerIntegrationDB(t *testing.T) *pgtest.Fixture {
 	t.Helper()
-
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping scheduler integration test")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	adminCfg, err := pgxpool.ParseConfig(dsn)
-	require.NoError(t, err)
-	admin, err := pgxpool.NewWithConfig(ctx, adminCfg)
-	require.NoError(t, err)
-	t.Cleanup(admin.Close)
-	require.NoError(t, admin.Ping(ctx))
-
-	schema := fmt.Sprintf("scheduler_test_%d", time.Now().UnixNano())
-	schemaIdent := pgx.Identifier{schema}.Sanitize()
-	_, err = admin.Exec(ctx, "CREATE SCHEMA "+schemaIdent)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanupCancel()
-		_, _ = admin.Exec(cleanupCtx, "DROP SCHEMA IF EXISTS "+schemaIdent+" CASCADE")
-	})
-
-	migrations, err := integrationSchema(t)
-	require.NoError(t, err)
-
-	conn, err := admin.Acquire(ctx)
-	require.NoError(t, err)
-	defer conn.Release()
-
-	_, err = conn.Exec(ctx, "SET search_path TO "+schemaIdent)
-	require.NoError(t, err)
-	// One Exec per file, like golang-migrate: a multi-statement string runs in
-	// an implicit transaction, which CREATE INDEX CONCURRENTLY rejects.
-	for _, migration := range migrations {
-		if _, err := conn.Conn().PgConn().Exec(ctx, migration.sql).ReadAll(); err != nil {
-			t.Fatalf("apply %s: %v", migration.name, err)
-		}
-	}
-
-	pools, err := pgtest.OpenAppPools(ctx, dsn, schema)
-	require.NoError(t, err)
-	t.Cleanup(func() { pgtest.ClosePools(pools) })
-
-	return pools.Bypass
+	return pgtest.New(t)
 }
 
 // integrationMigration is one up migration file.
@@ -328,7 +289,7 @@ func integrationSchema(t *testing.T) ([]integrationMigration, error) {
 		return nil, err
 	}
 	require.NotEmpty(t, paths, "no up migrations found")
-	sort.Strings(paths)
+	slices.Sort(paths)
 	migrations := make([]integrationMigration, 0, len(paths))
 	for _, path := range paths {
 		raw, err := os.ReadFile(path)

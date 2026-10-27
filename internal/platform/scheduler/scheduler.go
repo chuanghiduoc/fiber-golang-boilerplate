@@ -8,10 +8,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -441,8 +443,15 @@ func (s *Scheduler) enqueue(ctx context.Context, schedule Schedule, slot time.Ti
 		ScheduledFor: slot.UTC(),
 		Status:       runStatusEnqueued,
 	}
+	tenantID := spec.TenantID
+	if tenantID == uuid.Nil {
+		// Scheduler work runs for the platform, not for a request tenant: an
+		// unset spec tenant belongs to the seeded default tenant (a real row),
+		// never to whatever tenant happened to be in the leader's context.
+		tenantID = tenant.DefaultID
+	}
 	job := jobs.Job{
-		TenantID:       spec.TenantID,
+		TenantID:       tenantID,
 		Kind:           spec.Kind,
 		Payload:        payload,
 		MaxAttempts:    spec.MaxAttempts,

@@ -8,50 +8,36 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 )
 
-// EmailJobKind is the job kind for plaintext email jobs (legacy/backward
-// compatible). Encrypted jobs use EncryptedEmailJobKind so an old worker that
-// has not yet been upgraded leaves them queued (unknown kind retry) instead of
-// misreading the envelope as an empty message.
-const (
-	EmailJobKind          = "email.send"
-	EncryptedEmailJobKind = "email.send.encrypted"
-)
+// EncryptedEmailJobKind is the only email job kind: its payload is a
+// kid-bearing sealed envelope, so a queued message never holds plaintext PII
+// or links.
+const EncryptedEmailJobKind = "email.send.encrypted"
 
-// ErrEmailNoRecipients is returned when a queued email has no recipients. The
-// guard prevents a malformed or undecodable payload from being sent as an empty
-// message.
-var ErrEmailNoRecipients = errors.New("jobs: email has no recipients")
+var (
+	// ErrEmailNoRecipients is returned when a queued email has no recipients.
+	// The guard prevents a malformed payload from being sent as an empty
+	// message.
+	ErrEmailNoRecipients = errors.New("jobs: email has no recipients")
+	// ErrPayloadCodecRequired is returned when an email job is built or opened
+	// without a payload codec.
+	ErrPayloadCodecRequired = errors.New("jobs: email jobs require a payload codec")
+)
 
 // QueuedSender enqueues emails instead of sending them inline. A Worker
-// registered for EmailJobKind performs the actual SMTP/console send with
-// retries and dead-letter handling.
+// registered for EncryptedEmailJobKind performs the actual SMTP/console send
+// with retries and dead-letter handling.
 type QueuedSender struct {
 	queue *Queue
 	codec *PayloadCodec
 }
 
-// QueuedSenderOption configures a QueuedSender.
-type QueuedSenderOption func(*QueuedSender)
-
-// WithPayloadCodec encrypts email job payloads at rest. Without a codec the
-// payload is stored as plaintext JSON, preserving the previous behavior.
-func WithPayloadCodec(c *PayloadCodec) QueuedSenderOption {
-	return func(s *QueuedSender) {
-		s.codec = c
-	}
-}
-
-func NewQueuedSender(queue *Queue, opts ...QueuedSenderOption) *QueuedSender {
-	sender := &QueuedSender{queue: queue}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(sender)
-		}
-	}
-	return sender
+// NewQueuedSender builds a sender that seals every message with codec. A nil
+// codec is rejected when a message is enqueued.
+func NewQueuedSender(queue *Queue, codec *PayloadCodec) *QueuedSender {
+	return &QueuedSender{queue: queue, codec: codec}
 }
 
 func (s *QueuedSender) Send(ctx context.Context, msg email.Message) error {
@@ -87,73 +73,44 @@ func (s *QueuedSender) SendTx(ctx context.Context, tx pgx.Tx, msg email.Message)
 	return nil
 }
 
-// emailJob marshals one email message into the job payload and seals it when a
-// codec is configured. Queue.Enqueue and Queue.EnqueueTx apply the defaults and
-// validate the job so both paths stay identical.
+// emailJob marshals one email message into the job payload and seals it. Queue
+// applies the defaults and validates the job.
 func emailJob(msg email.Message, codec *PayloadCodec) (Job, error) {
+	if codec == nil {
+		return Job{}, ErrPayloadCodecRequired
+	}
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return Job{}, fmt.Errorf("jobs: encode email: %w", err)
 	}
-	kind := EmailJobKind
-	if codec != nil {
-		payload, err = codec.Seal(payload)
-		if err != nil {
-			return Job{}, fmt.Errorf("jobs: encrypt email payload: %w", err)
-		}
-		// A distinct kind makes rolling deploys safe: old workers retry an
-		// unknown kind instead of misreading the envelope as an empty email.
-		kind = EncryptedEmailJobKind
+	sealed, err := codec.Seal(payload)
+	if err != nil {
+		return Job{}, fmt.Errorf("jobs: encrypt email payload: %w", err)
 	}
 	return Job{
-		Kind:        kind,
-		Payload:     payload,
+		Kind:        EncryptedEmailJobKind,
+		Payload:     sealed,
 		MaxAttempts: 10,
 	}, nil
 }
 
-// emailHandlerConfig holds the optional EmailHandler settings.
-type emailHandlerConfig struct {
-	codec *PayloadCodec
-}
-
-// EmailHandlerOption configures an EmailHandler.
-type EmailHandlerOption func(*emailHandlerConfig)
-
-// WithEmailPayloadCodec opens encrypted email payloads before decoding them.
-// Plaintext payloads from before encryption was enabled still decode.
-func WithEmailPayloadCodec(c *PayloadCodec) EmailHandlerOption {
-	return func(cfg *emailHandlerConfig) {
-		cfg.codec = c
-	}
-}
-
-// EmailHandler adapts a concrete email.Sender to a jobs.Handler.
-func EmailHandler(sender email.Sender, opts ...EmailHandlerOption) Handler {
-	cfg := emailHandlerConfig{}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&cfg)
-		}
-	}
-
+// EmailHandler adapts a concrete email.Sender to a jobs.Handler. The codec is
+// required: every email job carries a sealed envelope.
+func EmailHandler(sender email.Sender, codec *PayloadCodec) Handler {
 	// A malformed envelope, undecodable JSON, or a message without recipients
 	// is a property of the job and can never succeed, so it dead-letters
 	// immediately. Decryption failures stay retryable: a worker may be missing
 	// a key another replica already seals with until the rollout completes.
 	return func(ctx context.Context, payload json.RawMessage) error {
-		decoded := []byte(payload)
-		if cfg.codec != nil {
-			var err error
-			decoded, err = cfg.codec.Open(payload)
-			if errors.Is(err, ErrInvalidPayloadEnvelope) {
-				return Permanent(fmt.Errorf("jobs: open email payload: %w", err))
-			}
-			if err != nil {
-				return fmt.Errorf("jobs: open email payload: %w", err)
-			}
-		} else if payloadLooksEncrypted(payload) {
-			return ErrEncryptedPayloadWithoutCodec
+		if codec == nil {
+			return Permanent(ErrPayloadCodecRequired)
+		}
+		decoded, err := codec.Open(payload)
+		if errors.Is(err, ErrInvalidPayloadEnvelope) {
+			return Permanent(fmt.Errorf("jobs: open email payload: %w", err))
+		}
+		if err != nil {
+			return fmt.Errorf("jobs: open email payload: %w", err)
 		}
 
 		var msg email.Message

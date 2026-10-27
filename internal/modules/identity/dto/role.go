@@ -1,6 +1,12 @@
 package dto
 
-import "time"
+import (
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/patch"
+)
 
 const (
 	RoleMember = "member"
@@ -10,10 +16,10 @@ const (
 
 // RoleResponse is a system or tenant role definition.
 type RoleResponse struct {
-	ID          int64     `json:"id"`
+	ID          uuid.UUID `json:"id"`
 	Key         string    `json:"key"`
 	Name        string    `json:"name"`
-	Scope       string    `json:"scope" enums:"tenant,platform"`
+	Scope       string    `json:"scope" enum:"tenant,platform"`
 	System      bool      `json:"system"`
 	Permissions []string  `json:"permissions"`
 	CreatedAt   time.Time `json:"createdAt"`
@@ -22,18 +28,36 @@ type RoleResponse struct {
 
 // CreateRoleRequest creates a tenant role.
 type CreateRoleRequest struct {
-	Key         string   `json:"key" validate:"required,min=2,max=50"`
-	Name        string   `json:"name" validate:"required,min=1,max=255,notblank"`
+	Key         string   `json:"key" required:"true" minLength:"2" maxLength:"50"`
+	Name        string   `json:"name" required:"true" minLength:"1" maxLength:"255"`
 	Permissions []string `json:"permissions"`
 }
 
-// UpdateRoleDefinitionRequest changes a tenant role's name and permissions.
-type UpdateRoleDefinitionRequest struct {
-	Name        *string   `json:"name" validate:"omitempty,min=1,max=255,notblank"`
-	Permissions *[]string `json:"permissions"`
+// RolePatch is the RFC 7396 merge patch for a tenant role.
+type RolePatch struct {
+	Name        patch.Field[string]   `json:"name,omitempty"`
+	Permissions patch.Field[[]string] `json:"permissions,omitempty"`
+}
+
+// InviteRequest invites an address into the request tenant.
+type InviteRequest struct {
+	Email   string      `json:"email" required:"true" format:"email" maxLength:"255"`
+	RoleIDs []uuid.UUID `json:"roleIds,omitempty"`
 }
 
 // ReplaceMemberRolesRequest replaces every role of one membership.
 type ReplaceMemberRolesRequest struct {
-	Roles []string `json:"roles" validate:"required,max=20,dive,required,max=50"`
+	RoleIDs []uuid.UUID `json:"roleIds" required:"true" minItems:"1" maxItems:"20"`
+}
+
+// MemberPatch is the RFC 7396 merge patch for a member's roles and status.
+type MemberPatch struct {
+	RoleIDs patch.Field[[]uuid.UUID] `json:"roleIds,omitempty"`
+	Status  patch.Field[string]      `json:"status,omitempty"`
+}
+
+// TenantPatch is the RFC 7396 merge patch for a platform tenant.
+type TenantPatch struct {
+	Name   patch.Field[string] `json:"name,omitempty"`
+	Status patch.Field[string] `json:"status,omitempty"`
 }

@@ -12,8 +12,9 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 )
 
 const (
@@ -174,7 +175,7 @@ func TestIdempotencyStressSingleExecution(t *testing.T) {
 	}
 
 	lockKey := idempotencyLockKey(idempotencyScope(
-		http.MethodPost, idempotencyStressPath, 0, "", "0.0.0.0", key))
+		http.MethodPost, idempotencyStressPath, uuid.Nil, "", "0.0.0.0", key))
 	exists, err := mem.Exists(context.Background(), lockKey)
 	if err != nil {
 		t.Fatalf("check lock: %v", err)

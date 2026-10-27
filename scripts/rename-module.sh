@@ -79,11 +79,8 @@ if ! go mod tidy; then
   echo "WARNING: 'go mod tidy' failed; fix the error above and run it manually." >&2
 fi
 
-if command -v swag >/dev/null 2>&1; then
-  echo "Regenerating Swagger docs..."
-  swag init -g cmd/api/main.go -o docs
-else
-  echo "swag not found; run 'make swagger' to regenerate the Swagger docs."
+if ! go run ./cmd/openapi; then
+  echo "WARNING: OpenAPI generation failed; run 'make openapi' after fixing the error." >&2
 fi
 
 echo ""

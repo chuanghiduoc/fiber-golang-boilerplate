@@ -7,17 +7,19 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const deleteTenantFilesForPurge = `-- name: DeleteTenantFilesForPurge :execrows
 DELETE FROM files
-WHERE tenant_id = $1::bigint
-  AND id = ANY($2::bigint[])
+WHERE tenant_id = $1::uuid
+  AND id = ANY($2::uuid[])
 `
 
 type DeleteTenantFilesForPurgeParams struct {
-	TenantID int64   `json:"tenant_id"`
-	Ids      []int64 `json:"ids"`
+	TenantID uuid.UUID   `json:"tenant_id"`
+	Ids      []uuid.UUID `json:"ids"`
 }
 
 func (q *Queries) DeleteTenantFilesForPurge(ctx context.Context, arg DeleteTenantFilesForPurgeParams) (int64, error) {
@@ -31,18 +33,18 @@ func (q *Queries) DeleteTenantFilesForPurge(ctx context.Context, arg DeleteTenan
 const listTenantFilesForPurge = `-- name: ListTenantFilesForPurge :many
 
 SELECT id, storage_path FROM files
-WHERE tenant_id = $1::bigint
+WHERE tenant_id = $1::uuid
 LIMIT $2::int
 `
 
 type ListTenantFilesForPurgeParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 type ListTenantFilesForPurgeRow struct {
-	ID          int64  `json:"id"`
-	StoragePath string `json:"storage_path"`
+	ID          uuid.UUID `json:"id"`
+	StoragePath string    `json:"storage_path"`
 }
 
 // Tenant purge. The caller deletes each batch's blobs first and then the rows;

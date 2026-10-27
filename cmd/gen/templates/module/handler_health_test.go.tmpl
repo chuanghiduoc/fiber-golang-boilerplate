@@ -3,8 +3,6 @@ package handler
 import (
 	"context"
 	"errors"
-	"net/http"
-	"strings"
 	"testing"
 )
 
@@ -13,16 +11,16 @@ type fakeHealthUseCase struct{ err error }
 func (f fakeHealthUseCase) Check(context.Context) error { return f.err }
 
 func TestHealthHandler(t *testing.T) {
-	app := newTestApp()
-	app.Get("/health", NewHealthHandler(fakeHealthUseCase{}).Health)
-	status, body := do(t, app, http.MethodGet, "/health", "")
-	if status != http.StatusOK || !strings.Contains(body, `"status":"ok"`) {
-		t.Fatalf("GET /health = %d %s, want 200 ok", status, body)
+	out, err := NewHealthHandler(fakeHealthUseCase{}).Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health = %v, want nil", err)
+	}
+	if out.Body.Status != "ok" || out.Body.Module != "{{.M.Name}}" {
+		t.Fatalf("Health = %#v, want ok for {{.M.Name}}", out.Body)
 	}
 
-	failing := newTestApp()
-	failing.Get("/health", NewHealthHandler(fakeHealthUseCase{err: errors.New("down")}).Health)
-	if status, body := do(t, failing, http.MethodGet, "/health", ""); status != http.StatusInternalServerError {
-		t.Fatalf("GET /health with a failing check = %d %s, want 500", status, body)
+	down := errors.New("down")
+	if _, err := NewHealthHandler(fakeHealthUseCase{err: down}).Health(context.Background()); !errors.Is(err, down) {
+		t.Fatalf("Health with a failing check = %v, want the wrapped error", err)
 	}
 }
