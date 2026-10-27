@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/url"
 	"path/filepath"
-	"strconv"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -152,25 +151,4 @@ func RunMigrations(dsn, migrationsPath string) error {
 	}
 
 	return nil
-}
-
-func HealthCheck(ctx context.Context, pool *pgxpool.Pool) map[string]string {
-	stats := make(map[string]string)
-
-	if err := pool.Ping(ctx); err != nil {
-		stats["status"] = "down"
-		stats["error"] = fmt.Sprintf("db down: %v", err)
-		return stats
-	}
-
-	stats["status"] = "up"
-	stats["message"] = "It's healthy"
-
-	poolStats := pool.Stat()
-	stats["total_connections"] = strconv.FormatInt(int64(poolStats.TotalConns()), 10)
-	stats["acquired_connections"] = strconv.FormatInt(int64(poolStats.AcquiredConns()), 10)
-	stats["idle_connections"] = strconv.FormatInt(int64(poolStats.IdleConns()), 10)
-	stats["max_connections"] = strconv.FormatInt(int64(poolStats.MaxConns()), 10)
-
-	return stats
 }

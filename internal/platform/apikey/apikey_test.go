@@ -141,7 +141,7 @@ func TestVerifier_RejectsBadChecksumBeforeLookup(t *testing.T) {
 	}
 
 	store := &fakeStore{key: key}
-	verifier := NewVerifier(store, nil)
+	verifier := NewVerifier(store, unreachablePrincipals{t: t})
 	_, err := verifier.Verify(context.Background(), corrupted, uuid.Nil)
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || resolvedStatus(appErr) != http.StatusUnauthorized {
@@ -172,7 +172,7 @@ func TestParsePrefix_RejectsLegacyFormat(t *testing.T) {
 	}
 
 	store := &fakeStore{}
-	verifier := NewVerifier(store, nil)
+	verifier := NewVerifier(store, unreachablePrincipals{t: t})
 	_, err := verifier.Verify(context.Background(), legacy, uuid.Nil)
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || resolvedStatus(appErr) != http.StatusUnauthorized {
@@ -377,14 +377,16 @@ func TestVerifier_RejectsUnknownMalformedAndInactiveOwner(t *testing.T) {
 		principals identitycontracts.PrincipalReader
 	}{
 		{
-			name:  "unknown hash",
-			raw:   credentials.Key,
-			store: &fakeStore{key: key, findErr: apperror.ErrNotFound},
+			name:       "unknown hash",
+			raw:        credentials.Key,
+			store:      &fakeStore{key: key, findErr: apperror.ErrNotFound},
+			principals: unreachablePrincipals{t: t},
 		},
 		{
-			name:  "malformed",
-			raw:   "fgb_short",
-			store: &fakeStore{key: key},
+			name:       "malformed",
+			raw:        "fgb_short",
+			store:      &fakeStore{key: key},
+			principals: unreachablePrincipals{t: t},
 		},
 		{
 			name:       "owner missing",
@@ -434,4 +436,14 @@ func TestVerifier_RejectsSuspendedTenant(t *testing.T) {
 // testID returns a deterministic UUID for a small fixture number.
 func testID(n int) uuid.UUID {
 	return uuid.MustParse(fmt.Sprintf("0192c9b0-7e4a-7000-8000-%012d", n))
+}
+
+// unreachablePrincipals fails the test when consulted: the format checks above
+// must reject a key before any owner lookup.
+type unreachablePrincipals struct{ t *testing.T }
+
+func (p unreachablePrincipals) GetPrincipal(context.Context, uuid.UUID, uuid.UUID) (identitycontracts.Principal, error) {
+	p.t.Helper()
+	p.t.Fatal("the principal reader must not be reached for a malformed key")
+	return identitycontracts.Principal{}, nil
 }

@@ -19,7 +19,6 @@ func TestPublicValuesAreStable(t *testing.T) {
 		string(CodeAuthRefreshInvalid):          "auth.refresh_invalid",
 		string(CodeAuthCSRFFailed):              "auth.csrf_failed",
 		string(CodeUserEmailTaken):              "user.email_taken",
-		string(CodeUserNotFound):                "user.not_found",
 		string(CodeUserLastAdmin):               "user.last_admin",
 		string(CodeInvitationInvalid):           "invitation.invalid",
 		string(CodeInvitationInviterIneligible): "invitation.inviter_ineligible",
@@ -41,7 +40,7 @@ func TestPublicValuesAreStable(t *testing.T) {
 
 func TestCatalogProvidersBuildInjectedCatalogs(t *testing.T) {
 	errors := testErrors()
-	if _, ok := errors.SpecFor(CodeUserNotFound); !ok {
+	if _, ok := errors.SpecFor(CodeUserEmailTaken); !ok {
 		t.Error("error codes not provided")
 	}
 	permissions := testPermissions()

@@ -48,14 +48,6 @@ type ETagOutput[T any] struct {
 	Body T
 }
 
-// LocationETagOutput is a created/updated resource that also carries Location
-// and ETag (useful for 201 responses of config resources).
-type LocationETagOutput[T any] struct {
-	Location string `header:"Location" doc:"URI of the resource."`
-	ETag     string `header:"ETag" doc:"Opaque version for If-Match."`
-	Body     T
-}
-
 // HTTPStatus lets Register document the response status of the helper type.
 func (*Created[T]) HTTPStatus() int { return 201 }
 
@@ -64,6 +56,3 @@ func (*Accepted[T]) HTTPStatus() int { return 202 }
 
 // HTTPStatus lets Register document the response status of the helper type.
 func (*Empty) HTTPStatus() int { return 204 }
-
-// HTTPStatus lets Register document the response status of the helper type.
-func (*LocationETagOutput[T]) HTTPStatus() int { return 200 }

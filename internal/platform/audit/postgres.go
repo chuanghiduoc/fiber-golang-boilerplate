@@ -2,7 +2,6 @@ package audit
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -312,10 +311,4 @@ func nullableTime(value time.Time) *time.Time {
 		return nil
 	}
 	return &value
-}
-
-// IsAlreadyCompleted reports whether err means the intent row was not in a
-// completable state.
-func IsAlreadyCompleted(err error) bool {
-	return errors.Is(err, ErrAlreadyCompleted)
 }

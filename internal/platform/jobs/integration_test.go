@@ -7,14 +7,11 @@ import (
 	"encoding/json"
 
 	"errors"
-	"github.com/google/uuid"
-	"os"
-	"path/filepath"
-	"runtime"
-	"sort"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1060,30 +1057,6 @@ func setupIntegrationDB(t *testing.T) *pgtest.Fixture {
 type integrationMigration struct {
 	name string
 	sql  string
-}
-
-// integrationSchema returns every up migration in version order, which is
-// what golang-migrate applies to a fresh database (one file at a time).
-func integrationSchema(t *testing.T) ([]integrationMigration, error) {
-	t.Helper()
-
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok, "resolve test file path")
-	paths, err := filepath.Glob(filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "*.up.sql"))
-	if err != nil {
-		return nil, err
-	}
-	require.NotEmpty(t, paths, "no up migrations found")
-	sort.Strings(paths)
-	migrations := make([]integrationMigration, 0, len(paths))
-	for _, path := range paths {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
-		migrations = append(migrations, integrationMigration{name: filepath.Base(path), sql: string(raw)})
-	}
-	return migrations, nil
 }
 
 // TestWorkerIntegrationMixedLeasesDoNotStealHealthyJob runs a long-lease worker

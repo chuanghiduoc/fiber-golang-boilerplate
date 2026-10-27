@@ -12,18 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const adminCountFiles = `-- name: AdminCountFiles :one
-SELECT count(*) FROM files
-WHERE tenant_id = $1
-`
-
-func (q *Queries) AdminCountFiles(ctx context.Context, tenantID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, adminCountFiles, tenantID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
 const adminFileStats = `-- name: AdminFileStats :one
 SELECT
     count(*) FILTER (WHERE deleted_at IS NULL)::bigint AS total_files,
@@ -42,53 +30,6 @@ func (q *Queries) AdminFileStats(ctx context.Context, tenantID uuid.UUID) (Admin
 	var i AdminFileStatsRow
 	err := row.Scan(&i.TotalFiles, &i.TotalFileSize)
 	return i, err
-}
-
-const adminListFiles = `-- name: AdminListFiles :many
-SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at, purge_attempts, purge_retry_after FROM files
-WHERE tenant_id = $1
-ORDER BY id DESC
-LIMIT $2 OFFSET $3
-`
-
-type AdminListFilesParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	Limit    int32     `json:"limit"`
-	Offset   int32     `json:"offset"`
-}
-
-func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) ([]File, error) {
-	rows, err := q.db.Query(ctx, adminListFiles, arg.TenantID, arg.Limit, arg.Offset)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []File{}
-	for rows.Next() {
-		var i File
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.UserID,
-			&i.OriginalName,
-			&i.StoragePath,
-			&i.MimeType,
-			&i.Size,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
-			&i.PurgeStartedAt,
-			&i.PurgeAttempts,
-			&i.PurgeRetryAfter,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }
 
 const adminListFilesCursor = `-- name: AdminListFilesCursor :many
@@ -143,23 +84,6 @@ func (q *Queries) AdminListFilesCursor(ctx context.Context, arg AdminListFilesCu
 		return nil, err
 	}
 	return items, nil
-}
-
-const countFilesByUserID = `-- name: CountFilesByUserID :one
-SELECT count(*) FROM files
-WHERE tenant_id = $1 AND user_id = $2 AND deleted_at IS NULL
-`
-
-type CountFilesByUserIDParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	UserID   uuid.UUID `json:"user_id"`
-}
-
-func (q *Queries) CountFilesByUserID(ctx context.Context, arg CountFilesByUserIDParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countFilesByUserID, arg.TenantID, arg.UserID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
 }
 
 const createFile = `-- name: CreateFile :one
@@ -385,59 +309,6 @@ func (q *Queries) ListFilesByUserCursor(ctx context.Context, arg ListFilesByUser
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []File{}
-	for rows.Next() {
-		var i File
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.UserID,
-			&i.OriginalName,
-			&i.StoragePath,
-			&i.MimeType,
-			&i.Size,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
-			&i.PurgeStartedAt,
-			&i.PurgeAttempts,
-			&i.PurgeRetryAfter,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listFilesByUserID = `-- name: ListFilesByUserID :many
-SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at, purge_attempts, purge_retry_after FROM files
-WHERE tenant_id = $1 AND user_id = $2 AND deleted_at IS NULL
-ORDER BY id DESC
-LIMIT $3 OFFSET $4
-`
-
-type ListFilesByUserIDParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	UserID   uuid.UUID `json:"user_id"`
-	Limit    int32     `json:"limit"`
-	Offset   int32     `json:"offset"`
-}
-
-func (q *Queries) ListFilesByUserID(ctx context.Context, arg ListFilesByUserIDParams) ([]File, error) {
-	rows, err := q.db.Query(ctx, listFilesByUserID,
-		arg.TenantID,
-		arg.UserID,
-		arg.Limit,
-		arg.Offset,
 	)
 	if err != nil {
 		return nil, err

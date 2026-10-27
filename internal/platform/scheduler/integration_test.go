@@ -5,10 +5,6 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
-	"runtime"
-	"slices"
 	"testing"
 	"time"
 
@@ -275,28 +271,4 @@ func setupSchedulerIntegrationDB(t *testing.T) *pgtest.Fixture {
 type integrationMigration struct {
 	name string
 	sql  string
-}
-
-// integrationSchema returns every up migration in version order, which is
-// what golang-migrate applies to a fresh database (one file at a time).
-func integrationSchema(t *testing.T) ([]integrationMigration, error) {
-	t.Helper()
-
-	_, filename, _, ok := runtime.Caller(0)
-	require.True(t, ok, "resolve test file path")
-	paths, err := filepath.Glob(filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "*.up.sql"))
-	if err != nil {
-		return nil, err
-	}
-	require.NotEmpty(t, paths, "no up migrations found")
-	slices.Sort(paths)
-	migrations := make([]integrationMigration, 0, len(paths))
-	for _, path := range paths {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
-		migrations = append(migrations, integrationMigration{name: filepath.Base(path), sql: string(raw)})
-	}
-	return migrations, nil
 }

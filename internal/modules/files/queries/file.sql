@@ -11,16 +11,6 @@ WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL;
 SELECT * FROM files
 WHERE id = $1 AND tenant_id = $2;
 
--- name: ListFilesByUserID :many
-SELECT * FROM files
-WHERE tenant_id = $1 AND user_id = $2 AND deleted_at IS NULL
-ORDER BY id DESC
-LIMIT $3 OFFSET $4;
-
--- name: CountFilesByUserID :one
-SELECT count(*) FROM files
-WHERE tenant_id = $1 AND user_id = $2 AND deleted_at IS NULL;
-
 -- name: DeleteFile :one
 UPDATE files SET deleted_at = NOW()
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
@@ -31,16 +21,6 @@ UPDATE files SET deleted_at = NULL
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL
   AND purge_started_at IS NULL
 RETURNING *;
-
--- name: AdminListFiles :many
-SELECT * FROM files
-WHERE tenant_id = $1
-ORDER BY id DESC
-LIMIT $2 OFFSET $3;
-
--- name: AdminCountFiles :one
-SELECT count(*) FROM files
-WHERE tenant_id = $1;
 
 -- name: AdminFileStats :one
 SELECT

@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -56,7 +57,7 @@ func TestAuthenticateLimitsPerIPBeforeVerifying(t *testing.T) {
 		},
 		Tenant: config.TenantConfig{DefaultSlug: "default"},
 	}
-	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}, APIKeyVerifier: apikey.NewVerifier(store, nil)})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}, APIKeyVerifier: apikey.NewVerifier(store, noPrincipals{})})
 	application.Register(protectedModule{})
 
 	creds, err := apikey.Generate()
@@ -81,4 +82,12 @@ func TestAuthenticateLimitsPerIPBeforeVerifying(t *testing.T) {
 	}
 	assert.Equal(t, int32(authMax), store.lookups.Load(),
 		"throttled requests must be rejected before the API-key store is queried")
+}
+
+// noPrincipals knows no API-key owner; the unknown keys in this test never get
+// that far.
+type noPrincipals struct{}
+
+func (noPrincipals) GetPrincipal(context.Context, uuid.UUID, uuid.UUID) (identitycontracts.Principal, error) {
+	return identitycontracts.Principal{}, apperror.ErrNotFound
 }

@@ -10,7 +10,7 @@ import (
 
 // frameworkImports are the HTTP-framework packages business and core code
 // must not reach. Fiber adapters live in *http subpackages (apperrorhttp,
-// authzhttp, tenanthttp, audithttp, apikeyhttp, featureshttp) and handlers.
+// authzhttp, tenanthttp, audithttp, apikeyhttp) and handlers.
 var frameworkImports = []string{"github.com/gofiber/", "github.com/valyala/fasthttp"}
 
 // TestCoreAndServicesAreFrameworkFree walks the repository-local import graph

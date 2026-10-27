@@ -61,8 +61,9 @@ lets clients distinguish it from a mistyped URL. `403` was rejected because it
 implies a permission problem the caller could fix by changing role.
 
 Platform helpers: `features.Require(ctx, evaluator, key, subject)` returns the
-typed error, and `featureshttp.Middleware(evaluator, key)` gates a route using the
-request tenant and `user_id` local. A nil evaluator uses compiled defaults
+typed error, and an operation's `httpapi.Policy.Feature` gates it (after
+authorization, before idempotency and the audit Guard) for the request tenant
+and authenticated user. A nil evaluator uses compiled defaults
 only, so an unwired gate fails closed for default-off flags.
 
 Using a flag to change a route is a product decision made by the owning
