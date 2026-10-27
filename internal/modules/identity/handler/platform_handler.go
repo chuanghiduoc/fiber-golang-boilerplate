@@ -7,17 +7,27 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
-// PlatformHandler serves the cross-tenant tenant-administration surface.
-type PlatformHandler struct {
-	tenants *service.TenantService
+// TenantAdmin is the tenant-administration surface the platform handler uses.
+// *tenancy.TenantService implements it.
+type TenantAdmin interface {
+	List(ctx context.Context, limit int, startingAfter string) ([]core.Tenant, bool, error)
+	Get(ctx context.Context, id uuid.UUID) (*core.Tenant, error)
+	Create(ctx context.Context, in core.NewTenant) (*core.Tenant, error)
+	Update(ctx context.Context, id uuid.UUID, update core.TenantUpdate) (*core.Tenant, error)
+	GetOperational(ctx context.Context, id uuid.UUID) (*core.Tenant, error)
 }
 
-func NewPlatformHandler(tenants *service.TenantService) *PlatformHandler {
+// PlatformHandler serves the cross-tenant tenant-administration surface.
+type PlatformHandler struct {
+	tenants TenantAdmin
+}
+
+func NewPlatformHandler(tenants TenantAdmin) *PlatformHandler {
 	return &PlatformHandler{tenants: tenants}
 }
 
@@ -58,11 +68,11 @@ func (h *PlatformHandler) ListTenants(ctx context.Context, input *listTenantsInp
 
 // CreateTenant creates a tenant and makes the caller its first owner.
 func (h *PlatformHandler) CreateTenant(ctx context.Context, input *createTenantInput) (*httpapi.Created[dto.TenantResponse], error) {
-	status := service.TenantStatus(input.Body.Status)
+	status := core.TenantStatus(input.Body.Status)
 	if status == "" {
-		status = service.TenantStatusActive
+		status = core.TenantStatusActive
 	}
-	created, err := h.tenants.Create(ctx, service.NewTenant{
+	created, err := h.tenants.Create(ctx, core.NewTenant{
 		Slug:        input.Body.Slug,
 		Name:        input.Body.Name,
 		Status:      status,
@@ -107,7 +117,7 @@ func (h *PlatformHandler) UpdateTenant(ctx context.Context, input *updateTenantI
 	if err := decodeMergePatch(input.RawBody, &req); err != nil {
 		return nil, err
 	}
-	update := service.TenantUpdate{}
+	update := core.TenantUpdate{}
 	if input.IfMatch != "" {
 		expected := found.UpdatedAt
 		update.ExpectedUpdatedAt = &expected
@@ -123,7 +133,7 @@ func (h *PlatformHandler) UpdateTenant(ctx context.Context, input *updateTenantI
 		if req.Status.Null {
 			return nil, unprocessable("status cannot be cleared")
 		}
-		value := service.TenantStatus(req.Status.Value)
+		value := core.TenantStatus(req.Status.Value)
 		update.Status = &value
 	}
 	updated, err := h.tenants.Update(ctx, id, update)
@@ -133,7 +143,7 @@ func (h *PlatformHandler) UpdateTenant(ctx context.Context, input *updateTenantI
 	return &httpapi.ETagOutput[dto.TenantResponse]{ETag: etagHeader(updated.UpdatedAt), Body: toTenantResponse(updated)}, nil
 }
 
-func toTenantResponse(t *service.Tenant) dto.TenantResponse {
+func toTenantResponse(t *core.Tenant) dto.TenantResponse {
 	return dto.TenantResponse{
 		ID:                  t.ID,
 		Slug:                t.Slug,

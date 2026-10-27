@@ -1,15 +1,19 @@
 package handler
 
 import (
+	"time"
+
 	"context"
 	"encoding/json"
+	"github.com/go-webauthn/webauthn/protocol"
 	"strings"
 
 	"github.com/google/uuid"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/mfa"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
@@ -46,12 +50,29 @@ type StepUpPasskeyInput struct {
 	Body dto.MFAStepUpRequest
 }
 
+// PasskeyManager is the passkey surface the passkey handlers use.
+// *mfa.PasskeyService implements it.
+type PasskeyManager interface {
+	BeginRegistration(ctx context.Context, userID uuid.UUID) (*protocol.CredentialCreation, error)
+	FinishRegistration(ctx context.Context, userID uuid.UUID, name string, raw []byte) (*core.Passkey, error)
+	Delete(ctx context.Context, userID, passkeyID uuid.UUID) error
+	BeginLogin(ctx context.Context, email string) (*protocol.CredentialAssertion, error)
+	FinishLogin(ctx context.Context, raw []byte, admit mfa.Admission) (*mfa.PasskeyLogin, error)
+	StepUpPasskey(ctx context.Context, userID, sessionID uuid.UUID, raw []byte) (time.Time, error)
+}
+
+// StepUp is the second-factor step-up surface.
+// *mfa.MFAService implements it.
+type StepUp interface {
+	StepUp(ctx context.Context, userID, sessionID uuid.UUID, code string) (time.Time, error)
+}
+
 // PasskeyHandler serves passkey management, passkey login, and the passkey
 // variant of the MFA step-up. Its operations are huma handlers like the rest of
 // identity.
 type PasskeyHandler struct {
-	passkeys      service.PasskeyService
-	stepUp        service.MFAStepUpService
+	passkeys      PasskeyManager
+	stepUp        StepUp
 	auth          *AuthHandler
 	refreshCookie RefreshCookieConfig
 }
@@ -59,7 +80,7 @@ type PasskeyHandler struct {
 // NewPasskeyHandler wires the passkey operations. auth supplies the session
 // issuer and the email-verification admission rule used by the other sign-in
 // flows; it may be nil in focused tests.
-func NewPasskeyHandler(passkeys service.PasskeyService, stepUp service.MFAStepUpService, auth *AuthHandler) *PasskeyHandler {
+func NewPasskeyHandler(passkeys PasskeyManager, stepUp StepUp, auth *AuthHandler) *PasskeyHandler {
 	return &PasskeyHandler{passkeys: passkeys, stepUp: stepUp, auth: auth}
 }
 
@@ -219,7 +240,7 @@ func (h *PasskeyHandler) StepUp(ctx context.Context, input *StepUpPasskeyInput) 
 // admit applies the same email-verification rule as password and Google
 // sign-in. It runs before the session is issued, so an unverified account
 // cannot obtain tokens through a passkey.
-func (h *PasskeyHandler) admit(ctx context.Context, member *service.Member) error {
+func (h *PasskeyHandler) admit(ctx context.Context, member *core.Member) error {
 	if h.auth == nil {
 		return nil
 	}
@@ -246,7 +267,7 @@ func passkeysNotConfigured() error {
 	return apperror.NewCode(apperror.CodeSystemUnavailable, "passkeys are not configured")
 }
 
-func toPasskeyResponse(passkey *service.Passkey) dto.PasskeyResponse {
+func toPasskeyResponse(passkey *core.Passkey) dto.PasskeyResponse {
 	transports := passkey.Transports
 	if transports == nil {
 		transports = []string{}

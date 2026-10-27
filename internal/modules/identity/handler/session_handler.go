@@ -7,7 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -39,7 +39,7 @@ type sessionInput struct {
 	Authorization string `header:"Authorization"`
 }
 
-func toSessionResponse(s *service.Session, currentID uuid.UUID) dto.SessionResponse {
+func toSessionResponse(s *core.Session, currentID uuid.UUID) dto.SessionResponse {
 	return dto.SessionResponse{
 		ID:         s.ID,
 		UserAgent:  s.UserAgent,

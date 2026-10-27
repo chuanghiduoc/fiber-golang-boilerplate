@@ -7,26 +7,27 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 // InvitationService is the invitation surface the handlers use.
-// *service.InvitationService implements it.
+// *membership.InvitationService implements it.
 type InvitationService interface {
-	Invite(ctx context.Context, in service.InviteInput) (*service.Invitation, error)
-	List(ctx context.Context, limit int, startingAfter string) ([]service.Invitation, bool, error)
-	Get(ctx context.Context, id uuid.UUID) (*service.Invitation, error)
+	Invite(ctx context.Context, in membership.InviteInput) (*core.Invitation, error)
+	List(ctx context.Context, limit int, startingAfter string) ([]core.Invitation, bool, error)
+	Get(ctx context.Context, id uuid.UUID) (*core.Invitation, error)
 	Revoke(ctx context.Context, id uuid.UUID) error
-	Accept(ctx context.Context, userID uuid.UUID, token string) (*service.Member, error)
-	SignUp(ctx context.Context, in service.InvitationSignUp) (*service.Member, error)
+	Accept(ctx context.Context, userID uuid.UUID, token string) (*core.Member, error)
+	SignUp(ctx context.Context, in membership.InvitationSignUp) (*core.Member, error)
 }
 
 // RoleLookup resolves a role id to its definition for invitation creation.
 type RoleLookup interface {
-	Get(ctx context.Context, id uuid.UUID) (*service.Role, error)
+	Get(ctx context.Context, id uuid.UUID) (*core.Role, error)
 }
 
 // InvitationHandler serves tenant invitations.
@@ -43,7 +44,7 @@ func NewInvitationHandler(invitations InvitationService, roles ...RoleLookup) *I
 	return h
 }
 
-func toInvitationResponse(inv *service.Invitation) dto.InvitationResponse {
+func toInvitationResponse(inv *core.Invitation) dto.InvitationResponse {
 	return dto.InvitationResponse{
 		ID:         inv.ID,
 		TenantID:   inv.TenantID,
@@ -71,7 +72,7 @@ type invitationInput struct {
 
 // Create invites an address into the request tenant.
 func (h *InvitationHandler) Create(ctx context.Context, input *createInvitationInput) (*httpapi.Created[dto.InvitationResponse], error) {
-	role := service.RoleMember
+	role := core.RoleMember
 	if len(input.Body.RoleIDs) > 0 {
 		if len(input.Body.RoleIDs) > 1 {
 			return nil, unprocessable("an invitation grants exactly one role")
@@ -85,7 +86,7 @@ func (h *InvitationHandler) Create(ctx context.Context, input *createInvitationI
 		}
 		role = found.Key
 	}
-	inv, err := h.invitations.Invite(ctx, service.InviteInput{
+	inv, err := h.invitations.Invite(ctx, membership.InviteInput{
 		InviterID: actorID(ctx),
 		Email:     input.Body.Email,
 		Role:      role,
@@ -148,7 +149,7 @@ func (h *InvitationHandler) Accept(ctx context.Context, input *acceptInvitationI
 
 // SignUp creates an account from an invitation.
 func (h *InvitationHandler) SignUp(ctx context.Context, input *signupInvitationInput) (*httpapi.Created[dto.UserResponse], error) {
-	member, err := h.invitations.SignUp(ctx, service.InvitationSignUp{
+	member, err := h.invitations.SignUp(ctx, membership.InvitationSignUp{
 		Token:    input.Body.Token,
 		Name:     input.Body.Name,
 		Password: input.Body.Password,

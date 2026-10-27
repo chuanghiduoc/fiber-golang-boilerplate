@@ -253,26 +253,3 @@ func insufficientRank(detail string) error {
 func permissionDenied() error {
 	return apperror.NewCode(apperror.CodePermissionDenied, "insufficient permissions")
 }
-
-// Exported rank helpers for tests and other identity subpackages.
-const (
-	RoleRankOwner  = roleRankOwner
-	RoleRankAdmin  = roleRankAdmin
-	RoleRankMember = roleRankMember
-)
-
-func RoleRank(role string) int                      { return roleRank(role) }
-func HasMemberManagementPermission(p []string) bool { return hasMemberManagementPermission(p) }
-func EffectiveRoleRank(role *Role) int              { return effectiveRoleRank(role) }
-func HighestRoleRank(roles []string) int            { return highestRoleRank(roles) }
-func CanManageRank(callerRank, targetRank int) bool { return canManageRank(callerRank, targetRank) }
-func CanGrantRank(callerRank, roleRank int) bool    { return canGrantRank(callerRank, roleRank) }
-func InsufficientRank(detail string) error          { return insufficientRank(detail) }
-func PermissionDenied() error                       { return permissionDenied() }
-
-func HighestEffectiveRank(ctx context.Context, roles RoleRepository, roleKeys []string) (int, error) {
-	return highestEffectiveRank(ctx, roles, roleKeys)
-}
-func EnsureInviterCanGrant(ctx context.Context, stores Stores, inviterID uuid.UUID, roleKey string) error {
-	return ensureInviterCanGrant(ctx, stores, inviterID, roleKey)
-}

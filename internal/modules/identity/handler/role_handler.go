@@ -7,17 +7,27 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
-// RoleHandler serves tenant role management.
-type RoleHandler struct {
-	roles service.RoleService
+// RoleAdmin is the role surface the role handlers use.
+// *membership.RoleService implements it.
+type RoleAdmin interface {
+	List(ctx context.Context, limit int, startingAfter string) ([]core.Role, bool, error)
+	Get(ctx context.Context, id uuid.UUID) (*core.Role, error)
+	Create(ctx context.Context, in core.NewRole) (*core.Role, error)
+	Update(ctx context.Context, id uuid.UUID, in core.RoleUpdate) (*core.Role, error)
+	Delete(ctx context.Context, id uuid.UUID) error
 }
 
-func NewRoleHandler(roles service.RoleService) *RoleHandler {
+// RoleHandler serves tenant role management.
+type RoleHandler struct {
+	roles RoleAdmin
+}
+
+func NewRoleHandler(roles RoleAdmin) *RoleHandler {
 	return &RoleHandler{roles: roles}
 }
 
@@ -58,7 +68,7 @@ func (h *RoleHandler) ListRoles(ctx context.Context, input *listRolesInput) (*ht
 
 // CreateRole creates a tenant role.
 func (h *RoleHandler) CreateRole(ctx context.Context, input *createRoleInput) (*httpapi.Created[dto.RoleResponse], error) {
-	created, err := h.roles.Create(ctx, service.NewRole{
+	created, err := h.roles.Create(ctx, core.NewRole{
 		Key:         input.Body.Key,
 		Name:        input.Body.Name,
 		Permissions: input.Body.Permissions,
@@ -102,7 +112,7 @@ func (h *RoleHandler) UpdateRole(ctx context.Context, input *updateRoleInput) (*
 	if req.Name.Present && req.Name.Null {
 		return nil, unprocessable("name cannot be cleared")
 	}
-	update := service.RoleUpdate{ID: id}
+	update := core.RoleUpdate{ID: id}
 	if input.IfMatch != "" {
 		expected := existing.UpdatedAt
 		update.ExpectedUpdatedAt = &expected
@@ -139,7 +149,7 @@ func (h *RoleHandler) DeleteRole(ctx context.Context, input *roleInput) (*httpap
 	return &httpapi.Empty{}, nil
 }
 
-func toRoleResponse(role *service.Role) dto.RoleResponse {
+func toRoleResponse(role *core.Role) dto.RoleResponse {
 	return dto.RoleResponse{
 		ID:          role.ID,
 		Key:         role.Key,

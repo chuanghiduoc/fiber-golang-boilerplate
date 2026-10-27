@@ -118,7 +118,3 @@ func userWriteError(err error, notFoundDetail, internalDetail string) error {
 	}
 	return apperror.NewInternal(internalDetail)
 }
-
-// UserServiceImpl is the concrete user service, exported for composition and
-// white-box tests outside this package.
-type UserServiceImpl = userService

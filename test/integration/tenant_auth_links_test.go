@@ -27,7 +27,8 @@ import (
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/authn"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -69,7 +70,7 @@ func (s *recordingEmailSender) Messages() []email.Message {
 type tenantAuthLinksHarness struct {
 	app       *fiber.App
 	pool      *pgxpool.Pool
-	verifSvc  identityservice.EmailVerificationService
+	verifSvc  authn.EmailVerificationService
 	sender    *recordingEmailSender
 	tenantTwo uuid.UUID
 	userID    uuid.UUID
@@ -240,7 +241,7 @@ func TestTenantAuthLinks_ResetAndVerificationCarryTenant(t *testing.T) {
 	require.NoError(t, h.pool.QueryRow(context.Background(),
 		`SELECT password_hash FROM user_passwords WHERE user_id = $1`, h.user2ID,
 	).Scan(&hash))
-	assert.True(t, identityservice.VerifyPasswordHash(hash, anotherPassword),
+	assert.True(t, core.VerifyPasswordHash(hash, anotherPassword),
 		"the global password must be the reset one")
 
 	// The catalog still owns the CSRF code the cookie mode uses.

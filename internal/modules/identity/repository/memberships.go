@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -16,26 +16,26 @@ import (
 
 const uniqueMembershipsTenantUser = "uq_memberships_tenant_user"
 
-// MembershipRepository implements service.MembershipRepository. Every query
+// MembershipRepository implements core.MembershipRepository. Every query
 // is scoped to the request tenant except ListForUser.
 type MembershipRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.MembershipRepository = (*MembershipRepository)(nil)
+var _ core.MembershipRepository = (*MembershipRepository)(nil)
 
 func NewMembershipRepository(db identitysqlc.DBTX) *MembershipRepository {
 	return &MembershipRepository{q: identitysqlc.New(db)}
 }
 
-func toMembership(row identitysqlc.Membership, role string, roles []string) identityservice.Membership {
-	return identityservice.Membership{
+func toMembership(row identitysqlc.Membership, role string, roles []string) core.Membership {
+	return core.Membership{
 		ID:                   row.ID,
 		TenantID:             row.TenantID,
 		UserID:               row.UserID,
 		Role:                 role,
 		Roles:                roles,
-		Status:               identityservice.MembershipStatus(row.Status),
+		Status:               core.MembershipStatus(row.Status),
 		BannedAt:             database.TimePtr(row.BannedAt),
 		BannedEmailHash:      row.BannedEmailHash,
 		ErasureRequestedAt:   database.TimePtr(row.ErasureRequestedAt),
@@ -48,14 +48,14 @@ func toMembership(row identitysqlc.Membership, role string, roles []string) iden
 
 func toMember(user identitysqlc.User, membership identitysqlc.Membership, role string,
 	roles []string, hasPassword bool,
-) identityservice.Member {
-	return identityservice.Member{
+) core.Member {
+	return core.Member{
 		User:       *toUser(user, hasPassword),
 		Membership: toMembership(membership, role, roles),
 	}
 }
 
-func (r *MembershipRepository) Get(ctx context.Context, userID uuid.UUID) (*identityservice.Member, error) {
+func (r *MembershipRepository) Get(ctx context.Context, userID uuid.UUID) (*core.Member, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -68,7 +68,7 @@ func (r *MembershipRepository) Get(ctx context.Context, userID uuid.UUID) (*iden
 	return &m, nil
 }
 
-func (r *MembershipRepository) GetActive(ctx context.Context, userID uuid.UUID) (*identityservice.Member, error) {
+func (r *MembershipRepository) GetActive(ctx context.Context, userID uuid.UUID) (*core.Member, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -81,7 +81,7 @@ func (r *MembershipRepository) GetActive(ctx context.Context, userID uuid.UUID) 
 	return &m, nil
 }
 
-func (r *MembershipRepository) ListActiveCursor(ctx context.Context, cur pagination.DBCursor) ([]identityservice.Member, error) {
+func (r *MembershipRepository) ListActiveCursor(ctx context.Context, cur pagination.DBCursor) ([]core.Member, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -95,14 +95,14 @@ func (r *MembershipRepository) ListActiveCursor(ctx context.Context, cur paginat
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	members := make([]identityservice.Member, len(rows))
+	members := make([]core.Member, len(rows))
 	for i := range rows {
 		members[i] = toMember(rows[i].User, rows[i].Membership, rows[i].Role, rows[i].Roles, rows[i].HasPassword)
 	}
 	return members, nil
 }
 
-func (r *MembershipRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]identityservice.Member, error) {
+func (r *MembershipRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]core.Member, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -116,14 +116,14 @@ func (r *MembershipRepository) ListCursor(ctx context.Context, cur pagination.DB
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	members := make([]identityservice.Member, len(rows))
+	members := make([]core.Member, len(rows))
 	for i := range rows {
 		members[i] = toMember(rows[i].User, rows[i].Membership, rows[i].Role, rows[i].Roles, rows[i].HasPassword)
 	}
 	return members, nil
 }
 
-func (r *MembershipRepository) ListFilteredCursor(ctx context.Context, cur pagination.DBCursor, status, role string) ([]identityservice.Member, error) {
+func (r *MembershipRepository) ListFilteredCursor(ctx context.Context, cur pagination.DBCursor, status, role string) ([]core.Member, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -144,27 +144,27 @@ func (r *MembershipRepository) ListFilteredCursor(ctx context.Context, cur pagin
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	members := make([]identityservice.Member, len(rows))
+	members := make([]core.Member, len(rows))
 	for i := range rows {
 		members[i] = toMember(rows[i].User, rows[i].Membership, rows[i].Role, rows[i].Roles, rows[i].HasPassword)
 	}
 	return members, nil
 }
 
-func (r *MembershipRepository) ListForUser(ctx context.Context, userID uuid.UUID) ([]identityservice.Membership, error) {
+func (r *MembershipRepository) ListForUser(ctx context.Context, userID uuid.UUID) ([]core.Membership, error) {
 	ctx = database.WithRLSBypass(ctx) // The user's memberships in every tenant (global account operations).
 	rows, err := r.q.ListUserMemberships(ctx, userID)
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	memberships := make([]identityservice.Membership, len(rows))
+	memberships := make([]core.Membership, len(rows))
 	for i := range rows {
 		memberships[i] = toMembership(rows[i].Membership, rows[i].Role, rows[i].Roles)
 	}
 	return memberships, nil
 }
 
-func (r *MembershipRepository) Create(ctx context.Context, userID uuid.UUID, role string) (*identityservice.Membership, error) {
+func (r *MembershipRepository) Create(ctx context.Context, userID uuid.UUID, role string) (*core.Membership, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -175,7 +175,7 @@ func (r *MembershipRepository) Create(ctx context.Context, userID uuid.UUID, rol
 	})
 	if err != nil {
 		if name, ok := uniqueConstraint(err); ok && name == uniqueMembershipsTenantUser {
-			return nil, identityservice.ErrAlreadyMember
+			return nil, core.ErrAlreadyMember
 		}
 		return nil, wrapErr(err)
 	}
@@ -186,7 +186,7 @@ func (r *MembershipRepository) Create(ctx context.Context, userID uuid.UUID, rol
 	return &m, nil
 }
 
-func (r *MembershipRepository) Reactivate(ctx context.Context, userID uuid.UUID, role string) (*identityservice.Membership, error) {
+func (r *MembershipRepository) Reactivate(ctx context.Context, userID uuid.UUID, role string) (*core.Membership, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -204,7 +204,7 @@ func (r *MembershipRepository) Reactivate(ctx context.Context, userID uuid.UUID,
 	return &m, nil
 }
 
-func (r *MembershipRepository) UpdateRole(ctx context.Context, userID uuid.UUID, role string) (*identityservice.Membership, error) {
+func (r *MembershipRepository) UpdateRole(ctx context.Context, userID uuid.UUID, role string) (*core.Membership, error) {
 	member, err := r.GetActive(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -217,7 +217,7 @@ func (r *MembershipRepository) UpdateRole(ctx context.Context, userID uuid.UUID,
 	return &member.Membership, nil
 }
 
-func (r *MembershipRepository) Ban(ctx context.Context, userID uuid.UUID, marker identityservice.BanMarker) (*identityservice.Membership, error) {
+func (r *MembershipRepository) Ban(ctx context.Context, userID uuid.UUID, marker core.BanMarker) (*core.Membership, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -237,7 +237,7 @@ func (r *MembershipRepository) Ban(ctx context.Context, userID uuid.UUID, marker
 	return r.hydrate(ctx, row)
 }
 
-func (r *MembershipRepository) Unban(ctx context.Context, userID uuid.UUID) (*identityservice.Membership, error) {
+func (r *MembershipRepository) Unban(ctx context.Context, userID uuid.UUID) (*core.Membership, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -249,7 +249,7 @@ func (r *MembershipRepository) Unban(ctx context.Context, userID uuid.UUID) (*id
 	return r.hydrate(ctx, row)
 }
 
-func (r *MembershipRepository) Remove(ctx context.Context, userID uuid.UUID, marker identityservice.BanMarker) (*identityservice.Membership, error) {
+func (r *MembershipRepository) Remove(ctx context.Context, userID uuid.UUID, marker core.BanMarker) (*core.Membership, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -314,7 +314,7 @@ func (r *MembershipRepository) deleteInvitationsCreatedBy(ctx context.Context, u
 
 // hydrate fills the derived role fields of a membership row written by a
 // status mutation.
-func (r *MembershipRepository) hydrate(ctx context.Context, row identitysqlc.Membership) (*identityservice.Membership, error) {
+func (r *MembershipRepository) hydrate(ctx context.Context, row identitysqlc.Membership) (*core.Membership, error) {
 	role, roles, err := r.rolesOf(ctx, row.UserID)
 	if err != nil {
 		return nil, err
@@ -431,16 +431,16 @@ func (r *MembershipRepository) LockOwnerChanges(ctx context.Context) error {
 	return nil
 }
 
-func (r *MembershipRepository) Stats(ctx context.Context) (identityservice.MemberStats, error) {
+func (r *MembershipRepository) Stats(ctx context.Context) (core.MemberStats, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
-		return identityservice.MemberStats{}, err
+		return core.MemberStats{}, err
 	}
 	row, err := r.q.MembershipStats(ctx, tenantID)
 	if err != nil {
-		return identityservice.MemberStats{}, wrapErr(err)
+		return core.MemberStats{}, wrapErr(err)
 	}
-	return identityservice.MemberStats{Active: row.ActiveMembers, Inactive: row.InactiveMembers}, nil
+	return core.MemberStats{Active: row.ActiveMembers, Inactive: row.InactiveMembers}, nil
 }
 
 func (r *MembershipRepository) EmailBanned(ctx context.Context, hashes [][]byte) (bool, error) {
@@ -460,20 +460,20 @@ func (r *MembershipRepository) EmailBanned(ctx context.Context, hashes [][]byte)
 // BannedMarkerCounts counts retained ban markers per key id across every
 // tenant. It is the startup check for markers written by a key that is no
 // longer configured; those bans can no longer match an address.
-func (r *MembershipRepository) BannedMarkerCounts(ctx context.Context) ([]identityservice.BanMarkerCount, error) {
+func (r *MembershipRepository) BannedMarkerCounts(ctx context.Context) ([]core.BanMarkerCount, error) {
 	ctx = database.WithRLSBypass(ctx) // Counts every tenant's retained bans.
 	rows, err := r.q.CountBannedMarkers(ctx)
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	counts := make([]identityservice.BanMarkerCount, len(rows))
+	counts := make([]core.BanMarkerCount, len(rows))
 	for i, row := range rows {
-		counts[i] = identityservice.BanMarkerCount{KeyID: row.BannedEmailHashKid, Bans: row.Bans}
+		counts[i] = core.BanMarkerCount{KeyID: row.BannedEmailHashKid, Bans: row.Bans}
 	}
 	return counts, nil
 }
 
-func (r *MembershipRepository) GetPrincipal(ctx context.Context, userID uuid.UUID) (*identityservice.Principal, error) {
+func (r *MembershipRepository) GetPrincipal(ctx context.Context, userID uuid.UUID) (*core.Principal, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -485,7 +485,7 @@ func (r *MembershipRepository) GetPrincipal(ctx context.Context, userID uuid.UUI
 	return toPrincipal(row), nil
 }
 
-func (r *MembershipRepository) LockPrincipal(ctx context.Context, userID uuid.UUID) (*identityservice.Principal, error) {
+func (r *MembershipRepository) LockPrincipal(ctx context.Context, userID uuid.UUID) (*core.Principal, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -497,8 +497,8 @@ func (r *MembershipRepository) LockPrincipal(ctx context.Context, userID uuid.UU
 	return toPrincipal(identitysqlc.GetMemberPrincipalRow(row)), nil
 }
 
-func toPrincipal(row identitysqlc.GetMemberPrincipalRow) *identityservice.Principal {
-	return &identityservice.Principal{
+func toPrincipal(row identitysqlc.GetMemberPrincipalRow) *core.Principal {
+	return &core.Principal{
 		UserID:               row.ID,
 		TenantID:             row.TenantID,
 		Email:                row.Email,
@@ -506,7 +506,7 @@ func toPrincipal(row identitysqlc.GetMemberPrincipalRow) *identityservice.Princi
 		Role:                 row.Role,
 		Permissions:          row.Permissions,
 		Platform:             row.Platform,
-		TenantStatus:         identityservice.TenantStatus(row.TenantStatus),
+		TenantStatus:         core.TenantStatus(row.TenantStatus),
 		CredentialsRevokedAt: database.TimePtr(row.CredentialsRevokedAt),
 	}
 }

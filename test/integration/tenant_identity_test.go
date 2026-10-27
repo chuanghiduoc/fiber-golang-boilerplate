@@ -19,7 +19,8 @@ import (
 
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -31,8 +32,8 @@ const integrationTenantSecret = "integration-app-secret-0123456789"
 type tenantHarness struct {
 	app       *fiber.App
 	pool      *pgxpool.Pool
-	stores    identityservice.Stores
-	adminSvc  identityservice.AdminUserService
+	stores    core.Stores
+	adminSvc  membership.AdminUserService
 	tenantOne uuid.UUID
 	tenantTwo uuid.UUID
 }
@@ -47,7 +48,7 @@ func setupTenantHarness(t *testing.T) *tenantHarness {
 		app:       full.app,
 		pool:      full.pool,
 		stores:    stores,
-		adminSvc:  identityservice.NewAdminUserService(stores, nil, nil),
+		adminSvc:  membership.NewAdminUserService(stores, nil, nil),
 		tenantOne: tenant.DefaultID,
 		tenantTwo: tenantTwo,
 	}

@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 )
 
@@ -20,7 +20,7 @@ func NewFixture(t testing.TB) *pgtest.Fixture {
 	fixture := pgtest.New(t)
 	stores := identityrepo.NewStores(fixture.Bypass)
 	tx := identityrepo.NewTransactor(fixture.Tx(), nil, nil, nil)
-	if err := identityservice.SyncPermissions(context.Background(), tx, stores.Roles, Catalogs().Permissions); err != nil {
+	if err := membership.SyncPermissions(context.Background(), tx, stores.Roles, Catalogs().Permissions); err != nil {
 		t.Fatalf("sync permission catalog: %v", err)
 	}
 	return fixture

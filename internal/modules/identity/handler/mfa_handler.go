@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
@@ -12,12 +12,12 @@ import (
 // MFAHandler serves the authenticated MFA management endpoints and the public
 // two-step login verification.
 type MFAHandler struct {
-	mfa           service.MFAService
+	mfa           MFA
 	keyring       *token.Keyring
 	refreshCookie RefreshCookieConfig
 }
 
-func NewMFAHandler(mfa service.MFAService) *MFAHandler {
+func NewMFAHandler(mfa MFA) *MFAHandler {
 	return &MFAHandler{mfa: mfa}
 }
 
@@ -67,7 +67,7 @@ func (h *MFAHandler) Enroll(ctx context.Context, input *mfaEnrollInput) (*httpap
 	location := "/api/v1/me/mfa/totp/" + enrollment.FactorID.String()
 	return httpapi.NewCreated(location, dto.MFAEnrollResponse{
 		FactorID:   enrollment.FactorID,
-		Type:       service.MFAFactorTOTP,
+		Type:       core.MFAFactorTOTP,
 		OtpauthURI: enrollment.OtpauthURI,
 	}), nil
 }

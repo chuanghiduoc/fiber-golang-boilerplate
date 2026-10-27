@@ -5,26 +5,26 @@ import (
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/google/uuid"
 )
 
-// SessionRepository implements service.SessionRepository.
+// SessionRepository implements core.SessionRepository.
 type SessionRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.SessionRepository = (*SessionRepository)(nil)
+var _ core.SessionRepository = (*SessionRepository)(nil)
 
 func NewSessionRepository(db identitysqlc.DBTX) *SessionRepository {
 	return &SessionRepository{q: identitysqlc.New(db)}
 }
 
-func toSession(row identitysqlc.Session) identityservice.Session {
-	return identityservice.Session{
+func toSession(row identitysqlc.Session) core.Session {
+	return core.Session{
 		ID:            row.ID,
 		TenantID:      row.TenantID,
 		UserID:        row.UserID,
@@ -37,11 +37,11 @@ func toSession(row identitysqlc.Session) identityservice.Session {
 		CreatedAt:     row.CreatedAt.Time,
 		ExpiresAt:     row.ExpiresAt.Time,
 		RevokedAt:     database.TimePtr(row.RevokedAt),
-		RevokedReason: identityservice.RevokeReason(row.RevokedReason.String),
+		RevokedReason: core.RevokeReason(row.RevokedReason.String),
 	}
 }
 
-func (r *SessionRepository) Create(ctx context.Context, session identityservice.NewSession) (*identityservice.Session, error) {
+func (r *SessionRepository) Create(ctx context.Context, session core.NewSession) (*core.Session, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -63,7 +63,7 @@ func (r *SessionRepository) Create(ctx context.Context, session identityservice.
 	return &s, nil
 }
 
-func (r *SessionRepository) Get(ctx context.Context, id uuid.UUID) (*identityservice.Session, error) {
+func (r *SessionRepository) Get(ctx context.Context, id uuid.UUID) (*core.Session, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -76,7 +76,7 @@ func (r *SessionRepository) Get(ctx context.Context, id uuid.UUID) (*identityser
 	return &s, nil
 }
 
-func (r *SessionRepository) ListLiveCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]identityservice.Session, error) {
+func (r *SessionRepository) ListLiveCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]core.Session, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -91,14 +91,14 @@ func (r *SessionRepository) ListLiveCursor(ctx context.Context, userID uuid.UUID
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	sessions := make([]identityservice.Session, len(rows))
+	sessions := make([]core.Session, len(rows))
 	for i := range rows {
 		sessions[i] = toSession(rows[i])
 	}
 	return sessions, nil
 }
 
-func (r *SessionRepository) Revoke(ctx context.Context, userID, id uuid.UUID, why identityservice.RevokeReason) (bool, error) {
+func (r *SessionRepository) Revoke(ctx context.Context, userID, id uuid.UUID, why core.RevokeReason) (bool, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return false, err
@@ -115,7 +115,7 @@ func (r *SessionRepository) Revoke(ctx context.Context, userID, id uuid.UUID, wh
 	return n > 0, nil
 }
 
-func (r *SessionRepository) RevokeAllInTenant(ctx context.Context, userID uuid.UUID, why identityservice.RevokeReason) error {
+func (r *SessionRepository) RevokeAllInTenant(ctx context.Context, userID uuid.UUID, why core.RevokeReason) error {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return err
@@ -130,7 +130,7 @@ func (r *SessionRepository) RevokeAllInTenant(ctx context.Context, userID uuid.U
 	return nil
 }
 
-func (r *SessionRepository) RevokeAllForUser(ctx context.Context, userID uuid.UUID, why identityservice.RevokeReason) error {
+func (r *SessionRepository) RevokeAllForUser(ctx context.Context, userID uuid.UUID, why core.RevokeReason) error {
 	ctx = database.WithRLSBypass(ctx) // The user's sessions in every tenant (global account operations).
 	if err := r.q.RevokeAllUserSessions(ctx, identitysqlc.RevokeAllUserSessionsParams{
 		UserID: userID,
@@ -141,7 +141,7 @@ func (r *SessionRepository) RevokeAllForUser(ctx context.Context, userID uuid.UU
 	return nil
 }
 
-func (r *SessionRepository) RevokeStaleForUser(ctx context.Context, userID uuid.UUID, why identityservice.RevokeReason) error {
+func (r *SessionRepository) RevokeStaleForUser(ctx context.Context, userID uuid.UUID, why core.RevokeReason) error {
 	ctx = database.WithRLSBypass(ctx) // The user's stale sessions in every tenant (after-commit cleanup of a version bump).
 	if err := r.q.RevokeStaleUserSessions(ctx, identitysqlc.RevokeStaleUserSessionsParams{
 		UserID: userID,
@@ -152,7 +152,7 @@ func (r *SessionRepository) RevokeStaleForUser(ctx context.Context, userID uuid.
 	return nil
 }
 
-func (r *SessionRepository) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, amr []string) (*identityservice.Session, error) {
+func (r *SessionRepository) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, amr []string) (*core.Session, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -185,7 +185,7 @@ func (r *SessionRepository) DeleteRefreshTokens(ctx context.Context, sessionID u
 	return nil
 }
 
-func (r *SessionRepository) RevokeOtherUserSessions(ctx context.Context, userID, keepID uuid.UUID, why identityservice.RevokeReason) error {
+func (r *SessionRepository) RevokeOtherUserSessions(ctx context.Context, userID, keepID uuid.UUID, why core.RevokeReason) error {
 	ctx = database.WithRLSBypass(ctx) // The user's other sessions in every tenant (MFA change).
 	if err := r.q.RevokeOtherUserSessions(ctx, identitysqlc.RevokeOtherUserSessionsParams{
 		UserID: userID,
@@ -197,7 +197,7 @@ func (r *SessionRepository) RevokeOtherUserSessions(ctx context.Context, userID,
 	return nil
 }
 
-func (r *SessionRepository) RevokeByRefreshToken(ctx context.Context, tokenHash []byte, why identityservice.RevokeReason) (userID uuid.UUID, revoked bool, err error) {
+func (r *SessionRepository) RevokeByRefreshToken(ctx context.Context, tokenHash []byte, why core.RevokeReason) (userID uuid.UUID, revoked bool, err error) {
 	ctx = database.WithRLSBypass(ctx) // Possession of the opaque token is the authorization; logout and reuse revoke across the request tenant boundary.
 	userID, err = r.q.RevokeSessionByRefreshToken(ctx, identitysqlc.RevokeSessionByRefreshTokenParams{
 		TokenHash: tokenHash,
@@ -261,12 +261,12 @@ func (r *SessionRepository) MarkMFAVerifiedWithMethod(ctx context.Context, userI
 	return verifiedAt.Time, nil
 }
 
-func (r *SessionRepository) State(ctx context.Context, sessionID, userID uuid.UUID) (*identityservice.SessionState, error) {
+func (r *SessionRepository) State(ctx context.Context, sessionID, userID uuid.UUID) (*core.SessionState, error) {
 	row, err := r.q.GetSessionState(ctx, identitysqlc.GetSessionStateParams{ID: sessionID, UserID: userID})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return &identityservice.SessionState{
+	return &core.SessionState{
 		TenantID:         row.TenantID,
 		Revoked:          row.RevokedAt.Valid,
 		ExpiresAt:        row.ExpiresAt.Time,
@@ -275,34 +275,34 @@ func (r *SessionRepository) State(ctx context.Context, sessionID, userID uuid.UU
 		Role:             highestRole(row.RoleKeys),
 		Permissions:      row.PermissionKeys,
 		Platform:         row.Platform,
-		MembershipStatus: identityservice.MembershipStatus(row.MembershipStatus),
+		MembershipStatus: core.MembershipStatus(row.MembershipStatus),
 		TokenVersion:     row.TokenVersion,
-		UserStatus:       identityservice.UserStatus(row.UserStatus),
-		TenantStatus:     identityservice.TenantStatus(row.TenantStatus),
+		UserStatus:       core.UserStatus(row.UserStatus),
+		TenantStatus:     core.TenantStatus(row.TenantStatus),
 	}, nil
 }
 
 // highestRole maps role keys to the compatibility role field.
 func highestRole(keys []string) string {
 	for _, key := range keys {
-		if key == identityservice.RoleOwner {
-			return identityservice.RoleOwner
+		if key == core.RoleOwner {
+			return core.RoleOwner
 		}
 	}
 	for _, key := range keys {
-		if key == identityservice.RoleAdmin {
-			return identityservice.RoleAdmin
+		if key == core.RoleAdmin {
+			return core.RoleAdmin
 		}
 	}
-	return identityservice.RoleMember
+	return core.RoleMember
 }
 
-// RefreshTokenRepository implements service.RefreshTokenRepository.
+// RefreshTokenRepository implements core.RefreshTokenRepository.
 type RefreshTokenRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.RefreshTokenRepository = (*RefreshTokenRepository)(nil)
+var _ core.RefreshTokenRepository = (*RefreshTokenRepository)(nil)
 
 func NewRefreshTokenRepository(db identitysqlc.DBTX) *RefreshTokenRepository {
 	return &RefreshTokenRepository{q: identitysqlc.New(db)}
@@ -324,7 +324,7 @@ func (r *RefreshTokenRepository) Create(ctx context.Context, sessionID uuid.UUID
 	return nil
 }
 
-func (r *RefreshTokenRepository) GetByHash(ctx context.Context, tokenHash []byte) (*identityservice.RefreshToken, error) {
+func (r *RefreshTokenRepository) GetByHash(ctx context.Context, tokenHash []byte) (*core.RefreshToken, error) {
 	// Intentionally tenant-scoped: a refresh token is usable only in the
 	// tenant that issued it, and RLS is a second line behind the explicit
 	// tenant comparison in SessionService.loadRefreshSession. Unlike logout,
@@ -333,7 +333,7 @@ func (r *RefreshTokenRepository) GetByHash(ctx context.Context, tokenHash []byte
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return &identityservice.RefreshToken{
+	return &core.RefreshToken{
 		ID:        row.ID,
 		TenantID:  row.TenantID,
 		SessionID: row.SessionID,
@@ -351,10 +351,10 @@ func (r *RefreshTokenRepository) MarkUsed(ctx context.Context, scopedTenantID, i
 	return n > 0, nil
 }
 
-func (r *RefreshTokenRepository) ClassifyRotation(ctx context.Context, tokenHash []byte, usedAfter time.Time) (identityservice.RefreshRotationState, error) {
+func (r *RefreshTokenRepository) ClassifyRotation(ctx context.Context, tokenHash []byte, usedAfter time.Time) (core.RefreshRotationState, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
-		return identityservice.RefreshRotationState{}, err
+		return core.RefreshRotationState{}, err
 	}
 	row, err := r.q.ClassifyRefreshTokenRotation(ctx, identitysqlc.ClassifyRefreshTokenRotationParams{
 		UsedAfter: database.Timestamptz(usedAfter),
@@ -362,9 +362,9 @@ func (r *RefreshTokenRepository) ClassifyRotation(ctx context.Context, tokenHash
 		TenantID:  tenantID,
 	})
 	if err != nil {
-		return identityservice.RefreshRotationState{}, wrapErr(err)
+		return core.RefreshRotationState{}, wrapErr(err)
 	}
-	return identityservice.RefreshRotationState{
+	return core.RefreshRotationState{
 		SessionLive:     row.SessionLive.Bool,
 		UsedWithinGrace: row.Recent.Bool,
 		Rotated:         row.Rotated,

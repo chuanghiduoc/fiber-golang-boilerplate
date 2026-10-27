@@ -9,7 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -18,14 +18,14 @@ import (
 
 // PrivacyService is the privacy surface the handlers use.
 type PrivacyService interface {
-	RequestExport(ctx context.Context, userID uuid.UUID) (*identityservice.DataExport, error)
-	ListExports(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]identityservice.DataExport, bool, error)
-	GetExport(ctx context.Context, userID, id uuid.UUID) (*identityservice.DataExport, error)
-	DownloadExport(ctx context.Context, userID, id uuid.UUID) (*identityservice.DataExport, io.ReadCloser, error)
+	RequestExport(ctx context.Context, userID uuid.UUID) (*core.DataExport, error)
+	ListExports(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]core.DataExport, bool, error)
+	GetExport(ctx context.Context, userID, id uuid.UUID) (*core.DataExport, error)
+	DownloadExport(ctx context.Context, userID, id uuid.UUID) (*core.DataExport, io.ReadCloser, error)
 	RequestSelfErasure(ctx context.Context, userID uuid.UUID, password string) error
 	RequestAdminErasure(ctx context.Context, userID uuid.UUID) error
-	ListErasureRequests(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]identityservice.ErasureRequest, bool, error)
-	GetErasureRequest(ctx context.Context, userID, id uuid.UUID) (*identityservice.ErasureRequest, error)
+	ListErasureRequests(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]core.ErasureRequest, bool, error)
+	GetErasureRequest(ctx context.Context, userID, id uuid.UUID) (*core.ErasureRequest, error)
 }
 
 // PrivacyHandler serves the caller's data exports and erasure requests.
@@ -37,7 +37,7 @@ func NewPrivacyHandler(service PrivacyService) *PrivacyHandler {
 	return &PrivacyHandler{service: service}
 }
 
-func toDataExportResponse(export *identityservice.DataExport) dto.DataExportResponse {
+func toDataExportResponse(export *core.DataExport) dto.DataExportResponse {
 	resp := dto.DataExportResponse{
 		ID:        export.ID,
 		TenantID:  export.TenantID,
@@ -47,13 +47,13 @@ func toDataExportResponse(export *identityservice.DataExport) dto.DataExportResp
 		CreatedAt: export.CreatedAt,
 		UpdatedAt: export.UpdatedAt,
 	}
-	if export.Status == identityservice.DataExportReady && export.ExpiresAt != nil && export.ExpiresAt.After(time.Now()) {
+	if export.Status == core.DataExportReady && export.ExpiresAt != nil && export.ExpiresAt.After(time.Now()) {
 		resp.ContentURL = fmt.Sprintf("/api/v1/me/data-exports/%s/content", export.ID)
 	}
 	return resp
 }
 
-func toErasureResponse(request *identityservice.ErasureRequest) dto.ErasureRequestResponse {
+func toErasureResponse(request *core.ErasureRequest) dto.ErasureRequestResponse {
 	return dto.ErasureRequestResponse{
 		ID:          request.ID,
 		TenantID:    request.TenantID,

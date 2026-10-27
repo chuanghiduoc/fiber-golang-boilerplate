@@ -7,18 +7,29 @@ import (
 	"context"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	"github.com/google/uuid"
 )
 
+// AdminUsers is the admin-user surface this adapter consumes.
+// *membership.AdminUserService implements it.
+type AdminUsers interface {
+	ListUsers(ctx context.Context, limit int, startingAfter string) ([]core.Member, bool, error)
+	UpdateRole(ctx context.Context, id uuid.UUID, role string) (*core.Member, error)
+	BanUser(ctx context.Context, id uuid.UUID) error
+	UnbanUser(ctx context.Context, id uuid.UUID) (*core.Member, error)
+	GetUserStats(ctx context.Context) (membership.UserStats, error)
+}
+
 // AdminIdentity adapts the identity admin service to identitycontracts.IdentityAdmin.
 type AdminIdentity struct {
-	service service.AdminUserService
+	service AdminUsers
 }
 
 var _ identitycontracts.IdentityAdmin = (*AdminIdentity)(nil)
 
-func NewAdminIdentity(svc service.AdminUserService) *AdminIdentity {
+func NewAdminIdentity(svc AdminUsers) *AdminIdentity {
 	return &AdminIdentity{service: svc}
 }
 
@@ -65,21 +76,21 @@ func (a *AdminIdentity) GetUserStats(ctx context.Context) (identitycontracts.Use
 	}, nil
 }
 
-func toUser(member *service.Member) identitycontracts.User {
-	user, membership := member.User, member.Membership
+func toUser(member *core.Member) identitycontracts.User {
+	user, mem := member.User, member.Membership
 	return identitycontracts.User{
 		ID:               user.ID,
 		Email:            user.Email,
 		Name:             user.Name,
-		Role:             membership.Role,
-		Roles:            membership.Roles,
-		MembershipStatus: string(membership.Status),
+		Role:             mem.Role,
+		Roles:            mem.Roles,
+		MembershipStatus: string(mem.Status),
 		EmailVerified:    user.EmailVerified(),
 		HasPassword:      user.HasPassword,
 		CreatedAt:        user.CreatedAt,
 		UpdatedAt:        member.UpdatedAt(),
-		JoinedAt:         membership.CreatedAt,
+		JoinedAt:         mem.CreatedAt,
 		DeletedAt:        member.DeletedAt(),
-		BannedAt:         membership.BannedAt,
+		BannedAt:         mem.BannedAt,
 	}
 }

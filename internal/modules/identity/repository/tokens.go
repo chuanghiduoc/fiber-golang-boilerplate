@@ -5,25 +5,25 @@ import (
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/google/uuid"
 )
 
-// PasswordResetRepository implements service.PasswordResetRepository. Reset
+// PasswordResetRepository implements core.PasswordResetRepository. Reset
 // tokens are per user (global), so no query takes a tenant.
 type PasswordResetRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.PasswordResetRepository = (*PasswordResetRepository)(nil)
+var _ core.PasswordResetRepository = (*PasswordResetRepository)(nil)
 
 func NewPasswordResetRepository(db identitysqlc.DBTX) *PasswordResetRepository {
 	return &PasswordResetRepository{q: identitysqlc.New(db)}
 }
 
-func toResetToken(row identitysqlc.PasswordResetToken) *identityservice.PasswordResetToken {
-	return &identityservice.PasswordResetToken{
+func toResetToken(row identitysqlc.PasswordResetToken) *core.PasswordResetToken {
+	return &core.PasswordResetToken{
 		ID:        row.ID,
 		UserID:    row.UserID,
 		ExpiresAt: row.ExpiresAt.Time,
@@ -47,7 +47,7 @@ func (r *PasswordResetRepository) Create(ctx context.Context, userID uuid.UUID, 
 	return true, nil
 }
 
-func (r *PasswordResetRepository) GetByHash(ctx context.Context, tokenHash []byte) (*identityservice.PasswordResetToken, error) {
+func (r *PasswordResetRepository) GetByHash(ctx context.Context, tokenHash []byte) (*core.PasswordResetToken, error) {
 	row, err := r.q.GetPasswordResetTokenByHash(ctx, tokenHash)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -55,7 +55,7 @@ func (r *PasswordResetRepository) GetByHash(ctx context.Context, tokenHash []byt
 	return toResetToken(row), nil
 }
 
-func (r *PasswordResetRepository) Consume(ctx context.Context, tokenHash []byte) (*identityservice.PasswordResetToken, error) {
+func (r *PasswordResetRepository) Consume(ctx context.Context, tokenHash []byte) (*core.PasswordResetToken, error) {
 	row, err := r.q.ConsumePasswordResetToken(ctx, tokenHash)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -71,12 +71,12 @@ func (r *PasswordResetRepository) DeleteByUser(ctx context.Context, userID uuid.
 	return wrapErr(r.q.DeletePasswordResetTokensByUserID(ctx, userID))
 }
 
-// VerificationRepository implements service.VerificationRepository.
+// VerificationRepository implements core.VerificationRepository.
 type VerificationRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.VerificationRepository = (*VerificationRepository)(nil)
+var _ core.VerificationRepository = (*VerificationRepository)(nil)
 
 func NewVerificationRepository(db identitysqlc.DBTX) *VerificationRepository {
 	return &VerificationRepository{q: identitysqlc.New(db)}
@@ -92,12 +92,12 @@ func (r *VerificationRepository) Create(ctx context.Context, userID uuid.UUID, e
 	return wrapErr(err)
 }
 
-func (r *VerificationRepository) Consume(ctx context.Context, tokenHash []byte) (*identityservice.VerificationToken, error) {
+func (r *VerificationRepository) Consume(ctx context.Context, tokenHash []byte) (*core.VerificationToken, error) {
 	row, err := r.q.ConsumeEmailVerificationToken(ctx, tokenHash)
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return &identityservice.VerificationToken{
+	return &core.VerificationToken{
 		ID:        row.ID,
 		UserID:    row.UserID,
 		Email:     row.Email,
@@ -110,14 +110,14 @@ func (r *VerificationRepository) DeleteByUser(ctx context.Context, userID uuid.U
 	return wrapErr(r.q.DeleteEmailVerificationTokensByUserID(ctx, userID))
 }
 
-// TokenPurgeRepository implements service.TokenPurgeRepository. Unlike every
+// TokenPurgeRepository implements core.TokenPurgeRepository. Unlike every
 // other identity query these run across all tenants on purpose: retention is
 // a maintenance job, and an expired token is unusable in any tenant.
 type TokenPurgeRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.TokenPurgeRepository = (*TokenPurgeRepository)(nil)
+var _ core.TokenPurgeRepository = (*TokenPurgeRepository)(nil)
 
 func NewTokenPurgeRepository(db identitysqlc.DBTX) *TokenPurgeRepository {
 	return &TokenPurgeRepository{q: identitysqlc.New(db)}

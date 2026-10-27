@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -22,12 +22,12 @@ const (
 	sqlStateRestrictViolation   = "23001"
 )
 
-// RoleRepository implements service.RoleRepository.
+// RoleRepository implements core.RoleRepository.
 type RoleRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.RoleRepository = (*RoleRepository)(nil)
+var _ core.RoleRepository = (*RoleRepository)(nil)
 
 func NewRoleRepository(db identitysqlc.DBTX) *RoleRepository {
 	return &RoleRepository{q: identitysqlc.New(db)}
@@ -35,8 +35,8 @@ func NewRoleRepository(db identitysqlc.DBTX) *RoleRepository {
 
 func toRole(id uuid.UUID, tenantID uuid.NullUUID, scope, key, name string,
 	permissions []string, createdAt, updatedAt pgtype.Timestamptz,
-) identityservice.Role {
-	role := identityservice.Role{
+) core.Role {
+	role := core.Role{
 		ID:          id,
 		Scope:       scope,
 		Key:         key,
@@ -49,7 +49,7 @@ func toRole(id uuid.UUID, tenantID uuid.NullUUID, scope, key, name string,
 	return role
 }
 
-func (r *RoleRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]identityservice.Role, error) {
+func (r *RoleRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]core.Role, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -63,7 +63,7 @@ func (r *RoleRepository) ListCursor(ctx context.Context, cur pagination.DBCursor
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	roles := make([]identityservice.Role, len(rows))
+	roles := make([]core.Role, len(rows))
 	for i := range rows {
 		roles[i] = toRole(rows[i].ID, rows[i].TenantID, rows[i].Scope, rows[i].Key,
 			rows[i].Name, rows[i].Permissions, rows[i].CreatedAt, rows[i].UpdatedAt)
@@ -71,7 +71,7 @@ func (r *RoleRepository) ListCursor(ctx context.Context, cur pagination.DBCursor
 	return roles, nil
 }
 
-func (r *RoleRepository) Get(ctx context.Context, id uuid.UUID) (*identityservice.Role, error) {
+func (r *RoleRepository) Get(ctx context.Context, id uuid.UUID) (*core.Role, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -85,7 +85,7 @@ func (r *RoleRepository) Get(ctx context.Context, id uuid.UUID) (*identityservic
 	return &role, nil
 }
 
-func (r *RoleRepository) GetByKey(ctx context.Context, key string) (*identityservice.Role, error) {
+func (r *RoleRepository) GetByKey(ctx context.Context, key string) (*core.Role, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -99,7 +99,7 @@ func (r *RoleRepository) GetByKey(ctx context.Context, key string) (*identityser
 	return &role, nil
 }
 
-func (r *RoleRepository) Create(ctx context.Context, in identityservice.NewRole) (*identityservice.Role, error) {
+func (r *RoleRepository) Create(ctx context.Context, in core.NewRole) (*core.Role, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -111,7 +111,7 @@ func (r *RoleRepository) Create(ctx context.Context, in identityservice.NewRole)
 	})
 	if err != nil {
 		if name, ok := uniqueConstraint(err); ok && name == "uq_roles_tenant_key" {
-			return nil, identityservice.ErrRoleKeyTaken
+			return nil, core.ErrRoleKeyTaken
 		}
 		return nil, wrapErr(err)
 	}
@@ -123,7 +123,7 @@ func (r *RoleRepository) Create(ctx context.Context, in identityservice.NewRole)
 	return &role, nil
 }
 
-func (r *RoleRepository) Update(ctx context.Context, id uuid.UUID, name string, permissions []string, expected *time.Time) (*identityservice.Role, error) {
+func (r *RoleRepository) Update(ctx context.Context, id uuid.UUID, name string, permissions []string, expected *time.Time) (*core.Role, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -166,7 +166,7 @@ func (r *RoleRepository) Delete(ctx context.Context, id uuid.UUID) (bool, error)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && (pgErr.Code == sqlStateForeignKeyViolation || pgErr.Code == sqlStateRestrictViolation) {
-			return false, identityservice.ErrRoleInUse
+			return false, core.ErrRoleInUse
 		}
 		return false, wrapErr(err)
 	}
@@ -206,7 +206,7 @@ func (r *RoleRepository) ReplaceMemberRoles(ctx context.Context, userID uuid.UUI
 		row, err := r.q.GetRoleByKey(ctx, identitysqlc.GetRoleByKeyParams{Key: key, TenantID: tid})
 		if err != nil {
 			if errors.Is(wrapErr(err), apperror.ErrNotFound) {
-				return identityservice.ErrRoleNotFound
+				return core.ErrRoleNotFound
 			}
 			return wrapErr(err)
 		}
@@ -236,8 +236,8 @@ func (r *RoleRepository) AssignPlatformRole(ctx context.Context, userID uuid.UUI
 	return nil
 }
 
-func (r *RoleRepository) SyncCatalog(ctx context.Context, permissions []identityservice.CatalogPermission,
-	roles []identityservice.CatalogRole,
+func (r *RoleRepository) SyncCatalog(ctx context.Context, permissions []core.CatalogPermission,
+	roles []core.CatalogRole,
 ) error {
 	if err := r.q.LockPermissionSync(ctx); err != nil {
 		return wrapErr(err)

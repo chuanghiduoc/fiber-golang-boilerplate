@@ -200,7 +200,3 @@ func (s *emailVerificationService) ResendVerification(ctx context.Context, email
 func (s *emailVerificationService) Invalidate(ctx context.Context, userID uuid.UUID) error {
 	return s.Stores.Verifications.DeleteByUser(ctx, userID)
 }
-
-// EmailVerificationServiceImpl is the concrete verification service, exported
-// for composition and white-box tests outside this package.
-type EmailVerificationServiceImpl = emailVerificationService

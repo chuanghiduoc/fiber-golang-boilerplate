@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/google/uuid"
@@ -14,23 +14,23 @@ import (
 // uniqueTenantsSlug is PostgreSQL's name for the inline slug UNIQUE.
 const uniqueTenantsSlug = "uq_tenants_slug"
 
-// TenantRepository implements service.TenantRepository.
+// TenantRepository implements core.TenantRepository.
 type TenantRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.TenantRepository = (*TenantRepository)(nil)
+var _ core.TenantRepository = (*TenantRepository)(nil)
 
 func NewTenantRepository(db identitysqlc.DBTX) *TenantRepository {
 	return &TenantRepository{q: identitysqlc.New(db)}
 }
 
-func toTenant(row identitysqlc.Tenant) *identityservice.Tenant {
-	return &identityservice.Tenant{
+func toTenant(row identitysqlc.Tenant) *core.Tenant {
+	return &core.Tenant{
 		ID:                  row.ID,
 		Slug:                row.Slug,
 		Name:                row.Name,
-		Status:              identityservice.TenantStatus(row.Status),
+		Status:              core.TenantStatus(row.Status),
 		StatusChangedAt:     row.StatusChangedAt.Time,
 		TrialEndsAt:         database.TimePtr(row.TrialEndsAt),
 		DeletionScheduledAt: database.TimePtr(row.DeletionScheduledAt),
@@ -39,36 +39,36 @@ func toTenant(row identitysqlc.Tenant) *identityservice.Tenant {
 	}
 }
 
-func oneTenant(row identitysqlc.Tenant, err error) (*identityservice.Tenant, error) {
+func oneTenant(row identitysqlc.Tenant, err error) (*core.Tenant, error) {
 	if err != nil {
 		return nil, wrapErr(err)
 	}
 	return toTenant(row), nil
 }
 
-func (r *TenantRepository) GetOperationalBySlug(ctx context.Context, slug string) (*identityservice.Tenant, error) {
+func (r *TenantRepository) GetOperationalBySlug(ctx context.Context, slug string) (*core.Tenant, error) {
 	return oneTenant(r.q.GetOperationalTenantBySlug(ctx, slug))
 }
 
-func (r *TenantRepository) GetOperationalByID(ctx context.Context, id uuid.UUID) (*identityservice.Tenant, error) {
+func (r *TenantRepository) GetOperationalByID(ctx context.Context, id uuid.UUID) (*core.Tenant, error) {
 	return oneTenant(r.q.GetOperationalTenantByID(ctx, id))
 }
 
-func (r *TenantRepository) GetByID(ctx context.Context, id uuid.UUID) (*identityservice.Tenant, error) {
+func (r *TenantRepository) GetByID(ctx context.Context, id uuid.UUID) (*core.Tenant, error) {
 	return oneTenant(r.q.GetTenantByID(ctx, id))
 }
 
-func (r *TenantRepository) GetBySlug(ctx context.Context, slug string) (*identityservice.Tenant, error) {
+func (r *TenantRepository) GetBySlug(ctx context.Context, slug string) (*core.Tenant, error) {
 	return oneTenant(r.q.GetTenantBySlug(ctx, slug))
 }
 
-func (r *TenantRepository) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*identityservice.Tenant, error) {
+func (r *TenantRepository) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*core.Tenant, error) {
 	return oneTenant(r.q.GetTenantByIDForUpdate(ctx, id))
 }
 
 // Create inserts the tenant and its settings row. It needs a transaction
 // for the two inserts to be atomic, so callers use it through Transactor.
-func (r *TenantRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]identityservice.Tenant, error) {
+func (r *TenantRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]core.Tenant, error) {
 	rows, err := r.q.ListTenantsCursor(ctx, identitysqlc.ListTenantsCursorParams{
 		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.IDParam(),
@@ -77,14 +77,14 @@ func (r *TenantRepository) ListCursor(ctx context.Context, cur pagination.DBCurs
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	tenants := make([]identityservice.Tenant, len(rows))
+	tenants := make([]core.Tenant, len(rows))
 	for i := range rows {
 		tenants[i] = *toTenant(rows[i])
 	}
 	return tenants, nil
 }
 
-func (r *TenantRepository) Create(ctx context.Context, t identityservice.NewTenant) (*identityservice.Tenant, error) {
+func (r *TenantRepository) Create(ctx context.Context, t core.NewTenant) (*core.Tenant, error) {
 	row, err := r.q.CreateTenant(ctx, identitysqlc.CreateTenantParams{
 		Slug:        t.Slug,
 		Name:        t.Name,
@@ -93,7 +93,7 @@ func (r *TenantRepository) Create(ctx context.Context, t identityservice.NewTena
 	})
 	if err != nil {
 		if name, ok := uniqueConstraint(err); ok && name == uniqueTenantsSlug {
-			return nil, identityservice.ErrTenantSlugTaken
+			return nil, core.ErrTenantSlugTaken
 		}
 		return nil, wrapErr(err)
 	}
@@ -107,7 +107,7 @@ func (r *TenantRepository) Create(ctx context.Context, t identityservice.NewTena
 	return toTenant(row), nil
 }
 
-func (r *TenantRepository) UpdateStatus(ctx context.Context, id uuid.UUID, status identityservice.TenantStatus, deletionScheduledAt *time.Time) (*identityservice.Tenant, error) {
+func (r *TenantRepository) UpdateStatus(ctx context.Context, id uuid.UUID, status core.TenantStatus, deletionScheduledAt *time.Time) (*core.Tenant, error) {
 	return oneTenant(r.q.UpdateTenantStatus(ctx, identitysqlc.UpdateTenantStatusParams{
 		ID:                  id,
 		Status:              string(status),
@@ -115,16 +115,16 @@ func (r *TenantRepository) UpdateStatus(ctx context.Context, id uuid.UUID, statu
 	}))
 }
 
-func (r *TenantRepository) UpdateName(ctx context.Context, id uuid.UUID, name string) (*identityservice.Tenant, error) {
+func (r *TenantRepository) UpdateName(ctx context.Context, id uuid.UUID, name string) (*core.Tenant, error) {
 	return oneTenant(r.q.UpdateTenantName(ctx, identitysqlc.UpdateTenantNameParams{ID: id, Name: name}))
 }
 
-func (r *TenantRepository) Settings(ctx context.Context, tenantID uuid.UUID) (*identityservice.TenantSettings, error) {
+func (r *TenantRepository) Settings(ctx context.Context, tenantID uuid.UUID) (*core.TenantSettings, error) {
 	row, err := r.q.GetTenantSettings(ctx, tenantID)
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return &identityservice.TenantSettings{TenantID: row.TenantID, Locale: row.Locale, Timezone: row.Timezone}, nil
+	return &core.TenantSettings{TenantID: row.TenantID, Locale: row.Locale, Timezone: row.Timezone}, nil
 }
 
 // TouchIfUnchanged is the optimistic-concurrency gate for the tenants ETag.

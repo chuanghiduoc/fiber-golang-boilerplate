@@ -501,7 +501,7 @@ Tenant status is `trialing | active | suspended | pending_deletion |
 deleted`; only `trialing` and `active` serve requests, and a `trialing` tenant
 stops serving as soon as `trial_ends_at` passes (resolved as not found before
 the hourly job writes `suspended`). Transitions go through
-the identity `TenantService` (`internal/modules/identity/service/tenants.go`),
+the identity `TenantService` (`internal/modules/identity/service/tenancy/tenants.go`),
 which enforces the state machine (`trialing → active | suspended |
 pending_deletion`, `active ↔ suspended`, `active | suspended →
 pending_deletion`, `pending_deletion → suspended | deleted`) and writes a Tier 1

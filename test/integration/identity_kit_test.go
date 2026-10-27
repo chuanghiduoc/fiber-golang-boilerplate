@@ -13,7 +13,9 @@ import (
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/authn"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -28,13 +30,13 @@ const identityKitRefreshTTL = 7 * 24 * time.Hour
 // does, for harnesses that mount individual identity routes. The optional
 // sender doubles as the transactional outbox, exactly like jobs.QueuedSender.
 type identityKit struct {
-	stores   identityservice.Stores
+	stores   core.Stores
 	sessions session.Store
-	users    identityservice.UserService
-	admin    identityservice.AdminUserService
+	users    authn.UserService
+	admin    membership.AdminUserService
 	// verification and resets are nil unless the kit was given a sender.
-	verification identityservice.EmailVerificationService
-	resets       identityservice.PasswordResetService
+	verification authn.EmailVerificationService
+	resets       authn.PasswordResetService
 	auth         *identityhandler.AuthHandler
 	userHandler  *identityhandler.UserHandler
 }
@@ -49,25 +51,25 @@ func newIdentityKit(fx *pgtest.Fixture, appCache cache.Cache, recorder audit.TxR
 	}
 	tx := identityrepo.NewTransactor(fx.Tx(), recorder, outbox, nil, testutil.MustBanHasher())
 	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
-	sign := func(c identityservice.AccessClaims) (string, error) {
+	sign := func(c authn.AccessClaims) (string, error) {
 		return token.GenerateForSession(token.SessionClaims{
 			UserID: c.UserID, TenantID: c.TenantID, SessionID: c.SessionID,
 			TokenVersion: c.TokenVersion,
 		}, secret, 1*time.Hour)
 	}
-	sessionSvc := identityservice.NewSessionService(stores, tx, sign, identityKitRefreshTTL, 720*time.Hour, sessionStore)
+	sessionSvc := authn.NewSessionService(stores, tx, sign, identityKitRefreshTTL, 720*time.Hour, sessionStore)
 
 	kit := &identityKit{stores: stores, sessions: sessionStore}
 	if sender != nil {
-		kit.verification = identityservice.NewEmailVerificationService(identityservice.VerificationDeps{
+		kit.verification = authn.NewEmailVerificationService(authn.VerificationDeps{
 			Stores: stores, Tx: tx, Cache: appCache, FrontendURL: "https://frontend.example.test",
 		})
-		kit.resets = identityservice.NewPasswordResetService(identityservice.ResetDeps{
+		kit.resets = authn.NewPasswordResetService(authn.ResetDeps{
 			Stores: stores, Tx: tx, Cache: appCache,
 			FrontendURL: "https://frontend.example.test", SessionCache: sessionStore,
 		})
 	}
-	kit.users = identityservice.NewUserService(identityservice.UserDeps{
+	kit.users = authn.NewUserService(authn.UserDeps{
 		Stores:       stores,
 		Tx:           tx,
 		Cache:        appCache,
@@ -75,7 +77,7 @@ func newIdentityKit(fx *pgtest.Fixture, appCache cache.Cache, recorder audit.TxR
 		Sessions:     sessionSvc,
 		Verification: kit.verification,
 	})
-	kit.admin = identityservice.NewAdminUserService(stores, tx, sessionStore)
+	kit.admin = membership.NewAdminUserService(stores, tx, sessionStore)
 	kit.auth = identityhandler.NewAuthHandler(identityhandler.AuthDeps{
 		Users:            kit.users,
 		Sessions:         sessionSvc,

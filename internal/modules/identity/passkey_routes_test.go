@@ -18,7 +18,9 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/authn"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/mfa"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
@@ -51,9 +53,9 @@ func (f *fakePasskeyService) BeginRegistration(context.Context, uuid.UUID) (*pro
 	}, nil
 }
 
-func (f *fakePasskeyService) FinishRegistration(_ context.Context, userID uuid.UUID, name string, raw []byte) (*service.Passkey, error) {
+func (f *fakePasskeyService) FinishRegistration(_ context.Context, userID uuid.UUID, name string, raw []byte) (*core.Passkey, error) {
 	f.registrationRaw = raw
-	return &service.Passkey{
+	return &core.Passkey{
 		ID: passkeyRouteID, UserID: userID, Name: name,
 		Transports: []string{"internal"}, CreatedAt: time.Unix(1_700_000_000, 0),
 	}, nil
@@ -64,7 +66,7 @@ func (f *fakePasskeyService) Delete(_ context.Context, _, id uuid.UUID) error {
 	return nil
 }
 
-func (f *fakePasskeyService) List(context.Context, uuid.UUID) ([]service.Passkey, error) {
+func (f *fakePasskeyService) List(context.Context, uuid.UUID) ([]core.Passkey, error) {
 	return nil, nil
 }
 
@@ -76,18 +78,18 @@ func (f *fakePasskeyService) BeginLogin(context.Context, string) (*protocol.Cred
 	}, nil
 }
 
-func (f *fakePasskeyService) FinishLogin(_ context.Context, raw []byte, _ service.Admission) (*service.PasskeyLogin, error) {
+func (f *fakePasskeyService) FinishLogin(_ context.Context, raw []byte, _ authn.Admission) (*mfa.PasskeyLogin, error) {
 	f.loginRaw = raw
-	return &service.PasskeyLogin{
-		Tokens: service.TokenPair{AccessToken: "access", RefreshToken: "refresh", SessionID: passkeyRouteSessionID},
-		Member: &service.Member{
-			User: service.User{ID: passkeyRouteUserID, Email: "passkey@example.com", Name: "Passkey"},
-			Membership: service.Membership{
-				TenantID: passkeyRouteTenantID, UserID: passkeyRouteUserID, Role: service.RoleMember,
-				Status: service.MembershipStatusActive,
+	return &mfa.PasskeyLogin{
+		Tokens: core.TokenPair{AccessToken: "access", RefreshToken: "refresh", SessionID: passkeyRouteSessionID},
+		Member: &core.Member{
+			User: core.User{ID: passkeyRouteUserID, Email: "passkey@example.com", Name: "Passkey"},
+			Membership: core.Membership{
+				TenantID: passkeyRouteTenantID, UserID: passkeyRouteUserID, Role: core.RoleMember,
+				Status: core.MembershipStatusActive,
 			},
 		},
-		Method: service.PasskeyMethodHardware,
+		Method: core.PasskeyMethodHardware,
 	}, nil
 }
 

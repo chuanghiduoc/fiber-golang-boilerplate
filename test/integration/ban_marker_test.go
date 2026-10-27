@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/banhash"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -39,7 +39,7 @@ func TestBanMarker_OldKeyMatchesOnlyWhileItIsAPreviousKey(t *testing.T) {
 	require.NoError(t, err)
 	oldHash, oldKid := oldHasher.Marker(member.Email)
 
-	_, err = repo.Ban(tctx, member.UserID, identityservice.BanMarker{Hash: oldHash, KeyID: oldKid})
+	_, err = repo.Ban(tctx, member.UserID, core.BanMarker{Hash: oldHash, KeyID: oldKid})
 	require.NoError(t, err, "ban under the old key")
 
 	var storedHash []byte
@@ -64,7 +64,7 @@ func TestBanMarker_OldKeyMatchesOnlyWhileItIsAPreviousKey(t *testing.T) {
 
 	counts, err := repo.BannedMarkerCounts(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, counts, identityservice.BanMarkerCount{KeyID: oldKid, Bans: 1})
+	assert.Contains(t, counts, core.BanMarkerCount{KeyID: oldKid, Bans: 1})
 }
 
 // A ban written after the rotation records the active key, and the startup
@@ -84,7 +84,7 @@ func TestBanMarker_NewBanRecordsTheActiveKey(t *testing.T) {
 	require.NoError(t, err)
 	hash, kid := rotated.Marker(member.Email)
 
-	_, err = repo.Ban(tctx, member.UserID, identityservice.BanMarker{Hash: hash, KeyID: kid})
+	_, err = repo.Ban(tctx, member.UserID, core.BanMarker{Hash: hash, KeyID: kid})
 	require.NoError(t, err)
 
 	var storedKid string

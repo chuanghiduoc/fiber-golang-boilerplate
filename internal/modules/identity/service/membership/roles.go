@@ -389,11 +389,3 @@ func roleEvent(ctx context.Context, action string, role *Role, metadata map[stri
 	event.Metadata = metadata
 	return event
 }
-
-// RoleServiceImpl is the concrete role service, exported for composition and
-// white-box tests outside this package.
-type RoleServiceImpl = roleService
-
-func AuthorizeGrant(ctx context.Context, permissions []string) error {
-	return authorizeGrant(ctx, permissions)
-}

@@ -8,7 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -16,23 +16,23 @@ import (
 	"github.com/google/uuid"
 )
 
-// DataExportRepository implements service.DataExportRepository over sqlc.
+// DataExportRepository implements core.DataExportRepository over sqlc.
 type DataExportRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.DataExportRepository = (*DataExportRepository)(nil)
+var _ core.DataExportRepository = (*DataExportRepository)(nil)
 
 func NewDataExportRepository(db identitysqlc.DBTX) *DataExportRepository {
 	return &DataExportRepository{q: identitysqlc.New(db)}
 }
 
-func toDataExport(row identitysqlc.DataExport) identityservice.DataExport {
-	return identityservice.DataExport{
+func toDataExport(row identitysqlc.DataExport) core.DataExport {
+	return core.DataExport{
 		ID:          row.ID,
 		TenantID:    row.TenantID,
 		UserID:      row.UserID,
-		Status:      identityservice.DataExportStatus(row.Status),
+		Status:      core.DataExportStatus(row.Status),
 		StoragePath: row.StoragePath.String,
 		ExpiresAt:   database.TimePtr(row.ExpiresAt),
 		CreatedAt:   row.CreatedAt.Time,
@@ -40,7 +40,7 @@ func toDataExport(row identitysqlc.DataExport) identityservice.DataExport {
 	}
 }
 
-func (r *DataExportRepository) Create(ctx context.Context, userID uuid.UUID) (*identityservice.DataExport, error) {
+func (r *DataExportRepository) Create(ctx context.Context, userID uuid.UUID) (*core.DataExport, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -51,7 +51,7 @@ func (r *DataExportRepository) Create(ctx context.Context, userID uuid.UUID) (*i
 	})
 	if err != nil {
 		if _, ok := uniqueConstraint(err); ok {
-			return nil, identityservice.ErrDataExportInProgress
+			return nil, core.ErrDataExportInProgress
 		}
 		return nil, wrapErr(err)
 	}
@@ -59,7 +59,7 @@ func (r *DataExportRepository) Create(ctx context.Context, userID uuid.UUID) (*i
 	return &export, nil
 }
 
-func (r *DataExportRepository) Get(ctx context.Context, userID, id uuid.UUID) (*identityservice.DataExport, error) {
+func (r *DataExportRepository) Get(ctx context.Context, userID, id uuid.UUID) (*core.DataExport, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -76,7 +76,7 @@ func (r *DataExportRepository) Get(ctx context.Context, userID, id uuid.UUID) (*
 	return &export, nil
 }
 
-func (r *DataExportRepository) ListForUser(ctx context.Context, userID uuid.UUID) ([]identityservice.DataExport, error) {
+func (r *DataExportRepository) ListForUser(ctx context.Context, userID uuid.UUID) ([]core.DataExport, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -88,14 +88,14 @@ func (r *DataExportRepository) ListForUser(ctx context.Context, userID uuid.UUID
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	exports := make([]identityservice.DataExport, len(rows))
+	exports := make([]core.DataExport, len(rows))
 	for i := range rows {
 		exports[i] = toDataExport(rows[i])
 	}
 	return exports, nil
 }
 
-func (r *DataExportRepository) ListCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]identityservice.DataExport, error) {
+func (r *DataExportRepository) ListCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]core.DataExport, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -110,7 +110,7 @@ func (r *DataExportRepository) ListCursor(ctx context.Context, userID uuid.UUID,
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	exports := make([]identityservice.DataExport, len(rows))
+	exports := make([]core.DataExport, len(rows))
 	for i := range rows {
 		exports[i] = toDataExport(rows[i])
 	}
@@ -157,7 +157,7 @@ func (r *DataExportRepository) MarkFailed(ctx context.Context, userID, id uuid.U
 	}))
 }
 
-func (r *DataExportRepository) ExpireForUser(ctx context.Context, userID uuid.UUID) ([]identityservice.DataExport, error) {
+func (r *DataExportRepository) ExpireForUser(ctx context.Context, userID uuid.UUID) ([]core.DataExport, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -169,7 +169,7 @@ func (r *DataExportRepository) ExpireForUser(ctx context.Context, userID uuid.UU
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	exports := make([]identityservice.DataExport, len(rows))
+	exports := make([]core.DataExport, len(rows))
 	for i := range rows {
 		exports[i] = toDataExport(rows[i])
 	}
@@ -187,13 +187,13 @@ func (r *DataExportRepository) DeleteForUser(ctx context.Context, userID uuid.UU
 	}))
 }
 
-func (r *DataExportRepository) Purgeable(ctx context.Context, limit int32) ([]identityservice.DataExport, error) {
+func (r *DataExportRepository) Purgeable(ctx context.Context, limit int32) ([]core.DataExport, error) {
 	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	rows, err := r.q.ListPurgeableDataExports(ctx, limit)
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	exports := make([]identityservice.DataExport, len(rows))
+	exports := make([]core.DataExport, len(rows))
 	for i := range rows {
 		exports[i] = toDataExport(rows[i])
 	}
@@ -205,7 +205,7 @@ func (r *DataExportRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	return wrapErr(r.q.DeleteDataExport(ctx, id))
 }
 
-func (r *DataExportRepository) ListSessions(ctx context.Context, userID uuid.UUID) ([]identityservice.Session, error) {
+func (r *DataExportRepository) ListSessions(ctx context.Context, userID uuid.UUID) ([]core.Session, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -217,14 +217,14 @@ func (r *DataExportRepository) ListSessions(ctx context.Context, userID uuid.UUI
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	sessions := make([]identityservice.Session, len(rows))
+	sessions := make([]core.Session, len(rows))
 	for i := range rows {
 		sessions[i] = toSession(rows[i])
 	}
 	return sessions, nil
 }
 
-func (r *DataExportRepository) AnonymizeUser(ctx context.Context, userID uuid.UUID, email string) (*identityservice.User, error) {
+func (r *DataExportRepository) AnonymizeUser(ctx context.Context, userID uuid.UUID, email string) (*core.User, error) {
 	row, err := r.q.AnonymizeUser(ctx, identitysqlc.AnonymizeUserParams{Email: email, ID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

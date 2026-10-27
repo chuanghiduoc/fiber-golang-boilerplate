@@ -2,13 +2,13 @@ package handler
 
 import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 )
 
 // toUserResponse maps a member of the request tenant to the API shape. Role,
 // ban, and join time come from the membership; identity fields from the
 // global user. DeletedAt is the membership removal or the account deletion.
-func toUserResponse(member *service.Member) dto.UserResponse {
+func toUserResponse(member *core.Member) dto.UserResponse {
 	user, membership := member.User, member.Membership
 	return dto.UserResponse{
 		ID:               user.ID,
@@ -29,7 +29,7 @@ func toUserResponse(member *service.Member) dto.UserResponse {
 	}
 }
 
-func toUserResponses(members []service.Member) []dto.UserResponse {
+func toUserResponses(members []core.Member) []dto.UserResponse {
 	out := make([]dto.UserResponse, len(members))
 	for i := range members {
 		out[i] = toUserResponse(&members[i])

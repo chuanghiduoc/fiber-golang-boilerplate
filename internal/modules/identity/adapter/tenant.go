@@ -3,19 +3,19 @@ package adapter
 import (
 	"context"
 
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
 // TenantResolver adapts the identity tenant repository to tenant.Resolver.
 // Only operational (trialing or active) tenants resolve.
 type TenantResolver struct {
-	repo identityservice.TenantRepository
+	repo core.TenantRepository
 }
 
 var _ tenant.Resolver = (*TenantResolver)(nil)
 
-func NewTenantResolver(repo identityservice.TenantRepository) *TenantResolver {
+func NewTenantResolver(repo core.TenantRepository) *TenantResolver {
 	return &TenantResolver{repo: repo}
 }
 

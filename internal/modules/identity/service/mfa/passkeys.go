@@ -673,9 +673,5 @@ func passkeyTransports(raw []protocol.AuthenticatorTransport) []string {
 	return out
 }
 
-// PasskeyServiceImpl is the concrete passkey service, exported for composition
-// and white-box tests outside this package.
-type PasskeyServiceImpl = passkeyService
-
 // PasskeyUserID is the stable WebAuthn user handle for a user id.
 func PasskeyUserID(id uuid.UUID) []byte { return passkeyUserID(id) }

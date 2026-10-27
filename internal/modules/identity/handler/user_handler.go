@@ -5,19 +5,36 @@ import (
 	"log/slog"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/authn"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/patch"
 	"github.com/google/uuid"
 )
 
-type UserHandler struct {
-	service       service.UserService
-	emailVerifSvc service.EmailVerificationService
+// AccountUsers is the profile and credential surface the user handlers use.
+// *authn.UserService implements it.
+type AccountUsers interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*core.Member, error)
+	Update(ctx context.Context, id uuid.UUID, req authn.UpdateProfileInput) (*core.Member, error)
+	VerifyPassword(ctx context.Context, userID uuid.UUID, password string) error
+	ChangePassword(ctx context.Context, userID uuid.UUID, req authn.ChangePasswordInput) error
 }
 
-func NewUserHandler(svc service.UserService, emailVerif ...service.EmailVerificationService) *UserHandler {
+// AccountVerification is the verification surface the user handlers use.
+// *authn.EmailVerificationService implements it.
+type AccountVerification interface {
+	Invalidate(ctx context.Context, userID uuid.UUID) error
+	SendVerification(ctx context.Context, userID uuid.UUID, userEmail string) error
+}
+
+type UserHandler struct {
+	service       AccountUsers
+	emailVerifSvc AccountVerification
+}
+
+func NewUserHandler(svc AccountUsers, emailVerif ...AccountVerification) *UserHandler {
 	h := &UserHandler{service: svc}
 	if len(emailVerif) > 0 {
 		h.emailVerifSvc = emailVerif[0]
@@ -81,7 +98,7 @@ func (h *UserHandler) UpdateMe(ctx context.Context, input *updateProfileInput) (
 		return nil, err
 	}
 
-	member, err := h.service.Update(ctx, actorID(ctx), service.UpdateProfileInput{Name: name, Email: email})
+	member, err := h.service.Update(ctx, actorID(ctx), authn.UpdateProfileInput{Name: name, Email: email})
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +117,7 @@ func (h *UserHandler) requirePasswordForEmailChange(ctx context.Context, userID 
 	if err != nil {
 		return false, err
 	}
-	if service.NormalizeEmail(*email) == service.NormalizeEmail(current.User.Email) {
+	if core.NormalizeEmail(*email) == core.NormalizeEmail(current.User.Email) {
 		return false, nil
 	}
 	if !current.User.HasPassword {
@@ -117,7 +134,7 @@ func (h *UserHandler) requirePasswordForEmailChange(ctx context.Context, userID 
 
 // sendVerificationAfterEmailChange invalidates tokens sent to the old address
 // and sends a fresh verification link to the new one.
-func (h *UserHandler) sendVerificationAfterEmailChange(ctx context.Context, member *service.Member, emailChanged bool) {
+func (h *UserHandler) sendVerificationAfterEmailChange(ctx context.Context, member *core.Member, emailChanged bool) {
 	if !emailChanged || member.User.EmailVerified() || h.emailVerifSvc == nil {
 		return
 	}
@@ -138,10 +155,10 @@ func (h *UserHandler) ChangePassword(ctx context.Context, input *changePasswordI
 	if err != nil {
 		return nil, err
 	}
-	if err := service.ValidatePasswordForEmail(input.Body.NewPassword, member.User.Email, "newPassword"); err != nil {
+	if err := core.ValidatePasswordForEmail(input.Body.NewPassword, member.User.Email, "newPassword"); err != nil {
 		return nil, err
 	}
-	if err := h.service.ChangePassword(withClientMetadata(ctx), actorID(ctx), service.ChangePasswordInput{
+	if err := h.service.ChangePassword(withClientMetadata(ctx), actorID(ctx), authn.ChangePasswordInput{
 		CurrentPassword: input.Body.CurrentPassword,
 		NewPassword:     input.Body.NewPassword,
 	}); err != nil {

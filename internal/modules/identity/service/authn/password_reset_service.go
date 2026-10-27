@@ -337,7 +337,3 @@ func consumeResetToken(ctx context.Context, st Stores, tokenHash []byte) (*User,
 	}
 	return user, nil
 }
-
-// PasswordResetServiceImpl is the concrete reset service, exported for
-// composition and white-box tests outside this package.
-type PasswordResetServiceImpl = passwordResetService

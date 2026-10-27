@@ -7,7 +7,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
@@ -17,8 +17,8 @@ import (
 
 // NewStores binds every identity repository to db (the pool, or a pgx.Tx). A
 // ban hasher may be supplied; the ban paths fail loudly when one is missing.
-func NewStores(db identitysqlc.DBTX, bans ...identityservice.BanHasher) identityservice.Stores {
-	stores := identityservice.Stores{
+func NewStores(db identitysqlc.DBTX, bans ...core.BanHasher) core.Stores {
+	stores := core.Stores{
 		Users:         NewUserRepository(db),
 		Memberships:   NewMembershipRepository(db),
 		Sessions:      NewSessionRepository(db),
@@ -44,7 +44,7 @@ type TxEmailSender interface {
 	SendTx(ctx context.Context, tx pgx.Tx, msg email.Message) error
 }
 
-// Transactor implements service.Transactor: InTx binds the identity stores,
+// Transactor implements core.Transactor: InTx binds the identity stores,
 // the Tier 1 audit recorder, the event publisher, and the email outbox to one
 // pgx transaction, so services never see pgx.Tx.
 type Transactor struct {
@@ -53,13 +53,13 @@ type Transactor struct {
 	mail      TxEmailSender
 	bus       *events.Bus
 	queue     *jobs.Queue
-	bans      identityservice.BanHasher
+	bans      core.BanHasher
 }
 
-var _ identityservice.Transactor = (*Transactor)(nil)
+var _ core.Transactor = (*Transactor)(nil)
 
 // NewTransactor wires the transaction-bound collaborators without a job queue.
-func NewTransactor(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus, bans ...identityservice.BanHasher) *Transactor {
+func NewTransactor(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus, bans ...core.BanHasher) *Transactor {
 	return NewTransactorWithQueue(txManager, recorder, mail, bus, nil, bans...)
 }
 
@@ -69,7 +69,7 @@ func NewTransactor(txManager *database.TxManager, recorder audit.TxRecorder, mai
 // publishes nothing. The
 // ban hasher is propagated to every transaction's stores so a ban mutation can
 // compute its keyed marker on the same connection.
-func NewTransactorWithQueue(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus, queue *jobs.Queue, bans ...identityservice.BanHasher) *Transactor {
+func NewTransactorWithQueue(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus, queue *jobs.Queue, bans ...core.BanHasher) *Transactor {
 	t := &Transactor{txManager: txManager, audit: recorder, mail: mail, bus: bus, queue: queue}
 	if len(bans) > 0 {
 		t.bans = bans[0]
@@ -77,10 +77,10 @@ func NewTransactorWithQueue(txManager *database.TxManager, recorder audit.TxReco
 	return t
 }
 
-func (t *Transactor) InTx(ctx context.Context, fn func(ctx context.Context, tx identityservice.TxRepos) error) error {
+func (t *Transactor) InTx(ctx context.Context, fn func(ctx context.Context, tx core.TxRepos) error) error {
 	var afterCommit []func()
 	err := t.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-		repos := identityservice.TxRepos{
+		repos := core.TxRepos{
 			Stores: NewStores(tx, t.bans),
 			Audit:  txAudit{recorder: t.audit, tx: tx},
 			Events: txEvents{bus: t.bus, tx: tx},
