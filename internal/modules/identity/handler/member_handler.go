@@ -7,7 +7,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -15,22 +16,29 @@ import (
 
 // MemberAdminService is the identity member-administration surface. The
 // concrete *service.adminUserService implements it through
-// service.AdminUserService.
+// membership.AdminUserService.
 type MemberAdminService interface {
-	ListMembers(ctx context.Context, limit int, startingAfter, status, role string) ([]service.Member, bool, error)
-	GetMember(ctx context.Context, id uuid.UUID) (*service.Member, error)
-	UpdateMember(ctx context.Context, id uuid.UUID, update service.MemberUpdate) (*service.Member, error)
-	GetUserStats(ctx context.Context) (service.UserStats, error)
+	ListMembers(ctx context.Context, limit int, startingAfter, status, role string) ([]core.Member, bool, error)
+	GetMember(ctx context.Context, id uuid.UUID) (*core.Member, error)
+	UpdateMember(ctx context.Context, id uuid.UUID, update membership.MemberUpdate) (*core.Member, error)
+	GetUserStats(ctx context.Context) (membership.UserStats, error)
+}
+
+// MemberProfiles is the profile surface the member handlers use.
+// *authn.UserService implements it.
+type MemberProfiles interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*core.Member, error)
+	RemoveMember(ctx context.Context, id uuid.UUID) error
 }
 
 // MemberHandler serves tenant membership administration and statistics.
 type MemberHandler struct {
 	members MemberAdminService
-	users   service.UserService
+	users   MemberProfiles
 	roles   RoleLookup
 }
 
-func NewMemberHandler(members MemberAdminService, users service.UserService, roles RoleLookup) *MemberHandler {
+func NewMemberHandler(members MemberAdminService, users MemberProfiles, roles RoleLookup) *MemberHandler {
 	return &MemberHandler{members: members, users: users, roles: roles}
 }
 
@@ -99,7 +107,7 @@ func (h *MemberHandler) Update(ctx context.Context, input *updateMemberInput) (*
 	if err := decodeMergePatch(input.RawBody, &req); err != nil {
 		return nil, err
 	}
-	update := service.MemberUpdate{}
+	update := membership.MemberUpdate{}
 	if input.IfMatch != "" {
 		update.ExpectedUpdatedAt = current.UpdatedAt()
 	}

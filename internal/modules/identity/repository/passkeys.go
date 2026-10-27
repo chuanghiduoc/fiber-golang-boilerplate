@@ -4,7 +4,7 @@ import (
 	"context"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/google/uuid"
 )
@@ -13,20 +13,20 @@ import (
 // credential id globally single-use.
 const uniquePasskeyCredentialID = "uq_webauthn_credentials_credential_id"
 
-// PasskeyRepository implements service.PasskeyRepository. Passkeys are per
+// PasskeyRepository implements core.PasskeyRepository. Passkeys are per
 // global user, so no query takes a tenant.
 type PasskeyRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.PasskeyRepository = (*PasskeyRepository)(nil)
+var _ core.PasskeyRepository = (*PasskeyRepository)(nil)
 
 func NewPasskeyRepository(db identitysqlc.DBTX) *PasskeyRepository {
 	return &PasskeyRepository{q: identitysqlc.New(db)}
 }
 
-func toPasskey(row identitysqlc.WebauthnCredential) *identityservice.Passkey {
-	return &identityservice.Passkey{
+func toPasskey(row identitysqlc.WebauthnCredential) *core.Passkey {
+	return &core.Passkey{
 		ID:             row.ID,
 		UserID:         row.UserID,
 		CredentialID:   row.CredentialID,
@@ -43,7 +43,7 @@ func toPasskey(row identitysqlc.WebauthnCredential) *identityservice.Passkey {
 	}
 }
 
-func (r *PasskeyRepository) Create(ctx context.Context, passkey identityservice.Passkey) (*identityservice.Passkey, error) {
+func (r *PasskeyRepository) Create(ctx context.Context, passkey core.Passkey) (*core.Passkey, error) {
 	row, err := r.q.CreatePasskey(ctx, identitysqlc.CreatePasskeyParams{
 		UserID:         passkey.UserID,
 		CredentialID:   passkey.CredentialID,
@@ -57,26 +57,26 @@ func (r *PasskeyRepository) Create(ctx context.Context, passkey identityservice.
 	})
 	if err != nil {
 		if name, ok := uniqueConstraint(err); ok && name == uniquePasskeyCredentialID {
-			return nil, identityservice.ErrPasskeyAlreadyRegistered
+			return nil, core.ErrPasskeyAlreadyRegistered
 		}
 		return nil, wrapErr(err)
 	}
 	return toPasskey(row), nil
 }
 
-func (r *PasskeyRepository) ListByUser(ctx context.Context, userID uuid.UUID) ([]identityservice.Passkey, error) {
+func (r *PasskeyRepository) ListByUser(ctx context.Context, userID uuid.UUID) ([]core.Passkey, error) {
 	rows, err := r.q.ListPasskeysByUser(ctx, userID)
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	out := make([]identityservice.Passkey, len(rows))
+	out := make([]core.Passkey, len(rows))
 	for i, row := range rows {
 		out[i] = *toPasskey(row)
 	}
 	return out, nil
 }
 
-func (r *PasskeyRepository) GetByCredentialID(ctx context.Context, credentialID []byte) (*identityservice.Passkey, error) {
+func (r *PasskeyRepository) GetByCredentialID(ctx context.Context, credentialID []byte) (*core.Passkey, error) {
 	row, err := r.q.GetPasskeyByCredentialID(ctx, credentialID)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -84,7 +84,7 @@ func (r *PasskeyRepository) GetByCredentialID(ctx context.Context, credentialID 
 	return toPasskey(row), nil
 }
 
-func (r *PasskeyRepository) Get(ctx context.Context, userID, id uuid.UUID) (*identityservice.Passkey, error) {
+func (r *PasskeyRepository) Get(ctx context.Context, userID, id uuid.UUID) (*core.Passkey, error) {
 	row, err := r.q.GetPasskey(ctx, identitysqlc.GetPasskeyParams{UserID: userID, ID: id})
 	if err != nil {
 		return nil, wrapErr(err)

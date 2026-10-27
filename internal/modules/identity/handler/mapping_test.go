@@ -7,20 +7,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 )
 
 func TestToUserResponse_MapsMembership(t *testing.T) {
 	joined := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	removed := joined.Add(time.Hour)
-	resp := toUserResponse(&service.Member{
-		User: service.User{ID: testID(7), Email: "m@example.com", Name: "M", Status: service.UserStatusActive, HasPassword: true,
+	resp := toUserResponse(&core.Member{
+		User: core.User{ID: testID(7), Email: "m@example.com", Name: "M", Status: core.UserStatusActive, HasPassword: true,
 			CreatedAt: joined.Add(-time.Hour), UpdatedAt: joined},
-		Membership: service.Membership{TenantID: testID(3), UserID: testID(7), Role: service.RoleAdmin, Status: service.MembershipStatusRemoved,
+		Membership: core.Membership{TenantID: testID(3), UserID: testID(7), Role: core.RoleAdmin, Status: core.MembershipStatusRemoved,
 			RemovedAt: &removed, CreatedAt: joined, UpdatedAt: removed},
 	})
 	assert.Equal(t, testID(3), resp.TenantID)
-	assert.Equal(t, service.RoleAdmin, resp.Role)
+	assert.Equal(t, core.RoleAdmin, resp.Role)
 	assert.Equal(t, "removed", resp.MembershipStatus)
 	assert.Equal(t, joined, resp.JoinedAt)
 	assert.Equal(t, removed, resp.UpdatedAt, "the later of the user/membership updates")

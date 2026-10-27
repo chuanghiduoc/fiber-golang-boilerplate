@@ -8,7 +8,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/authn"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/patch"
@@ -16,13 +18,13 @@ import (
 )
 
 type updateProfileUsers struct {
-	service.UserService
-	member   *service.Member
+	authn.UserService
+	member   *core.Member
 	password string
-	updated  service.UpdateProfileInput
+	updated  authn.UpdateProfileInput
 }
 
-func (s *updateProfileUsers) GetByID(context.Context, uuid.UUID) (*service.Member, error) {
+func (s *updateProfileUsers) GetByID(context.Context, uuid.UUID) (*core.Member, error) {
 	return s.member, nil
 }
 
@@ -33,7 +35,7 @@ func (s *updateProfileUsers) VerifyPassword(_ context.Context, _ uuid.UUID, pass
 	return nil
 }
 
-func (s *updateProfileUsers) Update(_ context.Context, _ uuid.UUID, in service.UpdateProfileInput) (*service.Member, error) {
+func (s *updateProfileUsers) Update(_ context.Context, _ uuid.UUID, in authn.UpdateProfileInput) (*core.Member, error) {
 	s.updated = in
 	return s.member, nil
 }
@@ -45,7 +47,7 @@ func profileTestContext(userID uuid.UUID) context.Context {
 func TestUpdateMe_MergePatchAppliesOnlyPresentMembers(t *testing.T) {
 	userID := testID(1)
 	users := &updateProfileUsers{
-		member:   &service.Member{User: service.User{ID: userID, Email: "old@example.com", Name: "Old"}},
+		member:   &core.Member{User: core.User{ID: userID, Email: "old@example.com", Name: "Old"}},
 		password: handlerTestPassword,
 	}
 	handler := NewUserHandler(users)
@@ -62,7 +64,7 @@ func TestUpdateMe_MergePatchAppliesOnlyPresentMembers(t *testing.T) {
 func TestUpdateMe_EmailChangeRequiresCurrentPassword(t *testing.T) {
 	userID := testID(1)
 	users := &updateProfileUsers{
-		member:   &service.Member{User: service.User{ID: userID, Email: "old@example.com", Name: "Old", HasPassword: true}},
+		member:   &core.Member{User: core.User{ID: userID, Email: "old@example.com", Name: "Old", HasPassword: true}},
 		password: handlerTestPassword,
 	}
 	handler := NewUserHandler(users)
@@ -85,7 +87,7 @@ func TestUpdateMe_EmailChangeRequiresCurrentPassword(t *testing.T) {
 
 func TestUpdateMe_ExplicitNullIsRejected(t *testing.T) {
 	userID := testID(1)
-	handler := NewUserHandler(&updateProfileUsers{member: &service.Member{User: service.User{ID: userID}}})
+	handler := NewUserHandler(&updateProfileUsers{member: &core.Member{User: core.User{ID: userID}}})
 	_, err := handler.UpdateMe(profileTestContext(userID), &updateProfileInput{RawBody: []byte(`{"name":null}`)})
 	require.Error(t, err)
 	var appErr *apperror.AppError
@@ -94,17 +96,17 @@ func TestUpdateMe_ExplicitNullIsRejected(t *testing.T) {
 }
 
 type roleTestService struct {
-	service.RoleService
-	role       *service.Role
+	membership.RoleService
+	role       *core.Role
 	updated    bool
-	lastUpdate service.RoleUpdate
+	lastUpdate core.RoleUpdate
 }
 
-func (s *roleTestService) Get(context.Context, uuid.UUID) (*service.Role, error) {
+func (s *roleTestService) Get(context.Context, uuid.UUID) (*core.Role, error) {
 	return s.role, nil
 }
 
-func (s *roleTestService) Update(_ context.Context, _ uuid.UUID, in service.RoleUpdate) (*service.Role, error) {
+func (s *roleTestService) Update(_ context.Context, _ uuid.UUID, in core.RoleUpdate) (*core.Role, error) {
 	s.updated = true
 	s.lastUpdate = in
 	role := *s.role
@@ -120,7 +122,7 @@ func (s *roleTestService) Update(_ context.Context, _ uuid.UUID, in service.Role
 
 func TestUpdateRole_StaleIfMatchReturnsPreconditionFailed(t *testing.T) {
 	updatedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	roles := &roleTestService{role: &service.Role{ID: testID(9), Key: "auditor", Name: "Auditor", UpdatedAt: updatedAt}}
+	roles := &roleTestService{role: &core.Role{ID: testID(9), Key: "auditor", Name: "Auditor", UpdatedAt: updatedAt}}
 	handler := NewRoleHandler(roles)
 
 	_, err := handler.UpdateRole(context.Background(), &updateRoleInput{
@@ -137,7 +139,7 @@ func TestUpdateRole_StaleIfMatchReturnsPreconditionFailed(t *testing.T) {
 
 func TestUpdateRole_CurrentIfMatchAppliesPatch(t *testing.T) {
 	updatedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	roles := &roleTestService{role: &service.Role{ID: testID(9), Key: "auditor", Name: "Auditor", UpdatedAt: updatedAt}}
+	roles := &roleTestService{role: &core.Role{ID: testID(9), Key: "auditor", Name: "Auditor", UpdatedAt: updatedAt}}
 	handler := NewRoleHandler(roles)
 
 	out, err := handler.UpdateRole(context.Background(), &updateRoleInput{
@@ -151,7 +153,7 @@ func TestUpdateRole_CurrentIfMatchAppliesPatch(t *testing.T) {
 }
 
 func TestUpdateRole_ExplicitNullPermissionsClearsThem(t *testing.T) {
-	roles := &roleTestService{role: &service.Role{ID: testID(9), Key: "auditor", Name: "Auditor", Permissions: []string{"profile:read"}}}
+	roles := &roleTestService{role: &core.Role{ID: testID(9), Key: "auditor", Name: "Auditor", Permissions: []string{"profile:read"}}}
 	handler := NewRoleHandler(roles)
 	_, err := handler.UpdateRole(context.Background(), &updateRoleInput{
 		RoleID:  testID(9).String(),

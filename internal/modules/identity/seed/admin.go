@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -31,7 +31,7 @@ import (
 // The optional tenant ID selects the tenant of the admin membership. Callers
 // pass the configured default tenant; when omitted, the seeded default tenant
 // (id 1, slug "default") is used.
-func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.Stores, tx identityservice.Transactor, tenantIDs ...uuid.UUID) error {
+func Admin(ctx context.Context, cfg config.AdminConfig, stores core.Stores, tx core.Transactor, tenantIDs ...uuid.UUID) error {
 	if cfg.Email == "" || cfg.Password == "" {
 		slog.Debug("ADMIN_EMAIL or ADMIN_PASSWORD not set, skipping admin seed")
 		return nil
@@ -45,7 +45,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.S
 	// request subject, so mark it for any authz.Authorize on this path.
 	ctx = authz.SystemContext(tenant.WithID(ctx, tenantID))
 
-	email := identityservice.NormalizeEmail(cfg.Email)
+	email := core.NormalizeEmail(cfg.Email)
 	name := strings.TrimSpace(cfg.Name)
 	if name == "" {
 		name = "Admin"
@@ -68,26 +68,26 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.S
 		return nil
 	}
 
-	hash, err := identityservice.HashPassword(cfg.Password)
+	hash, err := core.HashPassword(cfg.Password)
 	if err != nil {
 		return fmt.Errorf("hash admin password: %w", err)
 	}
-	err = tx.InTx(ctx, func(ctx context.Context, tx identityservice.TxRepos) error {
-		user, err := tx.Users.Create(ctx, identityservice.NewUser{Email: email, Name: name, EmailVerified: true})
+	err = tx.InTx(ctx, func(ctx context.Context, tx core.TxRepos) error {
+		user, err := tx.Users.Create(ctx, core.NewUser{Email: email, Name: name, EmailVerified: true})
 		if err != nil {
 			return err
 		}
 		if err := tx.Users.CreatePassword(ctx, user.ID, hash); err != nil {
 			return err
 		}
-		if _, err = tx.Memberships.Create(ctx, user.ID, identityservice.RoleOwner); err != nil {
+		if _, err = tx.Memberships.Create(ctx, user.ID, core.RoleOwner); err != nil {
 			return err
 		}
 		return tx.Roles.AssignPlatformRole(ctx, user.ID, authz.RolePlatformAdmin)
 	})
 	if err != nil {
 		// Another concurrent seeder may have won the race; its row decides.
-		if errors.Is(err, identityservice.ErrEmailTaken) {
+		if errors.Is(err, core.ErrEmailTaken) {
 			if winner, lookupErr := stores.Users.GetByEmail(ctx, email); lookupErr == nil {
 				return keepExisting(ctx, stores, winner, tenantID)
 			}
@@ -102,7 +102,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.S
 // keepExisting leaves an existing account untouched unless it is already an
 // active admin member whose email is unverified (a pre-hardening seed), which
 // is repaired.
-func keepExisting(ctx context.Context, stores identityservice.Stores, user *identityservice.User, tenantID uuid.UUID) error {
+func keepExisting(ctx context.Context, stores core.Stores, user *core.User, tenantID uuid.UUID) error {
 	member, err := stores.Memberships.Get(ctx, user.ID)
 	switch {
 	case errors.Is(err, apperror.ErrNotFound):
@@ -112,7 +112,7 @@ func keepExisting(ctx context.Context, stores identityservice.Stores, user *iden
 	case err != nil:
 		return fmt.Errorf("look up admin membership: %w", err)
 	}
-	if !member.Active() || member.Membership.Role != identityservice.RoleOwner {
+	if !member.Active() || member.Membership.Role != core.RoleOwner {
 		slog.Warn("ADMIN_EMAIL belongs to a member that is not an active owner; skipping admin seed (accounts are never promoted or restored)",
 			slog.String("email", user.Email),
 			slog.String("tenant_id", tenantID.String()),

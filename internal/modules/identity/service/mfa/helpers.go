@@ -24,12 +24,6 @@ func clearLoginAttempts(ctx context.Context, store cache.Cache, email string) {
 }
 func accountNotActive() error { return core.AccountNotActive() }
 
-func NewRecoveryCodes() (plain []string, hashes [][]byte, err error) {
-	return newRecoveryCodes()
-}
-
-func NormalizeRecoveryCode(code string) string { return normalizeRecoveryCode(code) }
-
 func cleanupStaleSessions(ctx context.Context, sessions SessionRepository, userID uuid.UUID, why RevokeReason) {
 	authn.CleanupStaleSessions(ctx, sessions, userID, why)
 }

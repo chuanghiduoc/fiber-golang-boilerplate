@@ -287,7 +287,7 @@ erDiagram
     }
 ```
 
-- **Tenant lifecycle** (enforced by `identity/service/tenants.go`; the
+- **Tenant lifecycle** (enforced by `identity/service/tenancy/tenants.go`; the
   timestamps each state needs are pinned by `CHECK`s): `trialing → active |
   suspended | pending_deletion`, `active → suspended | pending_deletion`,
   `suspended → active | pending_deletion`, `pending_deletion → suspended

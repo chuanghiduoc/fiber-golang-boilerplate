@@ -857,7 +857,3 @@ func newRecoveryCodes() (plain []string, hashes [][]byte, err error) {
 func normalizeRecoveryCode(code string) string {
 	return strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(strings.TrimSpace(code)))
 }
-
-// MFAServiceImpl is the concrete MFA service, exported for composition and
-// white-box tests outside this package.
-type MFAServiceImpl = mfaService

@@ -18,7 +18,8 @@ import (
 	apikeyservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -31,7 +32,7 @@ import (
 type ownerLockHarness struct {
 	pool     *pgxpool.Pool
 	keys     apikeyservice.Service
-	admin    identityservice.AdminUserService
+	admin    membership.AdminUserService
 	verifier *apikey.Verifier
 	owner    uuid.UUID
 }
@@ -57,7 +58,7 @@ func setupOwnerLockHarness(t *testing.T) *ownerLockHarness {
 	return &ownerLockHarness{
 		pool:     pool,
 		keys:     apikeyservice.NewService(keyRepo, principals, nil, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principals), authz.NewAuthorizer(integrationCatalogs().Permissions), 8760*time.Hour),
-		admin:    identityservice.NewAdminUserService(stores, identityrepo.NewTransactor(txManager, audit.Noop{}, nil, nil, testutil.BanHasher(t)), nil),
+		admin:    membership.NewAdminUserService(stores, identityrepo.NewTransactor(txManager, audit.Noop{}, nil, nil, testutil.BanHasher(t)), nil),
 		verifier: apikey.NewVerifier(apikeyadapter.NewVerifierStore(keyRepo), principals),
 		owner:    owner,
 	}
@@ -142,7 +143,7 @@ func TestAPIKeyCreatedDuringBanStaysRevokedAfterUnban(t *testing.T) {
 
 	banned := make(chan error, 1)
 	go func() {
-		_, banErr := identityrepo.NewMembershipRepository(banTx).Ban(ctx, h.owner, identityservice.BanMarker{Hash: banHash, KeyID: banKid})
+		_, banErr := identityrepo.NewMembershipRepository(banTx).Ban(ctx, h.owner, core.BanMarker{Hash: banHash, KeyID: banKid})
 		banned <- banErr
 	}()
 	time.Sleep(300 * time.Millisecond) // the ban UPDATE is now blocked on the owner row

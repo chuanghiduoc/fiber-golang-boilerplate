@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 )
@@ -31,12 +31,12 @@ func TestUserRepository_RehashPasswordIsConditionalOnTheVerifiedHash(t *testing.
 
 	verifiedHash, err := repo.PasswordHash(ctx, member.UserID)
 	require.NoError(t, err)
-	concurrentHash, err := identityservice.HashPassword(newPassword)
+	concurrentHash, err := core.HashPassword(newPassword)
 	require.NoError(t, err)
 	_, err = repo.ReplacePassword(ctx, member.UserID, concurrentHash)
 	require.NoError(t, err)
 
-	upgradeHash, err := identityservice.HashPassword(oldPassword)
+	upgradeHash, err := core.HashPassword(oldPassword)
 	require.NoError(t, err)
 	require.NoError(t, repo.RehashPassword(ctx, member.UserID, verifiedHash, upgradeHash))
 

@@ -8,7 +8,7 @@ import (
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/google/uuid"
@@ -20,12 +20,12 @@ import (
 // scoped) so bans, removals, and role changes are reflected on the next
 // request.
 type PrincipalReader struct {
-	memberships identityservice.MembershipRepository
+	memberships core.MembershipRepository
 }
 
 var _ identitycontracts.PrincipalReader = (*PrincipalReader)(nil)
 
-func NewPrincipalReader(memberships identityservice.MembershipRepository) *PrincipalReader {
+func NewPrincipalReader(memberships core.MembershipRepository) *PrincipalReader {
 	return &PrincipalReader{memberships: memberships}
 }
 
@@ -46,7 +46,7 @@ func (r *PrincipalReader) LockPrincipalTx(ctx context.Context, tx pgx.Tx, tenant
 	return toPrincipal(principal, err)
 }
 
-func toPrincipal(p *identityservice.Principal, err error) (identitycontracts.Principal, error) {
+func toPrincipal(p *core.Principal, err error) (identitycontracts.Principal, error) {
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return identitycontracts.Principal{}, apperror.ErrNotFound

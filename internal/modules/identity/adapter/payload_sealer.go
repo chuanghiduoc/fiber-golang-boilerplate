@@ -1,7 +1,7 @@
 package adapter
 
 import (
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 )
 
@@ -12,7 +12,7 @@ type PayloadSealer struct {
 	codec *jobs.PayloadCodec
 }
 
-var _ identityservice.SecretSealer = (*PayloadSealer)(nil)
+var _ core.SecretSealer = (*PayloadSealer)(nil)
 
 func NewPayloadSealer(codec *jobs.PayloadCodec) *PayloadSealer {
 	return &PayloadSealer{codec: codec}

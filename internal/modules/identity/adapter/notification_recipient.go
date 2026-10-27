@@ -5,7 +5,7 @@ import (
 	"errors"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/google/uuid"
 )
@@ -15,12 +15,12 @@ import (
 // addresses; notifications never query the users table. Only an active member
 // of the context tenant is a recipient.
 type NotificationRecipient struct {
-	memberships identityservice.MembershipRepository
+	memberships core.MembershipRepository
 }
 
 var _ identitycontracts.NotificationRecipientLookup = (*NotificationRecipient)(nil)
 
-func NewNotificationRecipient(memberships identityservice.MembershipRepository) *NotificationRecipient {
+func NewNotificationRecipient(memberships core.MembershipRepository) *NotificationRecipient {
 	return &NotificationRecipient{memberships: memberships}
 }
 

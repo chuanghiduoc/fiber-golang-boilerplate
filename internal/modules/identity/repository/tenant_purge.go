@@ -6,13 +6,14 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/tenancy"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/google/uuid"
 )
 
-// TenantPurgeRepository implements service.TenantPurgeRepository. The
+// TenantPurgeRepository implements core.TenantPurgeRepository. The
 // tenant-scoped deletes run through sqlc on the RLS-scoped handle in bounded
 // pages; the completion marker and its audit row share one transaction.
 type TenantPurgeRepository struct {
@@ -21,20 +22,20 @@ type TenantPurgeRepository struct {
 	audit audit.TxRecorder
 }
 
-var _ identityservice.TenantPurgeRepository = (*TenantPurgeRepository)(nil)
+var _ tenancy.TenantPurgeRepository = (*TenantPurgeRepository)(nil)
 
 func NewTenantPurgeRepository(db identitysqlc.DBTX, tx *database.TxManager, recorder audit.TxRecorder) *TenantPurgeRepository {
 	return &TenantPurgeRepository{db: db, tx: tx, audit: recorder}
 }
 
-func (r *TenantPurgeRepository) ListDeletedTenants(ctx context.Context, limit int32) ([]identityservice.PurgeTenant, error) {
+func (r *TenantPurgeRepository) ListDeletedTenants(ctx context.Context, limit int32) ([]tenancy.PurgeTenant, error) {
 	rows, err := identitysqlc.New(r.db).ListDeletedUnpurgedTenants(ctx, limit)
 	if err != nil {
 		return nil, err
 	}
-	tenants := make([]identityservice.PurgeTenant, len(rows))
+	tenants := make([]tenancy.PurgeTenant, len(rows))
 	for i := range rows {
-		tenants[i] = identityservice.PurgeTenant{
+		tenants[i] = tenancy.PurgeTenant{
 			ID: rows[i].ID, Slug: rows[i].Slug, Cursor: rows[i].PurgeCursor,
 		}
 	}
@@ -57,7 +58,7 @@ func (r *TenantPurgeRepository) ListMembershipUserIDs(ctx context.Context, tenan
 	})
 }
 
-func (r *TenantPurgeRepository) ListDataExports(ctx context.Context, tenantID uuid.UUID, limit int32) ([]identityservice.DataExport, error) {
+func (r *TenantPurgeRepository) ListDataExports(ctx context.Context, tenantID uuid.UUID, limit int32) ([]core.DataExport, error) {
 	rows, err := identitysqlc.New(r.db).ListTenantDataExportsForPurge(ctx, identitysqlc.ListTenantDataExportsForPurgeParams{
 		TenantID:  tenantID,
 		BatchSize: limit,
@@ -65,9 +66,9 @@ func (r *TenantPurgeRepository) ListDataExports(ctx context.Context, tenantID uu
 	if err != nil {
 		return nil, err
 	}
-	exports := make([]identityservice.DataExport, len(rows))
+	exports := make([]core.DataExport, len(rows))
 	for i := range rows {
-		exports[i] = identityservice.DataExport{
+		exports[i] = core.DataExport{
 			ID:          rows[i].ID,
 			TenantID:    tenantID,
 			StoragePath: rows[i].StoragePath,

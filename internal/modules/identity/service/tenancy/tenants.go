@@ -434,11 +434,3 @@ func StartupTenants(ctx context.Context, repo TenantRepository, defaultSlug stri
 	}
 	return baseline, configured, nil
 }
-
-// NormalizeNewTenant validates and canonicalizes a tenant create input.
-func NormalizeNewTenant(in *NewTenant) error { return normalizeNewTenant(in) }
-
-// DeletionSchedule returns the deletion date for a status transition.
-func DeletionSchedule(current *Tenant, to TenantStatus) *time.Time {
-	return deletionSchedule(current, to)
-}

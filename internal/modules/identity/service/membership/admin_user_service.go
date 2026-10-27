@@ -388,7 +388,3 @@ func (s *adminUserService) GetUserStats(ctx context.Context) (UserStats, error) 
 	}
 	return UserStats{ActiveUsers: stats.Active, DeletedUsers: stats.Inactive}, nil
 }
-
-// AdminUserServiceImpl is the concrete admin member service, exported for
-// composition and white-box tests outside this package.
-type AdminUserServiceImpl = adminUserService

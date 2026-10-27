@@ -4,18 +4,18 @@ import (
 	"context"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/google/uuid"
 )
 
-// MFARepository implements service.MFARepository. MFA is per global user, so
+// MFARepository implements core.MFARepository. MFA is per global user, so
 // no query takes a tenant.
 type MFARepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.MFARepository = (*MFARepository)(nil)
+var _ core.MFARepository = (*MFARepository)(nil)
 
 // uniqueMFAConfirmedTOTP is the partial unique index that admits one confirmed
 // TOTP factor per user.
@@ -25,8 +25,8 @@ func NewMFARepository(db identitysqlc.DBTX) *MFARepository {
 	return &MFARepository{q: identitysqlc.New(db)}
 }
 
-func toMFAFactor(row identitysqlc.MfaFactor) *identityservice.MFAFactor {
-	return &identityservice.MFAFactor{
+func toMFAFactor(row identitysqlc.MfaFactor) *core.MFAFactor {
+	return &core.MFAFactor{
 		ID:               row.ID,
 		UserID:           row.UserID,
 		Type:             row.Type,
@@ -38,7 +38,7 @@ func toMFAFactor(row identitysqlc.MfaFactor) *identityservice.MFAFactor {
 	}
 }
 
-func (r *MFARepository) GetTOTP(ctx context.Context, userID uuid.UUID) (*identityservice.MFAFactor, error) {
+func (r *MFARepository) GetTOTP(ctx context.Context, userID uuid.UUID) (*core.MFAFactor, error) {
 	row, err := r.q.GetMFAFactor(ctx, userID)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -46,7 +46,7 @@ func (r *MFARepository) GetTOTP(ctx context.Context, userID uuid.UUID) (*identit
 	return toMFAFactor(row), nil
 }
 
-func (r *MFARepository) GetTOTPForUpdate(ctx context.Context, userID uuid.UUID) (*identityservice.MFAFactor, error) {
+func (r *MFARepository) GetTOTPForUpdate(ctx context.Context, userID uuid.UUID) (*core.MFAFactor, error) {
 	row, err := r.q.GetMFAFactorForUpdate(ctx, userID)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -54,7 +54,7 @@ func (r *MFARepository) GetTOTPForUpdate(ctx context.Context, userID uuid.UUID) 
 	return toMFAFactor(row), nil
 }
 
-func (r *MFARepository) GetConfirmedTOTP(ctx context.Context, userID uuid.UUID) (*identityservice.MFAFactor, error) {
+func (r *MFARepository) GetConfirmedTOTP(ctx context.Context, userID uuid.UUID) (*core.MFAFactor, error) {
 	row, err := r.q.GetConfirmedMFAFactor(ctx, userID)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -62,7 +62,7 @@ func (r *MFARepository) GetConfirmedTOTP(ctx context.Context, userID uuid.UUID) 
 	return toMFAFactor(row), nil
 }
 
-func (r *MFARepository) UpsertUnconfirmedTOTP(ctx context.Context, userID uuid.UUID, secretCiphertext string) (*identityservice.MFAFactor, error) {
+func (r *MFARepository) UpsertUnconfirmedTOTP(ctx context.Context, userID uuid.UUID, secretCiphertext string) (*core.MFAFactor, error) {
 	row, err := r.q.UpsertUnconfirmedMFAFactor(ctx, identitysqlc.UpsertUnconfirmedMFAFactorParams{
 		UserID:           userID,
 		SecretCiphertext: secretCiphertext,

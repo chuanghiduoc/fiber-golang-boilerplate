@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -12,19 +12,19 @@ import (
 	"github.com/google/uuid"
 )
 
-// InvitationRepository implements service.InvitationRepository.
+// InvitationRepository implements core.InvitationRepository.
 type InvitationRepository struct {
 	q *identitysqlc.Queries
 }
 
-var _ identityservice.InvitationRepository = (*InvitationRepository)(nil)
+var _ core.InvitationRepository = (*InvitationRepository)(nil)
 
 func NewInvitationRepository(db identitysqlc.DBTX) *InvitationRepository {
 	return &InvitationRepository{q: identitysqlc.New(db)}
 }
 
-func toInvitation(row identitysqlc.Invitation, role string) identityservice.Invitation {
-	return identityservice.Invitation{
+func toInvitation(row identitysqlc.Invitation, role string) core.Invitation {
+	return core.Invitation{
 		ID:         row.ID,
 		TenantID:   row.TenantID,
 		Email:      row.EmailNormalized,
@@ -38,7 +38,7 @@ func toInvitation(row identitysqlc.Invitation, role string) identityservice.Invi
 	}
 }
 
-func (r *InvitationRepository) Upsert(ctx context.Context, invitation identityservice.NewInvitation) (*identityservice.Invitation, error) {
+func (r *InvitationRepository) Upsert(ctx context.Context, invitation core.NewInvitation) (*core.Invitation, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -65,7 +65,7 @@ func (r *InvitationRepository) Upsert(ctx context.Context, invitation identityse
 	return &inv, nil
 }
 
-func (r *InvitationRepository) Get(ctx context.Context, id uuid.UUID) (*identityservice.Invitation, error) {
+func (r *InvitationRepository) Get(ctx context.Context, id uuid.UUID) (*core.Invitation, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -78,7 +78,7 @@ func (r *InvitationRepository) Get(ctx context.Context, id uuid.UUID) (*identity
 	return &inv, nil
 }
 
-func (r *InvitationRepository) ListPendingCursor(ctx context.Context, cur pagination.DBCursor) ([]identityservice.Invitation, error) {
+func (r *InvitationRepository) ListPendingCursor(ctx context.Context, cur pagination.DBCursor) ([]core.Invitation, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -92,7 +92,7 @@ func (r *InvitationRepository) ListPendingCursor(ctx context.Context, cur pagina
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	out := make([]identityservice.Invitation, len(rows))
+	out := make([]core.Invitation, len(rows))
 	for i := range rows {
 		out[i] = toInvitation(rows[i].Invitation, rows[i].Role)
 	}
@@ -119,7 +119,7 @@ func (r *InvitationRepository) TenantByTokenHash(ctx context.Context, tokenHash 
 	return tenantID, nil
 }
 
-func (r *InvitationRepository) GetByTokenHashForUpdate(ctx context.Context, tenantID uuid.UUID, tokenHash []byte) (*identityservice.Invitation, error) {
+func (r *InvitationRepository) GetByTokenHashForUpdate(ctx context.Context, tenantID uuid.UUID, tokenHash []byte) (*core.Invitation, error) {
 	row, err := r.q.GetInvitationByTokenHashForUpdate(ctx, identitysqlc.GetInvitationByTokenHashForUpdateParams{
 		TenantID:  tenantID,
 		TokenHash: tokenHash,

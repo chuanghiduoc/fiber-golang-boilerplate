@@ -1,0 +1,215 @@
+//go:build integration
+
+package mfa_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/internal/pgfixtures"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/totp"
+	"github.com/google/uuid"
+)
+
+func recoveryHash(code string) []byte {
+	normalized := strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(code))
+	sum := sha256.Sum256([]byte(normalized))
+	return sum[:]
+}
+
+// One RFC 6238 step may be consumed at most once, even by concurrent requests.
+// A failed second-factor guess is audited in its own transaction, so the row
+// is visible after the login request returns 401, attributed to the user and
+// without the attempted code.
+func TestMFAVerifyFailureIsPersistedInAudit(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "mfa-audit@example.com",
+		testutil.MemberOptions{Password: pgfixtures.Passphrase})
+	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+
+	code, err := totp.Code(secret, time.Now())
+	require.NoError(t, err)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	require.NoError(t, err)
+
+	challenge, err := e.MFA.BeginChallenge(ctx, user.UserID, core.AMRPassword)
+	require.NoError(t, err)
+	const attempted = "not-a-real-code"
+	_, err = e.MFA.Verify(ctx, challenge, attempted)
+	require.Error(t, err)
+
+	var actorID uuid.UUID
+	var actorType, reason string
+	require.NoError(t, e.Pool.QueryRow(ctx,
+		`SELECT actor_id, actor_type, metadata->>'reason' FROM audit_events
+		 WHERE action = 'auth.mfa_verify_failed' ORDER BY id DESC LIMIT 1`).
+		Scan(&actorID, &actorType, &reason))
+	assert.Equal(t, user.UserID, actorID)
+	assert.Equal(t, "user", actorType)
+	assert.Equal(t, "invalid_code", reason)
+
+	var leaked int64
+	require.NoError(t, e.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE metadata::text LIKE '%' || $1 || '%'`, attempted).
+		Scan(&leaked))
+	assert.Zero(t, leaked, "the attempted code must never be persisted")
+}
+
+func TestConsumeTOTPStep_ConcurrentUseSucceedsOnce(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "step@example.com", testutil.MemberOptions{Password: pgfixtures.Passphrase})
+	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+
+	t0 := time.Now()
+	code, err := totp.Code(secret, t0)
+	require.NoError(t, err)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	require.NoError(t, err)
+
+	step := totp.Step(t0) + 1
+	var wg sync.WaitGroup
+	results := make([]bool, 2)
+	for i := range results {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], _ = e.Stores.MFA.ConsumeTOTPStep(ctx, user.UserID, step)
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, 1, countTrue(results), "exactly one concurrent use of a TOTP step may pass")
+}
+
+// A recovery code is single use under concurrency.
+func TestUseRecoveryCode_ConcurrentUseSucceedsOnce(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "recovery@example.com", testutil.MemberOptions{Password: pgfixtures.Passphrase})
+	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+
+	t0 := time.Now()
+	code, err := totp.Code(secret, t0)
+	require.NoError(t, err)
+	codes, err := e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	require.NoError(t, err)
+	require.Len(t, codes.RecoveryCodes, 10)
+
+	hash := recoveryHash(codes.RecoveryCodes[0])
+	var wg sync.WaitGroup
+	results := make([]bool, 2)
+	for i := range results {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], _ = e.Stores.MFA.UseRecoveryCode(ctx, user.UserID, hash)
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, 1, countTrue(results), "exactly one concurrent use of a recovery code may pass")
+}
+
+// Two concurrent verifications of one challenge and one TOTP code: only one
+// may consume the step, consume the challenge, and receive a session.
+func TestMFAVerify_ConcurrentChallengeSucceedsOnce(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "verify@example.com", testutil.MemberOptions{Password: pgfixtures.Passphrase})
+	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+
+	t0 := time.Now()
+	first, err := totp.Code(secret, t0)
+	require.NoError(t, err)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, first)
+	require.NoError(t, err)
+	// Confirmation used step(t0); the login uses the next step, still inside
+	// the +/-1 acceptance window.
+	next, err := totp.Code(secret, t0.Add(totp.Period))
+	require.NoError(t, err)
+
+	challenge, err := e.MFA.BeginChallenge(ctx, user.UserID, core.AMRPassword)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	results := make([]*core.MFALogin, 2)
+	errs := make([]error, 2)
+	for i := range results {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = e.MFA.Verify(ctx, challenge, next)
+		}()
+	}
+	wg.Wait()
+
+	succeeded := 0
+	var sessionID uuid.UUID
+	for i, err := range errs {
+		if err == nil {
+			succeeded++
+			sessionID = results[i].Tokens.SessionID
+		}
+	}
+	assert.Equal(t, 1, succeeded, "exactly one concurrent challenge verification may pass")
+	require.NotEqual(t, uuid.Nil, sessionID)
+
+	// The session records the full amr set; a refresh keeps it.
+	amr := scalar[[]string](t, e.Pool, `SELECT amr FROM sessions WHERE id = $1`, sessionID)
+	assert.ElementsMatch(t, []string{core.AMRPassword, core.AMROTP}, amr)
+}
+
+// Two concurrent confirmations of the same pending factor: one wins, the other
+// sees the already-confirmed factor and rolls back.
+func TestMFAConfirm_ConcurrentConfirmSucceedsOnce(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "confirm@example.com", testutil.MemberOptions{Password: pgfixtures.Passphrase})
+	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+
+	code, err := totp.Code(secret, time.Now())
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	results := make([]error, 2)
+	for i := range results {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, results[i] = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+		}()
+	}
+	wg.Wait()
+
+	succeeded := 0
+	for _, err := range results {
+		if err == nil {
+			succeeded++
+		}
+	}
+	assert.Equal(t, 1, succeeded, "exactly one concurrent confirmation may pass")
+	assert.Equal(t, int64(1), scalar[int64](t, e.Pool,
+		`SELECT count(*) FROM mfa_factors WHERE user_id = $1 AND confirmed_at IS NOT NULL`, user.UserID))
+}
+
+func countTrue(values []bool) int {
+	n := 0
+	for _, v := range values {
+		if v {
+			n++
+		}
+	}
+	return n
+}

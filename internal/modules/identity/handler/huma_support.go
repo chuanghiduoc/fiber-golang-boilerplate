@@ -11,7 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -45,7 +45,7 @@ func authenticatedWithAPIKey(ctx context.Context) bool {
 // session records on them. Every operation uses it, public or authenticated.
 func withClientMetadata(ctx context.Context) context.Context {
 	client := requestctx.ClientInfoFromContext(ctx)
-	return service.WithUserAgent(service.WithClientIP(ctx, client.IP), client.UserAgent)
+	return core.WithUserAgent(core.WithClientIP(ctx, client.IP), client.UserAgent)
 }
 
 // sessionIDFromBearer extracts the session id from the already-verified

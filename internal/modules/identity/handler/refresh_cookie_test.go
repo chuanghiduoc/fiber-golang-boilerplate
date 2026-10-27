@@ -19,7 +19,8 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/authn"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/sessiontest"
@@ -31,11 +32,11 @@ type cookieSessions struct {
 	loggedOut string
 }
 
-func (s *cookieSessions) Issue(context.Context, uuid.UUID, int32, []string) (service.TokenPair, error) {
-	return service.TokenPair{AccessToken: "access-1", RefreshToken: "refresh-1"}, nil
+func (s *cookieSessions) Issue(context.Context, uuid.UUID, int32, []string) (core.TokenPair, error) {
+	return core.TokenPair{AccessToken: "access-1", RefreshToken: "refresh-1"}, nil
 }
 
-func (s *cookieSessions) Refresh(_ context.Context, token string, admit service.Admission) (*service.RefreshResult, error) {
+func (s *cookieSessions) Refresh(_ context.Context, token string, admit authn.Admission) (*authn.RefreshResult, error) {
 	s.refreshed = token
 	member := loginMember()
 	if admit != nil {
@@ -43,9 +44,9 @@ func (s *cookieSessions) Refresh(_ context.Context, token string, admit service.
 			return nil, err
 		}
 	}
-	return &service.RefreshResult{
+	return &authn.RefreshResult{
 		Member: member,
-		Tokens: service.TokenPair{AccessToken: "access-2", RefreshToken: "refresh-2"},
+		Tokens: core.TokenPair{AccessToken: "access-2", RefreshToken: "refresh-2"},
 	}, nil
 }
 
@@ -60,16 +61,16 @@ func (r tenantResolver) Resolve(context.Context, string) (tenant.Tenant, error) 
 	return tenant.Tenant{ID: tenant.DefaultID, Slug: r.name}, nil
 }
 
-func loginMember() *service.Member {
+func loginMember() *core.Member {
 	userID := testID(2)
-	return &service.Member{
-		User: service.User{
+	return &core.Member{
+		User: core.User{
 			ID: userID, Email: "cookie@example.com", Name: "Cookie",
 			EmailVerifiedAt: timePtr(time.Now()),
 		},
-		Membership: service.Membership{
+		Membership: core.Membership{
 			TenantID: tenant.DefaultID, UserID: userID,
-			Role: service.RoleMember, Status: service.MembershipStatusActive,
+			Role: core.RoleMember, Status: core.MembershipStatusActive,
 		},
 	}
 }

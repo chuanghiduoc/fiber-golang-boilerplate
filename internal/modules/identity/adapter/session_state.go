@@ -3,7 +3,7 @@ package adapter
 import (
 	"context"
 
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/google/uuid"
 )
@@ -11,12 +11,12 @@ import (
 // SessionStateReader adapts identity sessions to session.StateReader, the
 // access-token validator's one lookup per (uncached) request.
 type SessionStateReader struct {
-	sessions identityservice.SessionRepository
+	sessions core.SessionRepository
 }
 
 var _ session.StateReader = (*SessionStateReader)(nil)
 
-func NewSessionStateReader(sessions identityservice.SessionRepository) *SessionStateReader {
+func NewSessionStateReader(sessions core.SessionRepository) *SessionStateReader {
 	return &SessionStateReader{sessions: sessions}
 }
 
@@ -35,8 +35,8 @@ func (r *SessionStateReader) SessionState(ctx context.Context, sessionID, userID
 		MFAVerifiedAt: state.MFAVerifiedAt,
 		AMR:           state.AMR,
 		Active: !state.Revoked &&
-			state.MembershipStatus == identityservice.MembershipStatusActive &&
-			state.UserStatus == identityservice.UserStatusActive,
+			state.MembershipStatus == core.MembershipStatusActive &&
+			state.UserStatus == core.UserStatusActive,
 		TenantActive: state.TenantStatus.Operational(),
 	}, nil
 }

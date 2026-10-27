@@ -11,7 +11,9 @@ import (
 	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/authn"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/privacy"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/tenancy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
@@ -38,10 +40,10 @@ type Module struct {
 
 	// The job, schedule, and startup collaborators are set by Build; a module
 	// built with New (tests) has none.
-	resetSvc     identityservice.PasswordResetService
-	tokenPurger  *identityservice.TokenPurger
-	privacySvc   *identityservice.PrivacyService
-	tenantPurger *identityservice.TenantPurgeService
+	resetSvc     authn.PasswordResetService
+	tokenPurger  *authn.TokenPurger
+	privacySvc   *privacy.PrivacyService
+	tenantPurger *tenancy.TenantPurgeService
 	startup      func(ctx context.Context) error
 
 	provides Provides

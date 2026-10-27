@@ -12,7 +12,7 @@ import (
 
 	apikeyservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/banhash"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 )
@@ -36,7 +36,7 @@ func TestIntegration_APIKeyBanRevokesAndUnbanDoesNotRevive(t *testing.T) {
 	require.NoError(t, err)
 	hash, kid := hasher.Marker(member.Email)
 	memberships := identityrepo.NewMembershipRepository(h.pool)
-	_, err = memberships.Ban(ctx, ownerID, identityservice.BanMarker{Hash: hash, KeyID: kid})
+	_, err = memberships.Ban(ctx, ownerID, core.BanMarker{Hash: hash, KeyID: kid})
 	require.NoError(t, err)
 	resp, _ = h.request(t, before.Secret, "")
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode, "banned owner")

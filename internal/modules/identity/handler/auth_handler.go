@@ -23,7 +23,8 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/authn"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/oauth"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
@@ -149,29 +150,68 @@ type GoogleOAuthProvider interface {
 	BuildMFACallbackURL(challenge string) string
 }
 
+// AuthUsers is the credential surface the auth handlers use.
+// *authn.UserService implements it.
+type AuthUsers interface {
+	Register(ctx context.Context, req authn.RegisterInput) (*core.Member, error)
+	Authenticate(ctx context.Context, req authn.LoginInput) (*core.Member, error)
+	SignInWithGoogle(ctx context.Context, req authn.GoogleSignIn) (*authn.GoogleSignInResult, error)
+	RevokeSessions(ctx context.Context, userID uuid.UUID) error
+}
+
+// PasswordReset is the reset surface the auth handlers use.
+// *authn.PasswordResetService implements it.
+type PasswordReset interface {
+	ForgotPassword(ctx context.Context, req authn.ForgotPasswordInput) error
+	ResetPassword(ctx context.Context, req authn.ResetPasswordInput) error
+}
+
+// EmailVerification is the verification surface the auth handlers use.
+// *authn.EmailVerificationService implements it.
+type EmailVerification interface {
+	SendVerification(ctx context.Context, userID uuid.UUID, userEmail string) error
+	Verify(ctx context.Context, token string) error
+	ResendVerification(ctx context.Context, emailAddr string) error
+	Invalidate(ctx context.Context, userID uuid.UUID) error
+}
+
+// MFA is the second-factor surface the auth and MFA handlers use.
+// *mfa.MFAService implements it.
+type MFA interface {
+	EnrollTOTP(ctx context.Context, userID, sessionID uuid.UUID, currentPassword string) (*core.MFAEnrollment, error)
+	ConfirmTOTP(ctx context.Context, userID, sessionID uuid.UUID, currentPassword, code string) (*core.MFAConfirmResult, error)
+	Disable(ctx context.Context, userID, sessionID uuid.UUID, code string) error
+	RegenerateRecoveryCodes(ctx context.Context, userID uuid.UUID, code string) ([]string, error)
+	ResetTOTP(ctx context.Context, userID uuid.UUID) error
+	Status(ctx context.Context, userID uuid.UUID) (*core.MFAStatus, error)
+	Required(ctx context.Context, userID uuid.UUID) (bool, error)
+	BeginChallenge(ctx context.Context, userID uuid.UUID, method string) (string, error)
+	Verify(ctx context.Context, challenge, code string) (*core.MFALogin, error)
+}
+
 // SessionIssuer is the session service surface the auth handlers use.
-// *service.SessionService implements it.
+// *authn.SessionService implements it.
 type SessionIssuer interface {
-	Issue(ctx context.Context, userID uuid.UUID, tokenVersion int32, amr []string) (service.TokenPair, error)
-	Refresh(ctx context.Context, refreshToken string, admit service.Admission) (*service.RefreshResult, error)
+	Issue(ctx context.Context, userID uuid.UUID, tokenVersion int32, amr []string) (core.TokenPair, error)
+	Refresh(ctx context.Context, refreshToken string, admit authn.Admission) (*authn.RefreshResult, error)
 	Logout(ctx context.Context, refreshToken string) error
-	List(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]service.Session, bool, error)
+	List(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]core.Session, bool, error)
 	Revoke(ctx context.Context, userID, sessionID uuid.UUID) error
 }
 
 // TenantLookup resolves operational tenants for the OAuth flow.
-// *service.TenantService implements it.
+// *tenancy.TenantService implements it.
 type TenantLookup interface {
-	ResolveOperational(ctx context.Context, slug string) (*service.Tenant, error)
-	GetOperational(ctx context.Context, id uuid.UUID) (*service.Tenant, error)
+	ResolveOperational(ctx context.Context, slug string) (*core.Tenant, error)
+	GetOperational(ctx context.Context, id uuid.UUID) (*core.Tenant, error)
 }
 
 // AuthDeps are the auth handler's collaborators.
 type AuthDeps struct {
-	Users        service.UserService
+	Users        AuthUsers
 	Sessions     SessionIssuer
-	Resets       service.PasswordResetService
-	Verification service.EmailVerificationService
+	Resets       PasswordReset
+	Verification EmailVerification
 	// OAuthStateSecret derives the OAuth state MAC key (the JWT secret).
 	OAuthStateSecret         string
 	RequireEmailVerification bool
@@ -179,26 +219,26 @@ type AuthDeps struct {
 	// Cache stores the short-lived one-time Google exchange grant.
 	Cache cache.Cache
 	// Sealer seals that grant with the data-encryption codec.
-	Sealer service.SecretSealer
+	Sealer core.SecretSealer
 	// MFA is nil only in deployments and tests that do not wire MFA; login
 	// then issues tokens directly.
-	MFA service.MFAService
+	MFA MFA
 	// Tenants validates the tenant carried through the OAuth state. Without
 	// it the Google flow fails closed with 500.
 	Tenants TenantLookup
 }
 
 type AuthHandler struct {
-	userSvc                  service.UserService
+	userSvc                  AuthUsers
 	sessions                 SessionIssuer
-	resetSvc                 service.PasswordResetService
-	emailVerifSvc            service.EmailVerificationService
+	resetSvc                 PasswordReset
+	emailVerifSvc            EmailVerification
 	requireEmailVerification bool
 	googleOAuth              GoogleOAuthProvider
 	tenants                  TenantLookup
-	mfa                      service.MFAService
+	mfa                      MFA
 	cache                    cache.Cache
-	sealer                   service.SecretSealer
+	sealer                   core.SecretSealer
 	// oauthStateKey signs the OAuth state (see encodeOAuthState).
 	oauthStateKey []byte
 	// flags evaluates the email-verification requirement and the sign-up
@@ -217,7 +257,7 @@ func (h *AuthHandler) SetFeatureFlags(flags features.Evaluator) {
 // emailVerificationRequired combines REQUIRE_EMAIL_VERIFICATION with the
 // email_verification flag for the user's tenant/user targets. The flag can
 // only add the requirement; it never lifts the configured one.
-func (h *AuthHandler) emailVerificationRequired(ctx context.Context, member *service.Member) bool {
+func (h *AuthHandler) emailVerificationRequired(ctx context.Context, member *core.Member) bool {
 	if h.requireEmailVerification {
 		return true
 	}
@@ -308,7 +348,7 @@ type signupInvitationInput struct {
 
 // Register creates a global account and its membership in the request tenant.
 func (h *AuthHandler) Register(ctx context.Context, input *registerInput) (*httpapi.Created[dto.UserResponse], error) {
-	member, err := h.userSvc.Register(withClientMetadata(ctx), service.RegisterInput{
+	member, err := h.userSvc.Register(withClientMetadata(ctx), authn.RegisterInput{
 		Email:    input.Body.Email,
 		Password: input.Body.Password,
 		Name:     input.Body.Name,
@@ -332,7 +372,7 @@ func (h *AuthHandler) Register(ctx context.Context, input *registerInput) (*http
 // challenge.
 func (h *AuthHandler) Login(ctx context.Context, input *loginInput) (*loginOutput, error) {
 	ctx = withClientMetadata(ctx)
-	member, err := h.userSvc.Authenticate(ctx, service.LoginInput{
+	member, err := h.userSvc.Authenticate(ctx, authn.LoginInput{
 		Email:    input.Body.Email,
 		Password: input.Body.Password,
 	})
@@ -354,7 +394,7 @@ func (h *AuthHandler) Login(ctx context.Context, input *loginInput) (*loginOutpu
 			return nil, err
 		}
 		if required {
-			challenge, err := h.mfa.BeginChallenge(ctx, member.User.ID, service.AMRPassword)
+			challenge, err := h.mfa.BeginChallenge(ctx, member.User.ID, core.AMRPassword)
 			if err != nil {
 				return nil, err
 			}
@@ -366,7 +406,7 @@ func (h *AuthHandler) Login(ctx context.Context, input *loginInput) (*loginOutpu
 		}
 	}
 
-	pair, err := h.sessions.Issue(ctx, member.User.ID, member.User.TokenVersion, []string{service.AMRPassword})
+	pair, err := h.sessions.Issue(ctx, member.User.ID, member.User.TokenVersion, []string{core.AMRPassword})
 	if err != nil {
 		return nil, err
 	}
@@ -393,7 +433,7 @@ func (h *AuthHandler) Refresh(ctx context.Context, input *refreshInput) (*loginO
 	if err != nil {
 		return nil, err
 	}
-	result, err := h.sessions.Refresh(ctx, token, func(ctx context.Context, member *service.Member) error {
+	result, err := h.sessions.Refresh(ctx, token, func(ctx context.Context, member *core.Member) error {
 		if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
 			return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 		}
@@ -445,7 +485,7 @@ func (h *AuthHandler) LogoutAll(ctx context.Context, _ *logoutAllInput) (*httpap
 // ForgotPassword enqueues a reset email without revealing whether the address
 // exists.
 func (h *AuthHandler) ForgotPassword(ctx context.Context, input *passwordResetRequestInput) (*httpapi.Empty, error) {
-	if err := h.resetSvc.ForgotPassword(ctx, service.ForgotPasswordInput{Email: input.Body.Email}); err != nil {
+	if err := h.resetSvc.ForgotPassword(ctx, authn.ForgotPasswordInput{Email: input.Body.Email}); err != nil {
 		return nil, err
 	}
 	return &httpapi.Empty{}, nil
@@ -456,19 +496,19 @@ func (h *AuthHandler) ResetPassword(ctx context.Context, input *passwordResetCom
 	// A live reset token resolves to its account, so the password/email
 	// policy can reject a password built from that address before the reset
 	// stores it.
-	if lookup, ok := h.resetSvc.(service.PasswordResetEmailLookup); ok {
+	if lookup, ok := h.resetSvc.(authn.PasswordResetEmailLookup); ok {
 		email, err := lookup.EmailForResetToken(ctx, input.Body.Token)
 		if err != nil {
 			return nil, err
 		}
 		if email != "" {
-			if err := service.ValidatePasswordForEmail(input.Body.Password, email, "password"); err != nil {
+			if err := core.ValidatePasswordForEmail(input.Body.Password, email, "password"); err != nil {
 				return nil, err
 			}
 		}
 	}
 
-	if err := h.resetSvc.ResetPassword(withClientMetadata(ctx), service.ResetPasswordInput{
+	if err := h.resetSvc.ResetPassword(withClientMetadata(ctx), authn.ResetPasswordInput{
 		Token:    input.Body.Token,
 		Password: input.Body.Password,
 	}); err != nil {
@@ -559,16 +599,16 @@ func (h *AuthHandler) GoogleCallback(ctx context.Context, input *googleCallbackI
 	}
 
 	allowSignUp := features.Require(ctx, h.flags, identitycatalog.KeyUserRegistration, features.Subject{TenantID: tenantID}) == nil
-	result, err := h.userSvc.SignInWithGoogle(withClientMetadata(ctx), service.GoogleSignIn{
+	result, err := h.userSvc.SignInWithGoogle(withClientMetadata(ctx), authn.GoogleSignIn{
 		GoogleID:      info.ID,
 		Email:         info.Email,
 		Name:          info.Name,
 		EmailVerified: info.VerifiedEmail,
 		AllowSignUp:   allowSignUp,
-		Complete: func(ctx context.Context, member *service.Member) error {
+		Complete: func(ctx context.Context, member *core.Member) error {
 			return h.admitGoogleUser(ctx, tenantID, member)
 		},
-		MFARequired: func(ctx context.Context, member *service.Member) (bool, error) {
+		MFARequired: func(ctx context.Context, member *core.Member) (bool, error) {
 			if h.mfa == nil {
 				return false, nil
 			}
@@ -580,7 +620,7 @@ func (h *AuthHandler) GoogleCallback(ctx context.Context, input *googleCallbackI
 	}
 	cleared := oauthStateCookieName + "=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax"
 	if result.MFARequired {
-		challenge, err := h.mfa.BeginChallenge(ctx, result.Member.User.ID, service.AMRGoogle)
+		challenge, err := h.mfa.BeginChallenge(ctx, result.Member.User.ID, core.AMRGoogle)
 		if err != nil {
 			return nil, err
 		}
@@ -613,7 +653,7 @@ func googleExchangeInvalid() error {
 
 // issueGoogleExchangeGrant stores the signed-in user's tokens under a random
 // 256-bit code for googleExchangeTTL and returns the code.
-func (h *AuthHandler) issueGoogleExchangeGrant(ctx context.Context, tenantID uuid.UUID, result *service.GoogleSignInResult) (string, error) {
+func (h *AuthHandler) issueGoogleExchangeGrant(ctx context.Context, tenantID uuid.UUID, result *authn.GoogleSignInResult) (string, error) {
 	if h.cache == nil || h.sealer == nil {
 		return "", apperror.Internal(nil, "google exchange store is not configured")
 	}
@@ -751,7 +791,7 @@ func oauthErrorType(err error) string {
 
 // admitGoogleUser applies the Login/Refresh sign-in rules to the account a
 // Google identity resolved to.
-func (h *AuthHandler) admitGoogleUser(ctx context.Context, tenantID uuid.UUID, member *service.Member) error {
+func (h *AuthHandler) admitGoogleUser(ctx context.Context, tenantID uuid.UUID, member *core.Member) error {
 	if member.Membership.TenantID != tenantID {
 		return apperror.NewUnauthorized("account is not active")
 	}

@@ -12,7 +12,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/tenancy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/banhash"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 )
@@ -64,7 +64,7 @@ func run() error {
 		database.NewTxManagerPools(pools, database.WithResolver(app.RLSResolver)), nil, nil, nil, banHasher)
 	// Seeding checks existence, not request eligibility: an operator may need
 	// to seed an admin before reactivating a suspended default tenant.
-	_, defaultTenant, err := service.StartupTenants(ctx, stores.Tenants, cfg.Tenant.DefaultSlug)
+	_, defaultTenant, err := tenancy.StartupTenants(ctx, stores.Tenants, cfg.Tenant.DefaultSlug)
 	if err != nil {
 		return err
 	}

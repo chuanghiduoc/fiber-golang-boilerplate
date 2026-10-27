@@ -22,7 +22,8 @@ import (
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -44,7 +45,7 @@ type auditTxHarness struct {
 	fx       *pgtest.Fixture
 	recorder *toggleRecorder
 	tx       *database.TxManager
-	identity identityservice.Stores
+	identity core.Stores
 	files    *filesrepo.FileRepository
 	store    storage.Storage
 }
@@ -107,8 +108,8 @@ func setupAuditTxHarness(t *testing.T) *auditTxHarness {
 
 // adminService is the identity admin service writing its Tier 1 audit rows
 // through the harness recorder.
-func (h *auditTxHarness) adminService() identityservice.AdminUserService {
-	return identityservice.NewAdminUserService(h.identity, identityrepo.NewTransactor(h.tx, h.recorder, nil, nil, testutil.MustBanHasher()), nil)
+func (h *auditTxHarness) adminService() membership.AdminUserService {
+	return membership.NewAdminUserService(h.identity, identityrepo.NewTransactor(h.tx, h.recorder, nil, nil, testutil.MustBanHasher()), nil)
 }
 
 // membershipState reads the target's membership in tenantID.
