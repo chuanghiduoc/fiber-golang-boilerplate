@@ -39,66 +39,151 @@ GROUP BY tenant_id, user_id;
 
 ALTER TABLE files FORCE ROW LEVEL SECURITY;
 
--- Only the owning user's counter moves. Keeping the tenant aggregate out of
--- the trigger is what lets two users upload concurrently when only the user
--- quota is enabled.
-CREATE OR REPLACE FUNCTION files_track_storage_usage() RETURNS trigger
+-- The counters are maintained once per statement from the transition tables,
+-- with one upsert per affected (tenant, user). A row-level trigger would run
+-- one upsert per file instead, and a bulk insert for a single user then walks
+-- a chain of dead tuple versions that grows with every row: 10k rows already
+-- took minutes on PostgreSQL 18. Only the owning user's counter moves, so two
+-- users uploading concurrently never contend for the same row, and a counter
+-- update is an additive upsert that stays correct under concurrency.
+
+-- A user who gained files gets their summed size added to their counter.
+CREATE OR REPLACE FUNCTION files_storage_usage_after_insert() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO files_storage_usage (tenant_id, user_id, bytes)
+    SELECT tenant_id, user_id, SUM(size)::bigint
+    FROM new_rows
+    GROUP BY tenant_id, user_id
+    ON CONFLICT ON CONSTRAINT uq_files_storage_usage_tenant_user DO UPDATE
+    SET bytes = files_storage_usage.bytes + EXCLUDED.bytes;
+    RETURN NULL;
+END;
+$$;
+
+-- Deleted bytes leave the counter, and a counter that reaches zero disappears:
+-- erasure and tenant purge must not leave a zero-byte user identifier behind.
+-- A missing counter for a non-zero delete is corruption, not a normal path; a
+-- zero-byte delete that finds no row is simply a counter already cleaned up.
+CREATE OR REPLACE FUNCTION files_storage_usage_after_delete() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
-    delta BIGINT;
+    missing BIGINT;
 BEGIN
-    IF TG_OP = 'INSERT' THEN
-        INSERT INTO files_storage_usage (tenant_id, user_id, bytes)
-        VALUES (NEW.tenant_id, NEW.user_id, NEW.size)
-        ON CONFLICT ON CONSTRAINT uq_files_storage_usage_tenant_user DO UPDATE
-        SET bytes = files_storage_usage.bytes + EXCLUDED.bytes;
-        RETURN NEW;
-    ELSIF TG_OP = 'DELETE' THEN
-        -- Remove the counter row when its last byte is released. This keeps
-        -- erasure and tenant purge from leaving a zero-byte user identifier
-        -- behind. A missing row is corruption, not a normal delete path.
-        DELETE FROM files_storage_usage
-        WHERE tenant_id = OLD.tenant_id
-          AND user_id = OLD.user_id
-          AND bytes = OLD.size;
-        IF NOT FOUND THEN
-            -- The first zero-byte file may already have removed the
-            -- zero-byte counter row. Further zero-byte deletes are still
-            -- valid and must not surface as corruption.
-            IF OLD.size = 0 THEN
-                RETURN OLD;
-            END IF;
-            UPDATE files_storage_usage
-            SET bytes = bytes - OLD.size
-            WHERE tenant_id = OLD.tenant_id AND user_id = OLD.user_id;
-            IF NOT FOUND THEN
-                RAISE EXCEPTION 'files_storage_usage row missing for tenant % user %',
-                    OLD.tenant_id, OLD.user_id;
-            END IF;
-        END IF;
-        RETURN OLD;
-    ELSE
-        IF NEW.tenant_id <> OLD.tenant_id OR NEW.user_id <> OLD.user_id THEN
-            INSERT INTO files_storage_usage (tenant_id, user_id, bytes)
-            VALUES (OLD.tenant_id, OLD.user_id, -OLD.size)
-            ON CONFLICT ON CONSTRAINT uq_files_storage_usage_tenant_user DO UPDATE
-            SET bytes = files_storage_usage.bytes + EXCLUDED.bytes;
-            INSERT INTO files_storage_usage (tenant_id, user_id, bytes)
-            VALUES (NEW.tenant_id, NEW.user_id, NEW.size)
-            ON CONFLICT ON CONSTRAINT uq_files_storage_usage_tenant_user DO UPDATE
-            SET bytes = files_storage_usage.bytes + EXCLUDED.bytes;
-            RETURN NEW;
-        END IF;
-        delta := NEW.size - OLD.size;
-        IF delta = 0 THEN
-            RETURN NEW;
-        END IF;
-        INSERT INTO files_storage_usage (tenant_id, user_id, bytes)
-        VALUES (NEW.tenant_id, NEW.user_id, delta)
-        ON CONFLICT ON CONSTRAINT uq_files_storage_usage_tenant_user DO UPDATE
-        SET bytes = files_storage_usage.bytes + EXCLUDED.bytes;
-        RETURN NEW;
+    WITH deltas AS (
+        SELECT tenant_id, user_id, SUM(size)::bigint AS bytes
+        FROM old_rows
+        GROUP BY tenant_id, user_id
+    )
+    SELECT count(*) INTO missing
+    FROM deltas d
+    LEFT JOIN files_storage_usage u
+        ON u.tenant_id = d.tenant_id AND u.user_id = d.user_id
+    WHERE u.tenant_id IS NULL AND d.bytes > 0;
+    IF missing > 0 THEN
+        RAISE EXCEPTION 'files_storage_usage row missing for % deleted (tenant, user) pair(s)', missing;
     END IF;
+
+    WITH deltas AS (
+        SELECT tenant_id, user_id, SUM(size)::bigint AS bytes
+        FROM old_rows
+        GROUP BY tenant_id, user_id
+    )
+    UPDATE files_storage_usage u
+    SET bytes = u.bytes - d.bytes
+    FROM deltas d
+    WHERE u.tenant_id = d.tenant_id AND u.user_id = d.user_id;
+
+    WITH deltas AS (
+        SELECT tenant_id, user_id, SUM(size)::bigint AS bytes
+        FROM old_rows
+        GROUP BY tenant_id, user_id
+    )
+    DELETE FROM files_storage_usage u
+    USING deltas d
+    WHERE u.tenant_id = d.tenant_id
+      AND u.user_id = d.user_id
+      AND u.bytes = 0;
+    RETURN NULL;
+END;
+$$;
+
+-- An update moves the delta only: a size change adjusts one counter, and a
+-- file moved to another tenant or user subtracts from the old counter and adds
+-- to the new one. Combinations whose delta nets out to zero (for example a
+-- zero-byte file moving between tenants) need no row.
+CREATE OR REPLACE FUNCTION files_storage_usage_after_update() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    missing BIGINT;
+BEGIN
+    WITH deltas AS (
+        SELECT tenant_id, user_id, SUM(delta)::bigint AS bytes
+        FROM (
+            SELECT tenant_id, user_id, -size AS delta FROM old_rows
+            UNION ALL
+            SELECT tenant_id, user_id, size AS delta FROM new_rows
+        ) AS moved
+        GROUP BY tenant_id, user_id
+        HAVING SUM(delta) <> 0
+    )
+    SELECT count(*) INTO missing
+    FROM deltas d
+    LEFT JOIN files_storage_usage u
+        ON u.tenant_id = d.tenant_id AND u.user_id = d.user_id
+    WHERE u.tenant_id IS NULL AND d.bytes < 0;
+    IF missing > 0 THEN
+        RAISE EXCEPTION 'files_storage_usage row missing for % updated (tenant, user) pair(s)', missing;
+    END IF;
+
+    -- Growing counters may need a row; a negative delta must never be proposed
+    -- to the CHECK constraint, so shrinking ones are a plain UPDATE instead.
+    WITH deltas AS (
+        SELECT tenant_id, user_id, SUM(delta)::bigint AS bytes
+        FROM (
+            SELECT tenant_id, user_id, -size AS delta FROM old_rows
+            UNION ALL
+            SELECT tenant_id, user_id, size AS delta FROM new_rows
+        ) AS moved
+        GROUP BY tenant_id, user_id
+        HAVING SUM(delta) > 0
+    )
+    INSERT INTO files_storage_usage (tenant_id, user_id, bytes)
+    SELECT tenant_id, user_id, bytes FROM deltas
+    ON CONFLICT ON CONSTRAINT uq_files_storage_usage_tenant_user DO UPDATE
+    SET bytes = files_storage_usage.bytes + EXCLUDED.bytes;
+
+    WITH deltas AS (
+        SELECT tenant_id, user_id, SUM(delta)::bigint AS bytes
+        FROM (
+            SELECT tenant_id, user_id, -size AS delta FROM old_rows
+            UNION ALL
+            SELECT tenant_id, user_id, size AS delta FROM new_rows
+        ) AS moved
+        GROUP BY tenant_id, user_id
+        HAVING SUM(delta) < 0
+    )
+    UPDATE files_storage_usage u
+    SET bytes = u.bytes + d.bytes
+    FROM deltas d
+    WHERE u.tenant_id = d.tenant_id AND u.user_id = d.user_id;
+
+    WITH deltas AS (
+        SELECT tenant_id, user_id, SUM(delta)::bigint AS bytes
+        FROM (
+            SELECT tenant_id, user_id, -size AS delta FROM old_rows
+            UNION ALL
+            SELECT tenant_id, user_id, size AS delta FROM new_rows
+        ) AS moved
+        GROUP BY tenant_id, user_id
+        HAVING SUM(delta) <> 0
+    )
+    DELETE FROM files_storage_usage u
+    USING deltas d
+    WHERE u.tenant_id = d.tenant_id
+      AND u.user_id = d.user_id
+      AND u.bytes = 0;
+    RETURN NULL;
 END;
 $$;
 
@@ -107,18 +192,37 @@ DECLARE
     target_schema TEXT := current_schema();
 BEGIN
     IF target_schema IS NULL THEN
-        RAISE EXCEPTION 'cannot pin files_track_storage_usage search_path: current_schema() is NULL';
+        RAISE EXCEPTION 'cannot pin files_storage_usage trigger search_path: current_schema() is NULL';
     END IF;
     EXECUTE format(
-        'ALTER FUNCTION %I.files_track_storage_usage() SET search_path = pg_catalog, %I',
+        'ALTER FUNCTION %I.files_storage_usage_after_insert() SET search_path = pg_catalog, %I',
+        target_schema, target_schema);
+    EXECUTE format(
+        'ALTER FUNCTION %I.files_storage_usage_after_delete() SET search_path = pg_catalog, %I',
+        target_schema, target_schema);
+    EXECUTE format(
+        'ALTER FUNCTION %I.files_storage_usage_after_update() SET search_path = pg_catalog, %I',
         target_schema, target_schema);
 END;
 $$;
 
-CREATE TRIGGER trigger_files_storage_usage
-    AFTER INSERT OR DELETE OR UPDATE OF tenant_id, user_id, size ON files
-    FOR EACH ROW
-    EXECUTE FUNCTION files_track_storage_usage();
+CREATE TRIGGER trigger_files_storage_usage_insert
+    AFTER INSERT ON files
+    REFERENCING NEW TABLE AS new_rows
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION files_storage_usage_after_insert();
+
+CREATE TRIGGER trigger_files_storage_usage_update
+    AFTER UPDATE ON files
+    REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION files_storage_usage_after_update();
+
+CREATE TRIGGER trigger_files_storage_usage_delete
+    AFTER DELETE ON files
+    REFERENCING OLD TABLE AS old_rows
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION files_storage_usage_after_delete();
 
 ALTER TABLE files_storage_usage ENABLE ROW LEVEL SECURITY;
 ALTER TABLE files_storage_usage FORCE ROW LEVEL SECURITY;

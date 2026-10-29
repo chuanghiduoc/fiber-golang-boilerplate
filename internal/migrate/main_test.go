@@ -28,7 +28,7 @@ func TestMigrationGuardCoversTenantFoundation(t *testing.T) {
 	if !slices.Contains(requiredTriggers["invitations"], "trigger_invitations_role_scope") {
 		t.Error("invitation role scope trigger must be verified")
 	}
-	if !slices.Contains(requiredTriggers["files"], "trigger_files_storage_usage") {
+	if !slices.Contains(requiredTriggers["files"], "trigger_files_storage_usage_insert") {
 		t.Error("files storage counter trigger must be verified")
 	}
 }

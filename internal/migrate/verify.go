@@ -23,7 +23,11 @@ var requiredTriggers = map[string][]string{
 	"invitations":               {"trigger_invitations_role_scope"},
 	"data_exports":              {"trigger_data_exports_updated_at"},
 	"webauthn_credentials":      {"trigger_webauthn_credentials_updated_at"},
-	"files":                     {"trigger_files_storage_usage"},
+	"files": {
+		"trigger_files_storage_usage_insert",
+		"trigger_files_storage_usage_update",
+		"trigger_files_storage_usage_delete",
+	},
 	"audit_events": {
 		"trigger_audit_events_completion",
 		"trigger_audit_events_no_delete",

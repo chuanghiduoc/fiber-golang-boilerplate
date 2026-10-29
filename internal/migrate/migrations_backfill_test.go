@@ -32,7 +32,7 @@ func TestBackfillMigrationsClearForcedRLS(t *testing.T) {
 			file:      "20261029100000_files_storage_usage.up.sql",
 			table:     "files",
 			backfill:  "INSERT INTO files_storage_usage",
-			afterward: "CREATE OR REPLACE FUNCTION files_track_storage_usage",
+			afterward: "CREATE OR REPLACE FUNCTION files_storage_usage_after_insert",
 		},
 	}
 
