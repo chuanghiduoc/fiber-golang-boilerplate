@@ -83,11 +83,15 @@ func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
 		`SELECT updated_at FROM mfa_factors WHERE user_id = $1`, user.UserID), time.Minute,
 		"re-enrollment must reset the enrollment timestamp")
 
+	// The replaced enrollment's factor id is no longer the user's pending
+	// factor, so confirming it is a 404 on that addressable resource, exactly
+	// like GET /me/mfa/totp/{factorId}. A code mismatch would only be reachable
+	// with the current id.
 	firstCode, err := totp.Code(firstSecret, time.Now())
 	require.NoError(t, err)
 	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: first.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: firstCode})
 	require.Error(t, err, "the replaced secret must no longer confirm")
-	assert.Equal(t, "auth.mfa_invalid_code", pgfixtures.AppCode(err))
+	assert.Equal(t, "resource.not_found", pgfixtures.AppCode(err))
 
 	secondCode, err := totp.Code(secondSecret, time.Now())
 	require.NoError(t, err)
