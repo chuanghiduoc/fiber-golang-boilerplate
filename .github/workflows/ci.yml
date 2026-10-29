@@ -381,7 +381,11 @@ jobs:
           apply() {
             for file in "$@"; do
               echo "applying $file"
-              psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 -q -f "$file"
+              # --single-transaction mirrors golang-migrate: pgx sends the whole
+              # file through the simple protocol as one implicit transaction, so
+              # statements such as LOCK TABLE are valid and a failure rolls back.
+              psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 -q \
+                --single-transaction -f "$file"
             done
           }
           check_tables() {
@@ -594,7 +598,9 @@ jobs:
       - name: Apply schema to integration database
         run: |
           for file in $(find migrations -maxdepth 1 -name '*.up.sql' | sort); do
-            psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$file"
+            # --single-transaction keeps each file atomic, matching the
+            # golang-migrate path used by cmd/migrate and internal/testutil/pgtest.
+            psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -q --single-transaction -f "$file"
           done
 
       - name: Run integration tests (PostgreSQL service)
