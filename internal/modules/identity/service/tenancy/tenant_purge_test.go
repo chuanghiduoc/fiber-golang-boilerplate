@@ -397,6 +397,50 @@ func TestTenantPurgeFailureLeavesTheTenantUnmarkedAndRetries(t *testing.T) {
 	assert.Equal(t, []uuid.UUID{fakes.TestID(7)}, repo.purged)
 }
 
+func TestTenantPurgeProviderBudgetDefersWithoutFailingTheJob(t *testing.T) {
+	svc, repo, _ := newPurgeTestService(t)
+	providers := svc.Registry().Providers()
+	var files *fakePurger
+	for _, provider := range providers {
+		if provider.Name == "files" {
+			files = provider.Purger.(*fakePurger)
+			break
+		}
+	}
+	require.NotNil(t, files)
+	files.err = tenancycontracts.ErrPurgeBudgetExceeded
+
+	require.NoError(t, svc.HandlePurgeJob(fakes.TenantCtx(), nil))
+	assert.Empty(t, repo.purged, "a budget stop must leave the tenant for the next run")
+
+	files.err = nil
+	require.NoError(t, svc.HandlePurgeJob(fakes.TenantCtx(), nil))
+	assert.Equal(t, []uuid.UUID{fakes.TestID(7)}, repo.purged, "the next run resumes and completes")
+}
+
+func TestTenantPurgeParentCancellationStillFailsTheJob(t *testing.T) {
+	svc, repo, _ := newPurgeTestService(t)
+	ctx, cancel := context.WithCancel(fakes.TenantCtx())
+	cancel()
+
+	err := svc.HandlePurgeJob(ctx, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Empty(t, repo.purged, "a shutting-down process must not mark a partially purged tenant complete")
+}
+
+func TestTenantPurgeCancellationWinsOverAnExhaustedClock(t *testing.T) {
+	svc, repo, _ := newPurgeTestService(t)
+	ctx, cancel := context.WithCancel(fakes.TenantCtx())
+	cancel()
+
+	completed, err := svc.eraseMemberships(
+		ctx, time.Now().Add(-tenantPurgeTenantBudget-time.Second), fakes.TestID(7), uuid.Nil,
+	)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, completed)
+	assert.Empty(t, repo.deletedMember, "cancellation must not be reported as a resumable partial run")
+}
+
 func TestTenantPurgeNeverTouchesAnotherTenant(t *testing.T) {
 	privacyRegistry := privacycontracts.NewRegistry()
 	eraser := &tenantRecorderEraser{}

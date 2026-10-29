@@ -8,6 +8,7 @@ package tenancy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"sync"
@@ -20,11 +21,32 @@ import (
 // sets stay constant no matter how large the tenant is.
 const PurgeBatchSize int32 = 500
 
+// ErrPurgeBudgetExceeded tells the orchestrator that a purger stopped at a
+// batch boundary because its context deadline ended. The rows already deleted
+// stay deleted; the next run resumes from the remaining rows. Callers must not
+// turn this into a job failure, because a retry would only repeat intentional
+// deferral work.
+var ErrPurgeBudgetExceeded = errors.New("tenant purge budget exceeded")
+
 // Purger erases every row the module owns for one tenant. It never deletes the
 // tenants row, the tenant's audit trail, or another tenant's data. It must be
 // idempotent: a repeated call after a successful one succeeds.
 type Purger interface {
 	PurgeTenant(ctx context.Context, tenantID uuid.UUID) error
+}
+
+// CheckPurgeBudget returns ErrPurgeBudgetExceeded when the purge budget
+// deadline has elapsed. It returns the original cancellation unchanged, so a
+// shutting-down process is never mistaken for a resumable partial purge.
+func CheckPurgeBudget(ctx context.Context) error {
+	err := ctx.Err()
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrPurgeBudgetExceeded
+	}
+	return err
 }
 
 // Provider is one module's tenant purger.

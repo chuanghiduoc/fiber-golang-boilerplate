@@ -425,8 +425,8 @@ func TestModule_InvalidPathIDIsRejected(t *testing.T) {
 	}
 
 	resp, body = request(t, application, http.MethodGet, "/api/v1/me/api-keys/00000000-0000-0000-0000-000000000000", authz.RoleAdmin, "", "")
-	if resp.StatusCode != fiber.StatusBadRequest {
-		t.Fatalf("nil id status = %d, want 400 (body=%s)", resp.StatusCode, body)
+	if resp.StatusCode != fiber.StatusNotFound {
+		t.Fatalf("nil id status = %d, want 404 (body=%s)", resp.StatusCode, body)
 	}
 }
 

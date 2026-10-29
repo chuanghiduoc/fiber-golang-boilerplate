@@ -1,0 +1,4 @@
+DROP INDEX IF EXISTS idx_webhook_events_tenant_payload_owner_occurred_at_event;
+DROP INDEX IF EXISTS idx_webhook_events_tenant_payload_user_occurred_at_event;
+DROP INDEX IF EXISTS idx_webhook_events_tenant_actor_occurred_at_event;
+DROP INDEX IF EXISTS idx_webhook_events_tenant_occurred_at_event;

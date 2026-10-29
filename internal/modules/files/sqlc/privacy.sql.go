@@ -30,22 +30,26 @@ func (q *Queries) DeleteFileForPrivacy(ctx context.Context, arg DeleteFileForPri
 	return result.RowsAffected(), nil
 }
 
-const listFilesForPrivacy = `-- name: ListFilesForPrivacy :many
+const listFilesForPrivacyLimited = `-- name: ListFilesForPrivacyLimited :many
 
 SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at, purge_attempts, purge_retry_after FROM files
 WHERE tenant_id = $1 AND user_id = $2
-ORDER BY id
+ORDER BY created_at DESC, id DESC
+LIMIT $3::int
 `
 
-type ListFilesForPrivacyParams struct {
+type ListFilesForPrivacyLimitedParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
 }
 
 // Privacy export/erasure. Both queries are scoped to the explicit tenant/user
 // passed by the privacy contract, not a request context.
-func (q *Queries) ListFilesForPrivacy(ctx context.Context, arg ListFilesForPrivacyParams) ([]File, error) {
-	rows, err := q.db.Query(ctx, listFilesForPrivacy, arg.TenantID, arg.UserID)
+// Export: one bounded page, newest first. This order matches
+// idx_files_tenant_user_created (tenant_id, user_id, created_at DESC, id DESC).
+func (q *Queries) ListFilesForPrivacyLimited(ctx context.Context, arg ListFilesForPrivacyLimitedParams) ([]File, error) {
+	rows, err := q.db.Query(ctx, listFilesForPrivacyLimited, arg.TenantID, arg.UserID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}

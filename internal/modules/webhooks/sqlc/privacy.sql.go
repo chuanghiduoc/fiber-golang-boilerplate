@@ -9,16 +9,36 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const deleteUserWebhookDeliveries = `-- name: DeleteUserWebhookDeliveries :exec
 DELETE FROM webhook_deliveries d
-USING webhook_events e
+USING (
+    SELECT tenant_id, event_id
+    FROM webhook_events
+    WHERE tenant_id = $1::uuid
+      AND subject_user_ids @> ARRAY[$2::uuid]
+    UNION
+    SELECT tenant_id, event_id
+    FROM webhook_events
+    WHERE tenant_id = $1::uuid
+      AND actor_type = 'user'
+      AND actor_id = $2::uuid
+    UNION
+    SELECT tenant_id, event_id
+    FROM webhook_events
+    WHERE tenant_id = $1::uuid
+      AND payload->>'userId' = $2::text
+    UNION
+    SELECT tenant_id, event_id
+    FROM webhook_events
+    WHERE tenant_id = $1::uuid
+      AND payload->>'ownerId' = $2::text
+) matched
 WHERE d.tenant_id = $1::uuid
-  AND e.tenant_id = d.tenant_id AND e.event_id = d.event_id
-  AND ((e.actor_type = 'user' AND e.actor_id = $2::uuid)
-       OR e.payload->>'userId' = $2::text
-       OR e.payload->>'ownerId' = $2::text)
+  AND matched.tenant_id = d.tenant_id
+  AND matched.event_id = d.event_id
 `
 
 type DeleteUserWebhookDeliveriesParams struct {
@@ -33,11 +53,32 @@ func (q *Queries) DeleteUserWebhookDeliveries(ctx context.Context, arg DeleteUse
 }
 
 const deleteUserWebhookEvents = `-- name: DeleteUserWebhookEvents :exec
-DELETE FROM webhook_events
-WHERE tenant_id = $1::uuid
-  AND ((actor_type = 'user' AND actor_id = $2::uuid)
-       OR payload->>'userId' = $2::text
-       OR payload->>'ownerId' = $2::text)
+DELETE FROM webhook_events e
+USING (
+    SELECT tenant_id, event_id
+    FROM webhook_events
+    WHERE tenant_id = $1::uuid
+      AND subject_user_ids @> ARRAY[$2::uuid]
+    UNION
+    SELECT tenant_id, event_id
+    FROM webhook_events
+    WHERE tenant_id = $1::uuid
+      AND actor_type = 'user'
+      AND actor_id = $2::uuid
+    UNION
+    SELECT tenant_id, event_id
+    FROM webhook_events
+    WHERE tenant_id = $1::uuid
+      AND payload->>'userId' = $2::text
+    UNION
+    SELECT tenant_id, event_id
+    FROM webhook_events
+    WHERE tenant_id = $1::uuid
+      AND payload->>'ownerId' = $2::text
+) matched
+WHERE e.tenant_id = $1::uuid
+  AND matched.tenant_id = e.tenant_id
+  AND matched.event_id = e.event_id
 `
 
 type DeleteUserWebhookEventsParams struct {
@@ -51,29 +92,102 @@ func (q *Queries) DeleteUserWebhookEvents(ctx context.Context, arg DeleteUserWeb
 }
 
 const listUserWebhookDeliveries = `-- name: ListUserWebhookDeliveries :many
-SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.secret_id, d.url, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at FROM webhook_deliveries d
-JOIN webhook_events e ON e.tenant_id = d.tenant_id AND e.event_id = d.event_id
-WHERE d.tenant_id = $1::uuid
-  AND ((e.actor_type = 'user' AND e.actor_id = $2::uuid)
-       OR e.payload->>'userId' = $2::text
-       OR e.payload->>'ownerId' = $2::text)
-ORDER BY d.created_at DESC, d.id DESC
+WITH candidate_deliveries AS (
+    (SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.secret_id, d.url, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at
+     FROM webhook_deliveries d
+     JOIN webhook_events e
+       ON e.tenant_id = d.tenant_id
+      AND e.event_id = d.event_id
+     WHERE d.tenant_id = $2::uuid
+       AND e.subject_user_ids @> ARRAY[$3::uuid]
+       AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
+     ORDER BY d.created_at DESC, d.id DESC
+     LIMIT $1::int)
+    UNION
+    (SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.secret_id, d.url, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at
+     FROM webhook_deliveries d
+     JOIN webhook_events e
+       ON e.tenant_id = d.tenant_id
+      AND e.event_id = d.event_id
+     WHERE d.tenant_id = $2::uuid
+       AND e.actor_type = 'user'
+       AND e.actor_id = $3::uuid
+       AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
+     ORDER BY d.created_at DESC, d.id DESC
+     LIMIT $1::int)
+    UNION
+    (SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.secret_id, d.url, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at
+     FROM webhook_deliveries d
+     JOIN webhook_events e
+       ON e.tenant_id = d.tenant_id
+      AND e.event_id = d.event_id
+     WHERE d.tenant_id = $2::uuid
+       AND e.payload->>'userId' = $3::text
+       AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
+     ORDER BY d.created_at DESC, d.id DESC
+     LIMIT $1::int)
+    UNION
+    (SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.secret_id, d.url, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at
+     FROM webhook_deliveries d
+     JOIN webhook_events e
+       ON e.tenant_id = d.tenant_id
+      AND e.event_id = d.event_id
+     WHERE d.tenant_id = $2::uuid
+       AND e.payload->>'ownerId' = $3::text
+       AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
+     ORDER BY d.created_at DESC, d.id DESC
+     LIMIT $1::int)
+)
+SELECT id, tenant_id, endpoint_id, event_id, secret_id, url, status, attempts, max_attempts, timeout_ms, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, is_replay, created_at, updated_at
+FROM candidate_deliveries
+ORDER BY created_at DESC, id DESC
+LIMIT $1::int
 `
 
 type ListUserWebhookDeliveriesParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	UserID   uuid.UUID `json:"user_id"`
+	RowLimit        int32              `json:"row_limit"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 }
 
-func (q *Queries) ListUserWebhookDeliveries(ctx context.Context, arg ListUserWebhookDeliveriesParams) ([]WebhookDelivery, error) {
-	rows, err := q.db.Query(ctx, listUserWebhookDeliveries, arg.TenantID, arg.UserID)
+type ListUserWebhookDeliveriesRow struct {
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	EndpointID     uuid.UUID          `json:"endpoint_id"`
+	EventID        uuid.UUID          `json:"event_id"`
+	SecretID       uuid.UUID          `json:"secret_id"`
+	Url            string             `json:"url"`
+	Status         string             `json:"status"`
+	Attempts       int32              `json:"attempts"`
+	MaxAttempts    int32              `json:"max_attempts"`
+	TimeoutMs      int32              `json:"timeout_ms"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	LastStatusCode pgtype.Int4        `json:"last_status_code"`
+	LastError      pgtype.Text        `json:"last_error"`
+	DeliveredAt    pgtype.Timestamptz `json:"delivered_at"`
+	ReplayedFromID uuid.NullUUID      `json:"replayed_from_id"`
+	IsReplay       bool               `json:"is_replay"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
+func (q *Queries) ListUserWebhookDeliveries(ctx context.Context, arg ListUserWebhookDeliveriesParams) ([]ListUserWebhookDeliveriesRow, error) {
+	rows, err := q.db.Query(ctx, listUserWebhookDeliveries,
+		arg.RowLimit,
+		arg.TenantID,
+		arg.UserID,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []WebhookDelivery{}
+	items := []ListUserWebhookDeliveriesRow{}
 	for rows.Next() {
-		var i WebhookDelivery
+		var i ListUserWebhookDeliveriesRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
@@ -106,23 +220,70 @@ func (q *Queries) ListUserWebhookDeliveries(ctx context.Context, arg ListUserWeb
 
 const listUserWebhookEvents = `-- name: ListUserWebhookEvents :many
 
-SELECT tenant_id, event_id, event_type, data_version, actor_type, actor_id, occurred_at, payload, created_at FROM webhook_events
-WHERE tenant_id = $1::uuid
-  AND ((actor_type = 'user' AND actor_id = $2::uuid)
-       OR payload->>'userId' = $2::text
-       OR payload->>'ownerId' = $2::text)
-ORDER BY occurred_at DESC, event_id
+WITH candidate_events AS (
+    (SELECT tenant_id, event_id, occurred_at
+     FROM webhook_events
+     WHERE tenant_id = $1::uuid
+       AND subject_user_ids @> ARRAY[$3::uuid]
+       AND (occurred_at, event_id) < ($4::timestamptz, $5::uuid)
+     ORDER BY occurred_at DESC, event_id DESC
+     LIMIT $2::int)
+    UNION ALL
+    (SELECT tenant_id, event_id, occurred_at
+     FROM webhook_events
+     WHERE tenant_id = $1::uuid
+       AND actor_type = 'user'
+       AND actor_id = $3::uuid
+       AND (occurred_at, event_id) < ($4::timestamptz, $5::uuid)
+     ORDER BY occurred_at DESC, event_id DESC
+     LIMIT $2::int)
+    UNION ALL
+    (SELECT tenant_id, event_id, occurred_at
+     FROM webhook_events
+     WHERE tenant_id = $1::uuid
+       AND payload->>'userId' = $3::text
+       AND (occurred_at, event_id) < ($4::timestamptz, $5::uuid)
+     ORDER BY occurred_at DESC, event_id DESC
+     LIMIT $2::int)
+    UNION ALL
+    (SELECT tenant_id, event_id, occurred_at
+     FROM webhook_events
+     WHERE tenant_id = $1::uuid
+       AND payload->>'ownerId' = $3::text
+       AND (occurred_at, event_id) < ($4::timestamptz, $5::uuid)
+     ORDER BY occurred_at DESC, event_id DESC
+     LIMIT $2::int)
+),
+matched_events AS (
+    SELECT DISTINCT tenant_id, event_id, occurred_at
+    FROM candidate_events
+)
+SELECT e.tenant_id, e.event_id, e.event_type, e.data_version, e.actor_type, e.actor_id, e.occurred_at, e.payload, e.created_at, e.subject_user_ids
+FROM webhook_events e
+JOIN matched_events m ON m.tenant_id = e.tenant_id AND m.event_id = e.event_id
+WHERE e.tenant_id = $1::uuid
+ORDER BY m.occurred_at DESC, m.event_id DESC
+LIMIT $2::int
 `
 
 type ListUserWebhookEventsParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	UserID   uuid.UUID `json:"user_id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	RowLimit         int32              `json:"row_limit"`
+	UserID           uuid.UUID          `json:"user_id"`
+	CursorOccurredAt pgtype.Timestamptz `json:"cursor_occurred_at"`
+	CursorID         uuid.UUID          `json:"cursor_id"`
 }
 
 // Privacy export/erasure for stored webhook event history attributed to one
 // user. Endpoint configuration is tenant-wide and is not touched.
 func (q *Queries) ListUserWebhookEvents(ctx context.Context, arg ListUserWebhookEventsParams) ([]WebhookEvent, error) {
-	rows, err := q.db.Query(ctx, listUserWebhookEvents, arg.TenantID, arg.UserID)
+	rows, err := q.db.Query(ctx, listUserWebhookEvents,
+		arg.TenantID,
+		arg.RowLimit,
+		arg.UserID,
+		arg.CursorOccurredAt,
+		arg.CursorID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -140,6 +301,7 @@ func (q *Queries) ListUserWebhookEvents(ctx context.Context, arg ListUserWebhook
 			&i.OccurredAt,
 			&i.Payload,
 			&i.CreatedAt,
+			&i.SubjectUserIds,
 		); err != nil {
 			return nil, err
 		}

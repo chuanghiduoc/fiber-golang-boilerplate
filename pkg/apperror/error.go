@@ -15,10 +15,6 @@ import (
 // Services should check errors.Is(err, ErrNotFound) instead of importing database drivers.
 var ErrNotFound = errors.New("record not found")
 
-// DocsBaseURL is prepended to the Problem Details "type" URI (RFC 9457).
-// Set once at startup from ERROR_DOCS_BASE_URL; empty yields relative "/errors/...".
-var DocsBaseURL = ""
-
 // StatusClientClosedRequest is the de-facto (nginx) status for a request whose
 // client disconnected before the response. It is a client outcome, so it is
 // logged at Info and never counted as a server error.
@@ -98,7 +94,7 @@ func (e *AppError) Problem(requestID, instance string) ProblemDetails {
 		title = "Internal Server Error"
 	}
 	return ProblemDetails{
-		Type:      DocsBaseURL + "/errors/" + slugCode(e.Code),
+		Type:      "/errors/" + slugCode(e.Code),
 		Title:     title,
 		Status:    status,
 		Code:      e.Code,
@@ -106,7 +102,7 @@ func (e *AppError) Problem(requestID, instance string) ProblemDetails {
 		Instance:  instance,
 		RequestID: requestID,
 		Timestamp: timestamp(),
-		Errors:    e.Errors,
+		Errors:    normalizeFieldPaths(e.Errors),
 	}
 }
 
@@ -263,8 +259,8 @@ type ProblemDetails struct {
 	Detail    string       `json:"detail"`
 	Instance  string       `json:"instance"`
 	RequestID string       `json:"requestId"`
-	Timestamp string       `json:"timestamp"`
-	Errors    []FieldError `json:"errors,omitempty"`
+	Timestamp string       `json:"timestamp" format:"date-time" doc:"RFC 3339 timestamp."`
+	Errors    []FieldError `json:"errors,omitempty" nullable:"false" doc:"Field-level errors when present; omitted otherwise, never null."`
 }
 
 // Error makes ProblemDetails an error value.

@@ -141,12 +141,12 @@ type intentRecorder struct {
 
 func (r *intentRecorder) Record(context.Context, audit.Event) error { return nil }
 
-func (r *intentRecorder) RecordID(_ context.Context, event audit.Event) (uuid.UUID, error) {
+func (r *intentRecorder) RecordID(_ context.Context, event audit.Event) (audit.IntentRef, error) {
 	r.intents = append(r.intents, event)
-	return testID(len(r.intents)), nil
+	return audit.IntentRef{ID: testID(len(r.intents))}, nil
 }
 
-func (r *intentRecorder) Complete(_ context.Context, _ uuid.UUID, completion audit.Completion) error {
+func (r *intentRecorder) Complete(_ context.Context, _ audit.IntentRef, completion audit.Completion) error {
 	r.completions = append(r.completions, completion)
 	return nil
 }
@@ -291,7 +291,10 @@ func TestHandlerUpdateFlagMergePatch(t *testing.T) {
 	assert.Equal(t, time.Unix(1700000000, 0).UTC(), svc.lastVersion.UpdatedAt.UTC())
 
 	resp, _ = doRequest(t, app, http.MethodPatch, platformFlagsPath+"/file_uploads",
-		[]byte(`{"enabled":true}`), map[string]string{"If-Match": `"stale"`})
+		[]byte(`{"enabled":true}`), map[string]string{
+			"Content-Type": "application/merge-patch+json",
+			"If-Match":     `"stale"`,
+		})
 	assert.Equal(t, fiber.StatusPreconditionFailed, resp.StatusCode)
 
 	resp, _ = doRequest(t, app, http.MethodPatch, platformFlagsPath+"/file_uploads",
@@ -465,4 +468,11 @@ func TestHandlerTargetListURLIsConcrete(t *testing.T) {
 	_, body = doRequest(t, app, http.MethodGet, tenantFlagsPath+"/file_uploads/targets", nil, nil)
 	require.NoError(t, json.Unmarshal(body, &list))
 	assert.Equal(t, "/api/v1/feature-flags/file_uploads/targets", list.URL)
+}
+
+func TestInvalidTargetIDMessageMatchesParserContract(t *testing.T) {
+	_, err := parsePlatformTargetID("user:not-a-uuid")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported or invalid format")
+	assert.NotContains(t, err.Error(), "user:{userId},")
 }

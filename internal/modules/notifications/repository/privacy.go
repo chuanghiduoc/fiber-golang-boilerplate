@@ -21,12 +21,19 @@ func NewPrivacyStore(db notificationsqlc.DBTX) *PrivacyStore {
 	return &PrivacyStore{q: notificationsqlc.New(db)}
 }
 
-func (s *PrivacyStore) ListNotifications(ctx context.Context, tenantID, userID uuid.UUID) ([]notificationsprivacy.Notification, error) {
+func (s *PrivacyStore) ListNotifications(ctx context.Context, tenantID, userID uuid.UUID, limit int32) ([]notificationsprivacy.Notification, bool, error) {
+	if limit <= 0 {
+		return []notificationsprivacy.Notification{}, false, nil
+	}
 	rows, err := s.q.ListNotificationsForPrivacy(ctx, notificationsqlc.ListNotificationsForPrivacyParams{
-		TenantID: tenantID, UserID: userID,
+		TenantID: tenantID, UserID: userID, RowLimit: limit + 1,
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	truncated := len(rows) > int(limit)
+	if truncated {
+		rows = rows[:limit]
 	}
 	out := make([]notificationsprivacy.Notification, len(rows))
 	for i, row := range rows {
@@ -36,15 +43,22 @@ func (s *PrivacyStore) ListNotifications(ctx context.Context, tenantID, userID u
 			CreatedAt: row.CreatedAt.Time,
 		}
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
-func (s *PrivacyStore) ListPreferences(ctx context.Context, tenantID, userID uuid.UUID) ([]notificationsprivacy.Preference, error) {
+func (s *PrivacyStore) ListPreferences(ctx context.Context, tenantID, userID uuid.UUID, limit int32) ([]notificationsprivacy.Preference, bool, error) {
+	if limit <= 0 {
+		return []notificationsprivacy.Preference{}, false, nil
+	}
 	rows, err := s.q.ListPreferencesForPrivacy(ctx, notificationsqlc.ListPreferencesForPrivacyParams{
-		TenantID: tenantID, UserID: userID,
+		TenantID: tenantID, UserID: userID, RowLimit: limit + 1,
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	truncated := len(rows) > int(limit)
+	if truncated {
+		rows = rows[:limit]
 	}
 	out := make([]notificationsprivacy.Preference, len(rows))
 	for i, row := range rows {
@@ -52,16 +66,11 @@ func (s *PrivacyStore) ListPreferences(ctx context.Context, tenantID, userID uui
 			Type: row.Type, Channel: row.Channel, Enabled: row.Enabled, UpdatedAt: row.UpdatedAt.Time,
 		}
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 func (s *PrivacyStore) DeleteAll(ctx context.Context, tenantID, userID uuid.UUID) error {
-	if err := s.q.DeleteNotificationPreferencesForPrivacy(ctx, notificationsqlc.DeleteNotificationPreferencesForPrivacyParams{
-		TenantID: tenantID, UserID: userID,
-	}); err != nil {
-		return err
-	}
-	return s.q.DeleteNotificationsForPrivacy(ctx, notificationsqlc.DeleteNotificationsForPrivacyParams{
+	return s.q.DeleteAllNotificationPrivacy(ctx, notificationsqlc.DeleteAllNotificationPrivacyParams{
 		TenantID: tenantID, UserID: userID,
 	})
 }

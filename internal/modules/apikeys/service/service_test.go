@@ -430,6 +430,66 @@ func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestService_OwnerHasPermissionFailsClosedWithoutRole(t *testing.T) {
+	svc := &service{authorizer: testAuthorizer}
+	tests := []struct {
+		name      string
+		principal identitycontracts.Principal
+		want      bool
+	}{
+		{
+			name:      "empty principal",
+			principal: identitycontracts.Principal{},
+			want:      false,
+		},
+		{
+			name:      "known role without explicit permissions",
+			principal: identitycontracts.Principal{Role: authz.RoleMember},
+			want:      true,
+		},
+		{
+			name:      "unknown role without explicit permissions",
+			principal: identitycontracts.Principal{Role: "unknown"},
+			want:      false,
+		},
+		{
+			name:      "explicit permission without role",
+			principal: identitycontracts.Principal{Permissions: []string{string(testScopeFilesRead)}},
+			want:      true,
+		},
+		{
+			name:      "explicit empty permission set overrides role",
+			principal: identitycontracts.Principal{Role: authz.RoleMember, Permissions: []string{}},
+			want:      false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := svc.ownerHasPermission(tt.principal, testScopeFilesRead); got != tt.want {
+				t.Fatalf("ownerHasPermission(%+v) = %v, want %v", tt.principal, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestService_CreateRejectsScopesWhenOwnerPrincipalHasNoRole(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{
+		testUser: {ID: testUser, TenantID: testTenantA, TenantStatus: identitycontracts.TenantStatusActive},
+	}}
+	svc := newTestService(repo, principals)
+
+	_, err := svc.Create(testContext(testTenantA), testUser, CreateInput{
+		Name: "no-role", Scopes: []string{"files:read"},
+	})
+	if !isBadRequest(err) {
+		t.Fatalf("create error = %v, want 400", err)
+	}
+	if len(repo.keys) != 0 {
+		t.Fatal("a principal without a role must not mint a key")
+	}
+}
+
 func TestService_RotateOnlyIssuesSecretsToTheOwner(t *testing.T) {
 	repo := newFakeRepo()
 	principals := fakePrincipals{users: map[uuid.UUID]identitycontracts.Principal{

@@ -10,8 +10,8 @@ import (
 // authorize is the service-level check every use case runs first: the caller
 // needs permission in the request tenant. Routes check the permission too;
 // this keeps jobs and any other transport on the same fail-closed path
-// (authz.Authorize denies a context with neither a subject nor
+// (authz.Authorizer denies a context with neither a subject nor
 // authz.SystemContext).
-func authorize(ctx context.Context, permission authz.Permission) error {
-	return authz.Authorize(ctx, permission, authz.Resource{TenantID: tenant.IDFromContext(ctx)}, authz.TenantPolicy{})
+func authorize(ctx context.Context, authorizer authz.Authorizer, permission authz.Permission) error {
+	return authorizer.Authorize(ctx, permission, authz.Resource{TenantID: tenant.IDFromContext(ctx)}, authz.TenantPolicy{})
 }

@@ -26,6 +26,12 @@ tmp/
 
 # Environment
 .env
+.env.*
+!.env.example
+
+# Local agent scratch/state
+.claude/
+.workbuddy-ai/
 
 # Project build
 main

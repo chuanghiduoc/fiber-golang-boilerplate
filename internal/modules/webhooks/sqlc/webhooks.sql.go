@@ -292,24 +292,25 @@ const createWebhookEvent = `-- name: CreateWebhookEvent :exec
 
 INSERT INTO webhook_events (
     tenant_id, event_id, event_type, data_version, actor_type, actor_id,
-    occurred_at, payload
+    subject_user_ids, occurred_at, payload
 )
 VALUES (
     $1, $2, $3, $4, $5,
-    $6, $7, $8::jsonb
+    $6, $7::uuid[], $8, $9::jsonb
 )
 ON CONFLICT (tenant_id, event_id) DO NOTHING
 `
 
 type CreateWebhookEventParams struct {
-	TenantID    uuid.UUID          `json:"tenant_id"`
-	EventID     uuid.UUID          `json:"event_id"`
-	EventType   string             `json:"event_type"`
-	DataVersion int32              `json:"data_version"`
-	ActorType   string             `json:"actor_type"`
-	ActorID     uuid.NullUUID      `json:"actor_id"`
-	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
-	Payload     []byte             `json:"payload"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	EventID        uuid.UUID          `json:"event_id"`
+	EventType      string             `json:"event_type"`
+	DataVersion    int32              `json:"data_version"`
+	ActorType      string             `json:"actor_type"`
+	ActorID        uuid.NullUUID      `json:"actor_id"`
+	SubjectUserIds []uuid.UUID        `json:"subject_user_ids"`
+	OccurredAt     pgtype.Timestamptz `json:"occurred_at"`
+	Payload        []byte             `json:"payload"`
 }
 
 // Events and deliveries -----------------------------------------------------
@@ -324,6 +325,7 @@ func (q *Queries) CreateWebhookEvent(ctx context.Context, arg CreateWebhookEvent
 		arg.DataVersion,
 		arg.ActorType,
 		arg.ActorID,
+		arg.SubjectUserIds,
 		arg.OccurredAt,
 		arg.Payload,
 	)

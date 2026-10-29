@@ -84,9 +84,10 @@ func (t *Transactor) InTx(ctx context.Context, fn func(ctx context.Context, tx c
 			Stores: NewStores(tx, t.bans),
 			Audit:  txAudit{recorder: t.audit, tx: tx},
 			Events: txEvents{bus: t.bus, tx: tx},
-			// The callback list only runs after WithTx commits, so a
-			// post-commit fallback (for example an email sent outside the
-			// outbox) can never fire on a rollback.
+			// The callback list only runs after WithTx commits, so
+			// post-commit cleanup can never fire on a rollback. Security
+			// notifications deliberately do not use this hook: they must go
+			// through the transactional email outbox.
 			AfterCommit: func(f func()) {
 				if f != nil {
 					afterCommit = append(afterCommit, f)

@@ -21,7 +21,9 @@ import (
 )
 
 // StartPasskeyRegistrationInput starts an authenticated registration ceremony.
-type StartPasskeyRegistrationInput struct{}
+type StartPasskeyRegistrationInput struct {
+	Body *dto.PasskeyReauthRequest
+}
 
 // CreatePasskeyInput verifies a registration attestation. The body is the
 // browser's PublicKeyCredential, optionally wrapped as {"name":...,"credential":...}.
@@ -31,6 +33,11 @@ type CreatePasskeyInput struct {
 
 // DeletePasskeyInput removes one of the caller's passkeys.
 type DeletePasskeyInput struct {
+	PasskeyID uuid.UUID `path:"passkeyId" doc:"Passkey id."`
+	Body      *dto.PasskeyReauthRequest
+}
+
+type passkeyIDInput struct {
 	PasskeyID uuid.UUID `path:"passkeyId" doc:"Passkey id."`
 }
 
@@ -53,9 +60,10 @@ type StepUpPasskeyInput struct {
 // PasskeyManager is the passkey surface the passkey handlers use.
 // *mfa.PasskeyService implements it.
 type PasskeyManager interface {
-	BeginRegistration(ctx context.Context, userID uuid.UUID) (*protocol.CredentialCreation, error)
+	BeginRegistration(ctx context.Context, userID uuid.UUID, proof core.ReauthProof) (*protocol.CredentialCreation, error)
 	FinishRegistration(ctx context.Context, userID uuid.UUID, name string, raw []byte) (*core.Passkey, error)
-	Delete(ctx context.Context, userID, passkeyID uuid.UUID) error
+	Delete(ctx context.Context, userID, passkeyID uuid.UUID, proof core.ReauthProof) error
+	List(ctx context.Context, userID uuid.UUID) ([]core.Passkey, error)
 	BeginLogin(ctx context.Context, email string) (*protocol.CredentialAssertion, error)
 	FinishLogin(ctx context.Context, raw []byte, admit mfa.Admission) (*mfa.PasskeyLogin, error)
 	StepUpPasskey(ctx context.Context, userID, sessionID uuid.UUID, raw []byte) (time.Time, error)
@@ -85,7 +93,7 @@ func NewPasskeyHandler(passkeys PasskeyManager, stepUp StepUp, auth *AuthHandler
 }
 
 // StartRegistration returns the registration options for the signed-in user.
-func (h *PasskeyHandler) StartRegistration(ctx context.Context, _ *StartPasskeyRegistrationInput) (*httpapi.Output[json.RawMessage], error) {
+func (h *PasskeyHandler) StartRegistration(ctx context.Context, input *StartPasskeyRegistrationInput) (*httpapi.Output[json.RawMessage], error) {
 	if h.passkeys == nil {
 		return nil, passkeysNotConfigured()
 	}
@@ -93,7 +101,15 @@ func (h *PasskeyHandler) StartRegistration(ctx context.Context, _ *StartPasskeyR
 	if err != nil {
 		return nil, err
 	}
-	creation, err := h.passkeys.BeginRegistration(ctx, userID)
+	sessionID := requestctx.SessionID(ctx)
+	if sessionID == uuid.Nil {
+		return nil, apperror.NewUnauthorized("session is required")
+	}
+	var currentPassword string
+	if input.Body != nil {
+		currentPassword = input.Body.CurrentPassword
+	}
+	creation, err := h.passkeys.BeginRegistration(ctx, userID, core.ReauthProof{SessionID: sessionID, CurrentPassword: currentPassword})
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +145,49 @@ func (h *PasskeyHandler) Create(ctx context.Context, input *CreatePasskeyInput) 
 	return httpapi.NewCreated("/api/v1/me/mfa/passkeys/"+passkey.ID.String(), response), nil
 }
 
+// List returns the caller's passkeys without any credential material.
+func (h *PasskeyHandler) List(ctx context.Context, _ *struct{}) (*httpapi.Output[dto.PasskeyListResponse], error) {
+	if h.passkeys == nil {
+		return nil, passkeysNotConfigured()
+	}
+	userID, err := passkeyUserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	passkeys, err := h.passkeys.List(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]dto.PasskeyResponse, len(passkeys))
+	for i := range passkeys {
+		out[i] = toPasskeyResponse(&passkeys[i])
+	}
+	return &httpapi.Output[dto.PasskeyListResponse]{Body: dto.PasskeyListResponse{Passkeys: out}}, nil
+}
+
+// Get returns one passkey owned by the caller. Another user's id behaves as
+// not found, which keeps the created Location dereferenceable without leaking
+// ownership.
+func (h *PasskeyHandler) Get(ctx context.Context, input *passkeyIDInput) (*httpapi.Output[dto.PasskeyResponse], error) {
+	if h.passkeys == nil {
+		return nil, passkeysNotConfigured()
+	}
+	userID, err := passkeyUserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	passkeys, err := h.passkeys.List(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range passkeys {
+		if passkeys[i].ID == input.PasskeyID {
+			return &httpapi.Output[dto.PasskeyResponse]{Body: toPasskeyResponse(&passkeys[i])}, nil
+		}
+	}
+	return nil, apperror.NewCode(identitycatalog.CodeAuthPasskeyNotFound, "passkey not found")
+}
+
 // Delete removes one of the caller's passkeys. The row is global to the user,
 // so another user's id behaves as not found.
 func (h *PasskeyHandler) Delete(ctx context.Context, input *DeletePasskeyInput) (*httpapi.Empty, error) {
@@ -139,7 +198,15 @@ func (h *PasskeyHandler) Delete(ctx context.Context, input *DeletePasskeyInput) 
 	if err != nil {
 		return nil, err
 	}
-	if err := h.passkeys.Delete(ctx, userID, input.PasskeyID); err != nil {
+	sessionID := requestctx.SessionID(ctx)
+	if sessionID == uuid.Nil {
+		return nil, apperror.NewUnauthorized("session is required")
+	}
+	var currentPassword string
+	if input.Body != nil {
+		currentPassword = input.Body.CurrentPassword
+	}
+	if err := h.passkeys.Delete(ctx, userID, input.PasskeyID, core.ReauthProof{SessionID: sessionID, CurrentPassword: currentPassword}); err != nil {
 		return nil, err
 	}
 	return &httpapi.Empty{}, nil
@@ -244,10 +311,7 @@ func (h *PasskeyHandler) admit(ctx context.Context, member *core.Member) error {
 	if h.auth == nil {
 		return nil
 	}
-	if !member.User.EmailVerified() && h.auth.emailVerificationRequired(ctx, member) {
-		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
-	}
-	return nil
+	return h.auth.Admission(ctx, member)
 }
 
 // passkeyUserID returns the authenticated user of a JWT-only operation.

@@ -76,25 +76,6 @@ func (r *DataExportRepository) Get(ctx context.Context, userID, id uuid.UUID) (*
 	return &export, nil
 }
 
-func (r *DataExportRepository) ListForUser(ctx context.Context, userID uuid.UUID) ([]core.DataExport, error) {
-	tenantID, err := tenant.Require(ctx)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := r.q.ListDataExportsForUser(ctx, identitysqlc.ListDataExportsForUserParams{
-		TenantID: tenantID,
-		UserID:   userID,
-	})
-	if err != nil {
-		return nil, wrapErr(err)
-	}
-	exports := make([]core.DataExport, len(rows))
-	for i := range rows {
-		exports[i] = toDataExport(rows[i])
-	}
-	return exports, nil
-}
-
 func (r *DataExportRepository) ListCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]core.DataExport, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
@@ -157,23 +138,15 @@ func (r *DataExportRepository) MarkFailed(ctx context.Context, userID, id uuid.U
 	}))
 }
 
-func (r *DataExportRepository) ExpireForUser(ctx context.Context, userID uuid.UUID) ([]core.DataExport, error) {
+func (r *DataExportRepository) ExpireForUser(ctx context.Context, userID uuid.UUID) error {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	rows, err := r.q.ExpireDataExportsForUser(ctx, identitysqlc.ExpireDataExportsForUserParams{
+	return wrapErr(r.q.ExpireDataExportsForUser(ctx, identitysqlc.ExpireDataExportsForUserParams{
 		TenantID: tenantID,
 		UserID:   userID,
-	})
-	if err != nil {
-		return nil, wrapErr(err)
-	}
-	exports := make([]core.DataExport, len(rows))
-	for i := range rows {
-		exports[i] = toDataExport(rows[i])
-	}
-	return exports, nil
+	}))
 }
 
 func (r *DataExportRepository) DeleteForUser(ctx context.Context, userID uuid.UUID) error {
@@ -205,23 +178,28 @@ func (r *DataExportRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	return wrapErr(r.q.DeleteDataExport(ctx, id))
 }
 
-func (r *DataExportRepository) ListSessions(ctx context.Context, userID uuid.UUID) ([]core.Session, error) {
+func (r *DataExportRepository) ListSessions(ctx context.Context, userID uuid.UUID, limit int32) ([]core.Session, bool, error) {
+	if limit <= 0 {
+		return []core.Session{}, false, nil
+	}
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	rows, err := r.q.ListUserSessionsForPrivacy(ctx, identitysqlc.ListUserSessionsForPrivacyParams{
 		TenantID: tenantID,
 		UserID:   userID,
+		RowLimit: limit + 1,
 	})
 	if err != nil {
-		return nil, wrapErr(err)
+		return nil, false, wrapErr(err)
 	}
+	rows, truncated := trimExportRows(rows, limit)
 	sessions := make([]core.Session, len(rows))
 	for i := range rows {
 		sessions[i] = toSession(rows[i])
 	}
-	return sessions, nil
+	return sessions, truncated, nil
 }
 
 func (r *DataExportRepository) AnonymizeUser(ctx context.Context, userID uuid.UUID, email string) (*core.User, error) {

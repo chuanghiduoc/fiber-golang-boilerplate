@@ -69,7 +69,7 @@ changes run as a separate one-shot `cmd/migrate` step.
 flowchart LR
     client([Client]) --> mw
     subgraph api["cmd/api process"]
-        mw["Global middleware<br/>recovery, CORS, security headers,<br/>request ID, i18n, tracing, metrics,<br/>logger, body limit, audit, timeout"]
+        mw["Global middleware<br/>recovery, request ID, security headers,<br/>CORS, i18n, tracing, metrics, logger,<br/>timeout, body limit, audit"]
         ver["/api/vN<br/>version guard + tenant resolution"]
         mods["Modules<br/>identity, files, admin, features,<br/>webhooks, apikeys, notifications"]
         contracts["internal/contracts<br/>(stdlib-only interfaces)"]
@@ -94,13 +94,13 @@ flowchart LR
 ```mermaid
 flowchart TD
     A["Use this template on GitHub"] --> B["git clone, then<br/>scripts/rename-module.sh"]
-    B --> C["go mod tidy<br/>cp .env.example .env"]
+    B --> C["go mod tidy<br/>make env"]
     C --> D{Docker?}
     D -->|yes| E["make docker-run"]
     D -->|no| F["make run<br/>(Go 1.27.3+, PostgreSQL)"]
     E --> G["Compose migrate service<br/>applies the schema"]
     F --> H["cmd/migrate<br/>applies the schema"]
-    G --> I["Compose seed service<br/>creates the bootstrap admin"]
+    G --> I["Optional seed profile<br/>creates the bootstrap admin"]
     H --> I
     I --> J["Check /healthz, /readyz, /openapi.yaml"]
 ```
@@ -125,14 +125,14 @@ needs `go` and `perl`), so it is safe to re-run after a rename.
 **With Docker (recommended):**
 
 ```bash
-cp .env.example .env
+make env          # writes .env with generated local secrets (chmod 600)
 make docker-run
 ```
 
 | Service | Port | Notes |
 |---------|------|-------|
 | API | `:8080` | Starts after the one-shot `migrate` service succeeds |
-| Seed | — | One-shot `cmd/seed` after `migrate`; creates the bootstrap admin and exits |
+| Seed | — | Opt-in `cmd/seed` profile after `migrate`; creates the bootstrap admin and exits |
 | PostgreSQL | `:5432` | `postgres:18-alpine` |
 | Redis | `:6379` | `redis:8-alpine` |
 | SeaweedFS S3 gateway | `:8333` | Optional: `STORAGE_DRIVER=seaweedfs docker compose --profile s3 up` |
@@ -141,27 +141,32 @@ make docker-run
 **Without Docker** (requires Go 1.27.3+ and PostgreSQL):
 
 ```bash
-cp .env.example .env
-# Edit .env with your database credentials
+make env          # writes .env with generated local secrets (chmod 600)
+# Edit .env if your PostgreSQL host/credentials differ
 make run
 ```
 
 `make run` applies the schema through `cmd/migrate` before starting the API.
-The admin user is created only by `cmd/seed` (`make seed`, the Compose `seed`
-service, or the Kubernetes seed Job), never by API startup.
+The admin user is created only by `cmd/seed` (`make seed`, the opt-in Compose
+`seed` profile, or the Kubernetes seed Job), never by API startup. For Compose:
+
+```bash
+docker compose --profile seed run --rm seed
+```
 
 
 ## Commands
 
 ```bash
 make run                 # apply the schema, then run the API locally
-make docker-run          # Compose: migrate and seed jobs, then the API
+make env                 # create .env with generated local secrets
+make docker-run          # Compose: migrate, then the API (seed is opt-in)
 make check               # vet + lint + architecture tests + unit tests
 make test-integration    # integration tests (testcontainers or TEST_DATABASE_URL)
 make gen module=billing  # scaffold a module (also resource= / command= / query=)
 make migrate-create module=files name=add_x  # new UTC-timestamp migration
 make sqlc-generate       # regenerate every module's sqlc code
-make openapi             # regenerate OpenAPI 3.1 (docs/openapi.yaml, /openapi.json)
+make openapi             # regenerate OpenAPI 3.1 (docs/openapi.yaml; served at /openapi.json and /openapi.yaml)
 ```
 
 See the `Makefile` for the full list.
@@ -187,9 +192,9 @@ the important ones.
 
 ## Scope
 
-A production-minded boilerplate, not a finished SaaS platform. Per-tenant
-quotas and full promotion/rollout automation are future work; tracing is
-disabled by default.
+A production-minded boilerplate, not a finished SaaS platform. File storage
+quotas are implemented; broader per-tenant resource limits and full
+promotion/rollout automation are future work. Tracing is disabled by default.
 
 ## License
 

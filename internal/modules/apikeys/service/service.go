@@ -696,7 +696,9 @@ func (s *service) normalizeScopes(raw []string, principal identitycontracts.Prin
 
 func (s *service) ownerHasPermission(principal identitycontracts.Principal, permission authz.Permission) bool {
 	if principal.Permissions == nil {
-		return principal.Role == "" || s.authorizer.Has(principal.Role, permission)
+		// An empty role is not a valid principal. Falling through here would
+		// treat a partially loaded owner as holding every scope in the catalog.
+		return principal.Role != "" && s.authorizer.Has(principal.Role, permission)
 	}
 	for _, granted := range principal.Permissions {
 		if granted == string(permission) {

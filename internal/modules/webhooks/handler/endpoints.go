@@ -71,6 +71,12 @@ func (h *Handler) UpdateEndpoint(ctx context.Context, in *updateWebhookEndpointI
 	if err := httpapi.CheckIfMatchValue(in.IfMatch, versionETag(current.UpdatedAt)); err != nil {
 		return nil, err
 	}
+	if endpointPatchEmpty(in.Body) {
+		return &httpapi.ETagOutput[dto.WebhookEndpointResponse]{
+			ETag: versionETag(current.UpdatedAt),
+			Body: toEndpointResponse(current),
+		}, nil
+	}
 	update := applyEndpointPatch(current, in.Body)
 	if in.IfMatch != "" {
 		expected := current.UpdatedAt

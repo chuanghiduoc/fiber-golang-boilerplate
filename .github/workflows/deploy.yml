@@ -398,10 +398,32 @@ jobs:
           kustomize build "$RENDER_DIR/k8s/overlays/$TARGET_ENV/migration" > "$RENDER_DIR/migration.yaml"
           kustomize build "$RENDER_DIR/k8s/overlays/$TARGET_ENV/seed" > "$RENDER_DIR/seed.yaml"
 
+          # Placeholders are useful in the repository template and in dry-run
+          # output, but a real deployment must not apply them. In particular,
+          # APP_TRUSTED_PROXIES=REPLACE_WITH_INGRESS_NGINX_POD_CIDR fails at
+          # startup, while a placeholder bucket/access key can reach the
+          # cluster and fail later during an upload.
+          if [ "${DRY_RUN:-false}" != "true" ]; then
+            placeholders="$(grep -En 'REPLACE_WITH_[A-Za-z0-9_]+' \
+              "$RENDER_DIR/app.yaml" "$RENDER_DIR/prereqs.yaml" \
+              "$RENDER_DIR/migration.yaml" "$RENDER_DIR/seed.yaml" || true)"
+            if [ -n "$placeholders" ]; then
+              printf '%s\n' "$placeholders"
+              echo "::error::rendered manifests still contain REPLACE_WITH_* placeholders; fill them before deploying"
+              exit 1
+            fi
+          fi
+
           # Guard the ordering invariant: the app overlay must never contain a
           # Secret, the migration Job, or the seed Job.
           if grep -qx 'kind: Secret' "$RENDER_DIR/app.yaml"; then
             echo "::error::the app overlay must not render a Secret"
+            exit 1
+          fi
+          # Admin credentials are seed-only. Shipping ADMIN_EMAIL without the
+          # seed-only ADMIN_PASSWORD makes config.Load reject every API start.
+          if grep -Eq '^[[:space:]]*ADMIN_(EMAIL|PASSWORD|PASSWORD_FILE|NAME):' "$RENDER_DIR/app.yaml"; then
+            echo "::error::the app overlay must not contain seed-only ADMIN_* settings"
             exit 1
           fi
           for job in "$MIGRATION_JOB" "$SEED_JOB"; do

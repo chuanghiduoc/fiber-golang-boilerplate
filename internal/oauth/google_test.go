@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 
@@ -122,6 +124,16 @@ func TestExchangeReturnsSentinelForIncompleteUserInfo(t *testing.T) {
 	}
 }
 
+func TestExchangeRejectsOversizedUserInfo(t *testing.T) {
+	body := `{"id":"google-1","email":"user@example.com","verified_email":true,"padding":"` +
+		strings.Repeat("x", maxGoogleUserInfoBytes) + `"}`
+	g := newExchangeServer(t, body)
+	_, err := g.Exchange(context.Background(), "auth-code", "verifier")
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("Exchange error = %v, want oversized userinfo rejection", err)
+	}
+}
+
 func TestExchangeSendsCodeVerifier(t *testing.T) {
 	var gotVerifier string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -168,5 +180,48 @@ func TestExchangeSendsCodeVerifier(t *testing.T) {
 	}
 	if info.Email != "user@example.com" || !info.VerifiedEmail {
 		t.Errorf("user info = %+v", info)
+	}
+}
+
+func TestExchangeBoundsUpstreamCalls(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "provider-access", "token_type": "Bearer", "expires_in": 3600,
+			})
+		case "/userinfo":
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := configForTest()
+	g := &GoogleOAuth{
+		cfg: &oauth2.Config{
+			ClientID:     cfg.GoogleClientID,
+			ClientSecret: cfg.GoogleClientSecret,
+			RedirectURL:  cfg.GoogleRedirectURL,
+			Scopes:       []string{"email", "profile"},
+			Endpoint:     oauth2.Endpoint{AuthURL: srv.URL + "/auth", TokenURL: srv.URL + "/token"},
+		},
+		frontendURL: cfg.FrontendURL,
+		userInfoURL: srv.URL + "/userinfo",
+		httpTimeout: 50 * time.Millisecond,
+	}
+
+	start := time.Now()
+	_, err := g.Exchange(context.Background(), "auth-code", "verifier")
+	if err == nil {
+		t.Fatal("Exchange accepted a userinfo request that never completed")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Exchange error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Exchange took %s, timeout was not enforced", elapsed)
 	}
 }

@@ -4,13 +4,10 @@ import (
 	"fmt"
 	"slices"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
-)
-
-// Credential strength rules for every environment.
-const (
-	minAdminPasswordLength = 12
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 )
 
 type JWTConfig struct {
@@ -166,7 +163,10 @@ func (a AdminConfig) validate(appEnv string) error {
 	if a.Email == "" || a.Password == "" {
 		return fmt.Errorf("ADMIN_EMAIL and ADMIN_PASSWORD must be set together")
 	}
-	if len(a.Password) < minAdminPasswordLength {
+	// The seeder hashes the NFKC-normalized password, so enforce the same
+	// rune-based minimum on that canonical form instead of Go's byte length.
+	normalized := validator.NormalizePassword(a.Password)
+	if utf8.RuneCountInString(normalized) < validator.MinPasswordRunes {
 		return fmt.Errorf("ADMIN_PASSWORD is too weak for %s environment", appEnv)
 	}
 	return nil

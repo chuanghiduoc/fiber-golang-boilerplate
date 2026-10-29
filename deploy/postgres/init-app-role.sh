@@ -8,9 +8,9 @@ psql -v ON_ERROR_STOP=1 \
   --username "$POSTGRES_USER" \
   --dbname "$POSTGRES_DB" \
   -v app_user="${APP_DB_USERNAME:-app}" \
-  -v app_password="${APP_DB_PASSWORD:-app-password}" \
+  -v app_password="${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}" \
   -v bypass_user="${APP_DB_BYPASS_USERNAME:-app_bypass}" \
-  -v bypass_password="${APP_DB_BYPASS_PASSWORD:-app-bypass-password}" \
+  -v bypass_password="${APP_DB_BYPASS_PASSWORD:?APP_DB_BYPASS_PASSWORD is required}" \
   -v owner="$POSTGRES_USER" \
   -v schema="${DB_SCHEMA:-public}" \
   -f /opt/app/database-roles.sql

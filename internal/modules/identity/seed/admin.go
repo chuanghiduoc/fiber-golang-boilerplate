@@ -13,6 +13,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 	"github.com/google/uuid"
 )
 
@@ -35,6 +36,13 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores core.Stores, tx c
 	if cfg.Email == "" || cfg.Password == "" {
 		slog.Debug("ADMIN_EMAIL or ADMIN_PASSWORD not set, skipping admin seed")
 		return nil
+	}
+
+	// The seed creates a privileged account outside the request path, so it
+	// must apply the same policy as registration rather than trusting the
+	// operator to read .env.example.
+	if weakness := validator.PasswordWeakness(cfg.Password); weakness != "" {
+		return fmt.Errorf("ADMIN_PASSWORD does not meet the password policy: %s", weakness)
 	}
 
 	tenantID := tenant.DefaultID

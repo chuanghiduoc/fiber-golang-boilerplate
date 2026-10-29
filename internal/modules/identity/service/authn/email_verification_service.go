@@ -129,47 +129,56 @@ func invalidVerificationToken() error {
 }
 
 func (s *emailVerificationService) Verify(ctx context.Context, token string) error {
-	// Consume atomically so a verification link cannot be replayed by two
-	// concurrent requests (or reused after a successful verification).
-	vt, err := s.Stores.Verifications.Consume(ctx, hashToken(token))
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return invalidVerificationToken()
+	// Consume and verify in one transaction. The atomic DELETE prevents two
+	// concurrent links from succeeding; the transaction makes a transient
+	// user lookup/update failure leave the token available for a retry instead
+	// of burning the link.
+	return s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		vt, err := tx.Verifications.Consume(ctx, hashToken(token))
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return invalidVerificationToken()
+			}
+			return apperror.NewInternal("failed to verify token")
 		}
-		return apperror.NewInternal("failed to verify token")
-	}
-	if !vt.ExpiresAt.After(time.Now()) {
-		return apperror.NewBadRequest("verification token has expired")
-	}
+		if !vt.ExpiresAt.After(time.Now()) {
+			return apperror.NewBadRequest("verification token has expired")
+		}
 
-	// The link proves ownership of the address it was sent to, not merely of
-	// the account. Reject it if the account has since changed address.
-	user, err := s.Stores.Users.GetByID(ctx, vt.UserID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return invalidVerificationToken()
+		// The link proves ownership of the address it was sent to, not merely
+		// of the account. Reject it if the account has since changed address.
+		user, err := tx.Users.GetByID(ctx, vt.UserID)
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return invalidVerificationToken()
+			}
+			return apperror.NewInternal("failed to load user")
 		}
-		return apperror.NewInternal("failed to load user")
-	}
-	if user.Email != NormalizeEmail(vt.Email) {
-		return apperror.NewBadRequest("verification token does not match the current email")
-	}
-	if _, err := s.Stores.Users.VerifyEmail(ctx, vt.UserID, vt.Email); err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
+		if user.Email != NormalizeEmail(vt.Email) {
 			return apperror.NewBadRequest("verification token does not match the current email")
 		}
-		return apperror.NewInternal("failed to verify email")
-	}
-	return nil
+		if _, err := tx.Users.VerifyEmail(ctx, vt.UserID, vt.Email); err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return apperror.NewBadRequest("verification token does not match the current email")
+			}
+			return apperror.NewInternal("failed to verify email")
+		}
+		return nil
+	})
 }
 
 func (s *emailVerificationService) ResendVerification(ctx context.Context, emailAddr string) error {
 	emailAddr = NormalizeEmail(emailAddr)
 
 	// Rate limit before the lookup so the response cannot reveal whether the
-	// address exists. Increment is atomic and sets the TTL on first use.
+	// address exists. Increment is atomic and sets the TTL on first use. A cache
+	// failure is a generic 503 for every address instead of skipping the limit.
 	if s.Cache != nil {
-		if n, err := s.Cache.Increment(ctx, emailKey("email_verification:", emailAddr), time.Minute); err == nil && n > 1 {
+		limited, err := emailThrottleExceeded(ctx, s.Cache, "email_verification:", emailAddr)
+		if err != nil {
+			return err
+		}
+		if limited {
 			return nil
 		}
 	}

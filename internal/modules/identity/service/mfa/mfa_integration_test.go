@@ -36,11 +36,12 @@ func TestMFAVerifyFailureIsPersistedInAudit(t *testing.T) {
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "mfa-audit@example.com",
 		testutil.MemberOptions{Password: pgfixtures.Passphrase})
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: code})
 	require.NoError(t, err)
 
 	challenge, err := e.MFA.BeginChallenge(ctx, user.UserID, core.AMRPassword)
@@ -70,12 +71,13 @@ func TestConsumeTOTPStep_ConcurrentUseSucceedsOnce(t *testing.T) {
 	e := pgfixtures.NewEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "step@example.com", testutil.MemberOptions{Password: pgfixtures.Passphrase})
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 
 	t0 := time.Now()
 	code, err := totp.Code(secret, t0)
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: code})
 	require.NoError(t, err)
 
 	step := totp.Step(t0) + 1
@@ -98,12 +100,13 @@ func TestUseRecoveryCode_ConcurrentUseSucceedsOnce(t *testing.T) {
 	e := pgfixtures.NewEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "recovery@example.com", testutil.MemberOptions{Password: pgfixtures.Passphrase})
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 
 	t0 := time.Now()
 	code, err := totp.Code(secret, t0)
 	require.NoError(t, err)
-	codes, err := e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	codes, err := e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: code})
 	require.NoError(t, err)
 	require.Len(t, codes.RecoveryCodes, 10)
 
@@ -128,12 +131,13 @@ func TestMFAVerify_ConcurrentChallengeSucceedsOnce(t *testing.T) {
 	e := pgfixtures.NewEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "verify@example.com", testutil.MemberOptions{Password: pgfixtures.Passphrase})
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 
 	t0 := time.Now()
 	first, err := totp.Code(secret, t0)
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, first)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: first})
 	require.NoError(t, err)
 	// Confirmation used step(t0); the login uses the next step, still inside
 	// the +/-1 acceptance window.
@@ -177,7 +181,8 @@ func TestMFAConfirm_ConcurrentConfirmSucceedsOnce(t *testing.T) {
 	e := pgfixtures.NewEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "confirm@example.com", testutil.MemberOptions{Password: pgfixtures.Passphrase})
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
@@ -188,7 +193,7 @@ func TestMFAConfirm_ConcurrentConfirmSucceedsOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, results[i] = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+			_, results[i] = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: code})
 		}()
 	}
 	wg.Wait()

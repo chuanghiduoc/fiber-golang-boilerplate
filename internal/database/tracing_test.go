@@ -119,6 +119,86 @@ func TestQueryTracerRecordsSQLStateWithoutMessage(t *testing.T) {
 	assert.Empty(t, span.Events())
 }
 
+func TestBatchTracerRecordsSanitizedSpans(t *testing.T) {
+	provider, recorder := newDatabaseTestProvider(t)
+	tracer := &queryTracer{tp: provider}
+
+	parentCtx, parent := provider.Tracer("test").Start(context.Background(), "request")
+	batch := &pgx.Batch{}
+	batch.Queue("BEGIN")
+	batch.Queue("SELECT * FROM users WHERE email = $1", "user@example.com")
+	batch.Queue("COMMIT")
+
+	ctx := tracer.TraceBatchStart(parentCtx, nil, pgx.TraceBatchStartData{Batch: batch})
+	tracer.TraceBatchQuery(ctx, nil, pgx.TraceBatchQueryData{SQL: "BEGIN"})
+	tracer.TraceBatchQuery(ctx, nil, pgx.TraceBatchQueryData{
+		SQL:  "SELECT * FROM users WHERE email = $1",
+		Args: []any{"user@example.com"},
+		Err: &pgconn.PgError{
+			Code:    "23505",
+			Message: `duplicate key value violates unique constraint "users_email_key" for user@example.com`,
+		},
+	})
+	tracer.TraceBatchQuery(ctx, nil, pgx.TraceBatchQueryData{SQL: "COMMIT"})
+	tracer.TraceBatchEnd(ctx, nil, pgx.TraceBatchEndData{})
+	parent.End()
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 5) // parent + batch + one span per queued query
+	counts := make(map[string]int, len(ended))
+	for _, span := range ended {
+		counts[span.Name()]++
+		for _, attr := range span.Attributes() {
+			value := attr.Value.String()
+			assert.NotContains(t, value, "FROM users")
+			assert.NotContains(t, value, "user@example.com")
+			assert.NotContains(t, value, "users_email_key")
+		}
+	}
+	assert.Equal(t, 1, counts["db BATCH"])
+	assert.Equal(t, 1, counts["db BEGIN"])
+	assert.Equal(t, 1, counts["db SELECT"])
+	assert.Equal(t, 1, counts["db COMMIT"])
+
+	var selectSpan sdktrace.ReadOnlySpan
+	for _, span := range ended {
+		if span.Name() == "db SELECT" {
+			selectSpan = span
+			break
+		}
+	}
+	require.NotNil(t, selectSpan)
+	assert.Equal(t, codes.Error, selectSpan.Status().Code)
+	assert.Equal(t, "23505", attrString(selectSpan.Attributes(), semconv.DBResponseStatusCodeKey))
+	assert.Equal(t, "postgres.23505", attrString(selectSpan.Attributes(), semconv.ErrorTypeKey))
+}
+
+func TestBatchTracerEndsUnconsumedSpans(t *testing.T) {
+	provider, recorder := newDatabaseTestProvider(t)
+	tracer := &queryTracer{tp: provider}
+
+	parentCtx, parent := provider.Tracer("test").Start(context.Background(), "request")
+	batch := &pgx.Batch{}
+	batch.Queue("BEGIN")
+	batch.Queue("SELECT 1")
+	ctx := tracer.TraceBatchStart(parentCtx, nil, pgx.TraceBatchStartData{Batch: batch})
+	tracer.TraceBatchEnd(ctx, nil, pgx.TraceBatchEndData{})
+	parent.End()
+
+	assert.Len(t, recorder.Ended(), 4, "an early close must not leak queued query spans")
+}
+
+func TestBatchTracerSkipsWithoutRecordingParent(t *testing.T) {
+	provider, recorder := newDatabaseTestProvider(t)
+	tracer := &queryTracer{tp: provider}
+	batch := &pgx.Batch{}
+	batch.Queue("SELECT 1")
+
+	ctx := tracer.TraceBatchStart(context.Background(), nil, pgx.TraceBatchStartData{Batch: batch})
+	tracer.TraceBatchEnd(ctx, nil, pgx.TraceBatchEndData{})
+	assert.Empty(t, recorder.Ended())
+}
+
 func TestSQLOperation(t *testing.T) {
 	tests := []struct {
 		name  string

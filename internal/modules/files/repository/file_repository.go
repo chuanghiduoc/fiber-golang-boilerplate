@@ -148,30 +148,67 @@ func (r *FileRepository) AdminFileStats(ctx context.Context) (filesvc.FileStats,
 	return filesvc.FileStats{TotalFiles: stats.TotalFiles, TotalFileSize: stats.TotalFileSize}, nil
 }
 
-// LockQuota takes the per-tenant advisory lock that serializes uploads. The
-// lock is transaction-scoped: the upload service calls this inside its
-// metadata transaction, and the lock releases with the commit or rollback.
-func (r *FileRepository) LockQuota(ctx context.Context) error {
+// StorageUsage reads only the enabled quota counters. A user check is one row;
+// tenant usage is the SUM of per-user rows. A user-only check never scans the
+// tenant's counters.
+func (r *FileRepository) StorageUsage(ctx context.Context, userID uuid.UUID, scope filesvc.QuotaScope) (filesvc.QuotaUsage, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
-		return err
+		return filesvc.QuotaUsage{}, err
 	}
-	return r.q.LockFilesQuota(ctx, tenantID)
+	var usage filesvc.QuotaUsage
+	if scope.Tenant {
+		bytes, readErr := r.q.TenantStorageUsage(ctx, tenantID)
+		if readErr != nil {
+			return filesvc.QuotaUsage{}, readErr
+		}
+		usage.TenantBytes = bytes
+	}
+	if scope.User {
+		bytes, readErr := r.q.UserStorageUsage(ctx, filesqlc.UserStorageUsageParams{
+			TenantID: tenantID,
+			UserID:   userID,
+		})
+		if readErr != nil {
+			return filesvc.QuotaUsage{}, readErr
+		}
+		usage.UserBytes = bytes
+	}
+	return usage, nil
 }
 
-func (r *FileRepository) StorageUsage(ctx context.Context, userID uuid.UUID) (tenantBytes, userBytes int64, err error) {
+// LockStorageUsage serializes only the enabled quota scope. Tenant quota uses
+// a transaction advisory lock, then reads the SUM of per-user counters; user
+// quota locks that user's counter row. The tenant advisory lock is taken
+// first when both are enabled, and the files trigger only touches user rows,
+// so there is no lock-order cycle with user-only deployments.
+func (r *FileRepository) LockStorageUsage(ctx context.Context, userID uuid.UUID, scope filesvc.QuotaScope) (filesvc.QuotaUsage, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
-		return 0, 0, err
+		return filesvc.QuotaUsage{}, err
 	}
-	usage, err := r.q.FilesStorageUsage(ctx, filesqlc.FilesStorageUsageParams{
-		TenantID: tenantID,
-		UserID:   userID,
-	})
-	if err != nil {
-		return 0, 0, err
+	var usage filesvc.QuotaUsage
+	if scope.Tenant {
+		if err := r.q.LockTenantQuota(ctx, tenantID.String()); err != nil {
+			return filesvc.QuotaUsage{}, err
+		}
+		bytes, readErr := r.q.TenantStorageUsage(ctx, tenantID)
+		if readErr != nil {
+			return filesvc.QuotaUsage{}, readErr
+		}
+		usage.TenantBytes = bytes
 	}
-	return usage.TenantBytes, usage.UserBytes, nil
+	if scope.User {
+		bytes, lockErr := r.q.LockUserStorageUsage(ctx, filesqlc.LockUserStorageUsageParams{
+			TenantID: tenantID,
+			UserID:   userID,
+		})
+		if lockErr != nil {
+			return filesvc.QuotaUsage{}, lockErr
+		}
+		usage.UserBytes = bytes
+	}
+	return usage, nil
 }
 
 // ExistingStoragePaths returns which of paths have a metadata row in the

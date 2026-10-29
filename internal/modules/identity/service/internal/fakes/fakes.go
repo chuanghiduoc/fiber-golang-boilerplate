@@ -674,7 +674,8 @@ func (r Sessions) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersio
 	r.DB.Mu.Lock()
 	defer r.DB.Mu.Unlock()
 	s, ok := r.DB.Sessions[id]
-	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) || s.RevokedAt != nil {
+	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) ||
+		s.RevokedAt != nil || !s.ExpiresAt.After(time.Now()) {
 		return nil, apperror.ErrNotFound
 	}
 	s.TokenVersion, s.AMR, s.LastUsedAt = tokenVersion, amr, time.Now()
@@ -704,13 +705,24 @@ func (r Sessions) RevokeByRefreshToken(_ context.Context, hash []byte, why Revok
 	return userID, n > 0, nil
 }
 
-func (r Sessions) Touch(context.Context, uuid.UUID, string, string) error { return nil }
+func (r Sessions) Touch(ctx context.Context, id uuid.UUID, userAgent, ip string) error {
+	r.DB.Mu.Lock()
+	defer r.DB.Mu.Unlock()
+	s, ok := r.DB.Sessions[id]
+	if !ok || s.TenantID != tenant.IDFromContext(ctx) ||
+		s.RevokedAt != nil || !s.ExpiresAt.After(time.Now()) {
+		return apperror.ErrNotFound
+	}
+	s.LastUsedAt, s.UserAgent, s.IP = time.Now(), userAgent, ip
+	return nil
+}
 
 func (r Sessions) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID) (time.Time, error) {
 	r.DB.Mu.Lock()
 	defer r.DB.Mu.Unlock()
 	s, ok := r.DB.Sessions[sessionID]
-	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) || s.RevokedAt != nil {
+	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) ||
+		s.RevokedAt != nil || !s.ExpiresAt.After(time.Now()) {
 		return time.Time{}, apperror.ErrNotFound
 	}
 	now := time.Now()
@@ -722,7 +734,8 @@ func (r Sessions) MarkMFAVerifiedWithMethod(ctx context.Context, userID, session
 	r.DB.Mu.Lock()
 	defer r.DB.Mu.Unlock()
 	s, ok := r.DB.Sessions[sessionID]
-	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) || s.RevokedAt != nil {
+	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) ||
+		s.RevokedAt != nil || !s.ExpiresAt.After(time.Now()) {
 		return time.Time{}, apperror.ErrNotFound
 	}
 	now := time.Now()
@@ -731,7 +744,7 @@ func (r Sessions) MarkMFAVerifiedWithMethod(ctx context.Context, userID, session
 	return now, nil
 }
 
-func (r Sessions) State(context.Context, uuid.UUID, uuid.UUID) (*SessionState, error) {
+func (r Sessions) State(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (*SessionState, error) {
 	return nil, errFakeNotImplemented
 }
 
@@ -1214,6 +1227,14 @@ func (r Passkeys) ListByUser(_ context.Context, userID uuid.UUID) ([]Passkey, er
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
+}
+
+func (r Passkeys) ListByUserLimited(_ context.Context, userID uuid.UUID, limit int32) (passkeys []Passkey, truncated bool, err error) {
+	all, err := r.ListByUser(context.Background(), userID)
+	if err != nil || limit <= 0 || len(all) <= int(limit) {
+		return all, false, err
+	}
+	return all[:limit], true, nil
 }
 
 func (r Passkeys) GetByCredentialID(_ context.Context, credentialID []byte) (*Passkey, error) {

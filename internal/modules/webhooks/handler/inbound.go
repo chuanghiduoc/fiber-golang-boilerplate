@@ -59,6 +59,12 @@ func (h *Handler) UpdateInboundSource(ctx context.Context, in *updateInboundSour
 	if err := httpapi.CheckIfMatchValue(in.IfMatch, versionETag(current.UpdatedAt)); err != nil {
 		return nil, err
 	}
+	if inboundSourcePatchEmpty(in.Body) {
+		return &httpapi.ETagOutput[dto.InboundSourceResponse]{
+			ETag: versionETag(current.UpdatedAt),
+			Body: toInboundSourceResponse(current),
+		}, nil
+	}
 	update := applyInboundSourcePatch(current, in.Body)
 	if in.IfMatch != "" {
 		expected := current.UpdatedAt

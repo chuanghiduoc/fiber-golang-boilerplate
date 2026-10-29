@@ -68,7 +68,9 @@ func TestTotalPages(t *testing.T) {
 		{"single item", 1, 10, 1},
 		{"perPage zero returns 0", 10, 0, 0},
 		{"perPage negative returns 0", 10, -1, 0},
+		{"negative total returns 0", -5, 10, 0},
 		{"large total", 1001, 100, 11},
+		{"max int64 saturates instead of overflowing", math.MaxInt64, 1, math.MaxInt},
 	}
 
 	for _, tt := range tests {

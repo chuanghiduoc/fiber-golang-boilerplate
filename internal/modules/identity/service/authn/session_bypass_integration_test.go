@@ -128,10 +128,11 @@ func TestMFALoginRace_PasswordOnlySessionRefusedAfterConfirm(t *testing.T) {
 	require.False(t, required, "the factor is not confirmed yet")
 
 	// Step 2: a concurrent request confirms the factor.
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: code})
 	require.NoError(t, err)
 
 	// Step 3: the first login tries to finish at the version it read.
@@ -147,10 +148,11 @@ func TestCreateSession_RefusesPasswordOnlySessionOnceFactorConfirmed(t *testing.
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "factor-guard@example.com",
 		testutil.MemberOptions{Password: pgfixtures.Passphrase})
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: code})
 	require.NoError(t, err)
 
 	version := scalar[int32](t, e.Pool, `SELECT token_version FROM users WHERE id = $1`, user.UserID)
@@ -187,10 +189,11 @@ func TestMFAConfirm_ReissuesCurrentSessionAndRejectsOtherTenants(t *testing.T) {
 	other, err := e.Sessions.Issue(tenant.WithID(ctx, acmeID), user.UserID, user.TokenVersion, []string{core.AMRPassword})
 	require.NoError(t, err)
 
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	result, err := e.MFA.ConfirmTOTP(ctx, user.UserID, current.SessionID, pgfixtures.Passphrase, code)
+	result, err := e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: current.SessionID, CurrentPassword: pgfixtures.Passphrase, Code: code})
 	require.NoError(t, err)
 	require.Equal(t, current.SessionID, result.Tokens.SessionID, "the confirming session is re-issued, not replaced")
 	require.NotEmpty(t, result.Tokens.AccessToken)
@@ -240,10 +243,11 @@ func TestMFADisable_KeepsCurrentSessionAndRevokesOtherTenant(t *testing.T) {
 	other, err := e.Sessions.Issue(tenant.WithID(ctx, acmeID), user.UserID, user.TokenVersion, []string{core.AMRPassword})
 	require.NoError(t, err)
 
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, current.SessionID, pgfixtures.Passphrase, code)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: current.SessionID, CurrentPassword: pgfixtures.Passphrase, Code: code})
 	require.NoError(t, err)
 
 	// Confirmation already revoked the other session; open a new one in the
@@ -254,7 +258,7 @@ func TestMFADisable_KeepsCurrentSessionAndRevokesOtherTenant(t *testing.T) {
 
 	code, err = totp.Code(secret, time.Now().Add(totp.Period))
 	require.NoError(t, err)
-	require.NoError(t, e.MFA.Disable(ctx, user.UserID, current.SessionID, code))
+	require.NoError(t, e.MFA.Disable(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: current.SessionID, CurrentPassword: pgfixtures.Passphrase, Code: code}))
 
 	assert.Nil(t, scalar[*time.Time](t, e.Pool,
 		`SELECT revoked_at FROM sessions WHERE id = $1`, current.SessionID),

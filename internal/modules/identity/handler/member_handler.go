@@ -43,7 +43,7 @@ func NewMemberHandler(members MemberAdminService, users MemberProfiles, roles Ro
 }
 
 type listMembersInput struct {
-	Limit         int    `query:"limit" minimum:"1" maximum:"100" default:"20"`
+	Limit         int    `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string `query:"startingAfter"`
 	Status        string `query:"status" enum:"active,suspended,removed"`
 	Role          string `query:"role" maxLength:"50"`
@@ -54,9 +54,9 @@ type memberInput struct {
 }
 
 type updateMemberInput struct {
-	MemberID string `path:"memberId" format:"uuid"`
-	IfMatch  string `header:"If-Match"`
-	RawBody  []byte `rawBody:"application/merge-patch+json" contentType:"application/merge-patch+json" required:"true"`
+	MemberID string          `path:"memberId" format:"uuid"`
+	IfMatch  string          `header:"If-Match"`
+	Body     dto.MemberPatch `contentType:"application/merge-patch+json" required:"true"`
 }
 
 type statsInput struct{}
@@ -103,9 +103,12 @@ func (h *MemberHandler) Update(ctx context.Context, input *updateMemberInput) (*
 	if err := checkETag(input.IfMatch, current.UpdatedAt()); err != nil {
 		return nil, err
 	}
-	var req dto.MemberPatch
-	if err := decodeMergePatch(input.RawBody, &req); err != nil {
-		return nil, err
+	req := input.Body
+	if !req.RoleIDs.Present && !req.Status.Present {
+		return &httpapi.ETagOutput[dto.UserResponse]{
+			ETag: etagHeader(current.UpdatedAt()),
+			Body: toUserResponse(current),
+		}, nil
 	}
 	update := membership.MemberUpdate{}
 	if input.IfMatch != "" {
@@ -115,7 +118,7 @@ func (h *MemberHandler) Update(ctx context.Context, input *updateMemberInput) (*
 		if req.RoleIDs.Null || len(req.RoleIDs.Value) == 0 {
 			return nil, unprocessable("roleIds cannot be cleared")
 		}
-		keys, err := h.roleKeys(ctx, req.RoleIDs.Value)
+		keys, err := h.roleKeys(ctx, []uuid.UUID(req.RoleIDs.Value))
 		if err != nil {
 			return nil, err
 		}

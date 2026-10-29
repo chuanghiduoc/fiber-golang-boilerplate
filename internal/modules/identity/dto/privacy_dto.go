@@ -7,8 +7,11 @@ import (
 )
 
 // ErasureRequest re-authenticates the caller before a self-service erasure.
+// CurrentPassword is required for an account with a local password; a
+// passwordless (OAuth-only) account instead proves possession of a recent
+// interactive session, so the field may be omitted there.
 type ErasureRequest struct {
-	CurrentPassword string `json:"currentPassword" required:"true"`
+	CurrentPassword string `json:"currentPassword,omitempty" maxLength:"128"`
 }
 
 // DataExportResponse is one export request. The storage path is never exposed.

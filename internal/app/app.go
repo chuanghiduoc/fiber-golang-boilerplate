@@ -327,8 +327,10 @@ type App struct {
 func New(cfg *config.Config, deps Deps) *App {
 	deps.Config = ModuleSettings{JWT: cfg.JWT, MFA: cfg.MFA, CORS: cfg.CORS, Tenant: cfg.Tenant}
 	if deps.Catalogs.Errors == nil {
-		deps.Catalogs.Errors = apperror.PlatformCatalog()
+		deps.Catalogs.Errors = apperror.NewCatalog()
+		deps.Catalogs.Errors.Seal()
 	}
+	deps.Catalogs.Errors.SetDocsBaseURL(cfg.App.ErrorDocsBaseURL)
 	if deps.Catalogs.Permissions == nil {
 		deps.Catalogs.Permissions = authz.NewCatalog()
 		deps.Catalogs.Permissions.Seal()
@@ -433,6 +435,8 @@ func (a *App) setupHTTPAPI() {
 			ErrorCatalog:    a.deps.Catalogs.Errors,
 			TenantResolver:  a.deps.TenantResolver,
 			DefaultSlug:     defaultSlug,
+			MaxBodyBytes:    int64(a.cfg.App.BodyLimit),
+			BodyReadTimeout: a.cfg.App.RequestTimeout,
 		},
 	)
 }
@@ -443,6 +447,11 @@ func (a *App) setupGlobalMiddleware() {
 	// Recovery below stays where it is so handler panics still flow through
 	// Logger/Metrics/Tracing as a 500 with the request ID attached.
 	a.fiber.Use(middleware.Recovery(a.cfg.App.Env))
+	// RequestID and SecurityHeaders run before CORS: a valid preflight
+	// short-circuits inside CORS, and a panic in CORS must still carry the
+	// correlation and security headers. Recovery stays outermost.
+	a.fiber.Use(middleware.RequestID())
+	a.fiber.Use(middleware.SecurityHeaders(a.cfg.App.Env))
 	a.fiber.Use(cors.New(cors.Config{
 		AllowOrigins:     a.cfg.CORS.Origins(),
 		AllowMethods:     a.cfg.CORS.Methods(),
@@ -450,14 +459,25 @@ func (a *App) setupGlobalMiddleware() {
 		ExposeHeaders:    a.cfg.CORS.ExposedHeaders(),
 		AllowCredentials: a.cfg.JWT.RefreshCookie,
 	}))
-	a.fiber.Use(middleware.SecurityHeaders(a.cfg.App.Env))
-	a.fiber.Use(middleware.RequestID())
 	a.fiber.Use(requestctxhttp.Middleware())
 	a.fiber.Use(i18n.Middleware(a.deps.I18n))
 	a.fiber.Use(middleware.Tracing(a.deps.Tracing.TracerProvider(), a.cfg.Tracing.ExcludedPaths(), a.cfg.Tracing.TrustIncoming, a.deps.Catalogs.Errors))
 	a.fiber.Use(middleware.Metrics(a.deps.Catalogs.Errors))
 	a.fiber.Use(middleware.Logger(a.deps.Catalogs.Errors))
 	a.fiber.Use(middleware.Recovery(a.cfg.App.Env))
+	requestTimeout := a.cfg.App.RequestTimeout
+	if drain := config.ShutdownBudget - config.ShutdownReserve; requestTimeout+PostHandlerBudget > drain {
+		slog.Warn("APP_REQUEST_TIMEOUT plus post-handler work exceeds the shutdown drain window; in-flight requests may be cut off on shutdown",
+			slog.Duration("request_timeout", requestTimeout),
+			slog.Duration("post_handler_budget", PostHandlerBudget),
+			slog.Duration("drain_window", drain),
+		)
+	}
+	// Timeout wraps body draining as well as auth and the handler. A chunked
+	// body without Content-Length is read by BodyLimit before routing, so a
+	// timeout placed inside BodyLimit would let a slow client hold the request
+	// until Fiber's much larger ReadTimeout.
+	a.fiber.Use(middleware.Timeout(requestTimeout, apperrorhttp.New(a.deps.Catalogs.Errors, a.deps.I18n)))
 	// Fiber's BodyLimit is the multipart upload ceiling. Every non-multipart
 	// body, and multipart bodies on routes outside the upload path, are capped
 	// here before auth, rate limiting, or decoding run. The upload route parses
@@ -467,15 +487,6 @@ func (a *App) setupGlobalMiddleware() {
 		middleware.WithUploadLimit(a.cfg.App.BodyLimit, filesUploadPath),
 	))
 	a.fiber.Use(audithttp.Middleware(a.deps.Audit))
-	requestTimeout := a.cfg.App.RequestTimeout
-	if drain := config.ShutdownBudget - config.ShutdownReserve; requestTimeout+PostHandlerBudget > drain {
-		slog.Warn("APP_REQUEST_TIMEOUT plus post-handler work exceeds the shutdown drain window; in-flight requests may be cut off on shutdown",
-			slog.Duration("request_timeout", requestTimeout),
-			slog.Duration("post_handler_budget", PostHandlerBudget),
-			slog.Duration("drain_window", drain),
-		)
-	}
-	a.fiber.Use(middleware.Timeout(requestTimeout))
 }
 
 // PostHandlerBudget is the longest a request keeps running after its handler
@@ -504,15 +515,13 @@ type metricsInput struct {
 	Authorization string `header:"Authorization"`
 }
 
+// metricsOutput is a raw byte body: huma writes []byte without content
+// negotiation, so registering a process-global text/plain format (which would
+// also affect every JSON operation) is unnecessary.
 type metricsOutput struct {
 	ContentType string `header:"Content-Type"`
-	Body        prometheusBody
+	Body        []byte
 }
-
-// prometheusBody makes huma document and serve the scrape payload as text/plain.
-type prometheusBody []byte
-
-func (prometheusBody) ContentType(string) string { return "text/plain; version=0.0.4; charset=utf-8" }
 
 // setupInfrastructureRoutes registers the platform-owned operations through the
 // same helper modules use. They are outside /api/v1 and therefore have no
@@ -560,14 +569,15 @@ func (a *App) setupInfrastructureRoutes() {
 	}, httpapi.Policy{Public: true}, readiness)
 
 	httpapi.Register(a.http, httpapi.Op{
-		Method:         http.MethodGet,
-		Path:           "/metrics",
-		OperationID:    "getMetrics",
-		Infrastructure: true,
-		Tags:           []string{infrastructureTag},
-		Summary:        "Prometheus metrics",
-		Description:    "Prometheus text exposition. Requires `Authorization: Bearer <METRICS_AUTH_TOKEN>` when a token is configured.",
-		Errors:         []int{http.StatusUnauthorized},
+		Method:              http.MethodGet,
+		Path:                "/metrics",
+		OperationID:         "getMetrics",
+		Infrastructure:      true,
+		Tags:                []string{infrastructureTag},
+		Summary:             "Prometheus metrics",
+		Description:         "Prometheus text exposition. Requires `Authorization: Bearer <METRICS_AUTH_TOKEN>` when a token is configured.",
+		Errors:              []int{http.StatusUnauthorized},
+		ResponseContentType: "text/plain; version=0.0.4; charset=utf-8",
 	}, httpapi.Policy{Public: true}, func(_ context.Context, input *metricsInput) (*metricsOutput, error) {
 		if token := a.cfg.App.MetricsAuthToken; token != "" {
 			expected := []byte("Bearer " + token)
@@ -585,7 +595,7 @@ func (a *App) setupInfrastructureRoutes() {
 			// Huma negotiates on this exact media type; the exporter may add
 			// parameters such as escaping=underscores that Huma rejects.
 			ContentType: "text/plain; version=0.0.4; charset=utf-8",
-			Body:        prometheusBody(recorder.Body.Bytes()),
+			Body:        recorder.Body.Bytes(),
 		}, nil
 	})
 }

@@ -198,6 +198,39 @@ func TestValidate_RejectsWildcardTrustedProxy(t *testing.T) {
 	}
 }
 
+func TestValidate_TrustedProxyCIDR(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "single address", value: "10.1.2.3"},
+		{name: "pod cidr", value: "10.244.0.0/16"},
+		{name: "node cidr", value: "10.1.2.0/24"},
+		{name: "narrow private cidr", value: "10.0.0.0/14"},
+		{name: "wide private cidr", value: "10.0.0.0/8", wantErr: true},
+		{name: "wide private supernet", value: "10.0.0.0/7", wantErr: true},
+		{name: "docker private cidr", value: "172.16.0.0/12", wantErr: true},
+		{name: "home private cidr", value: "192.168.0.0/16", wantErr: true},
+		{name: "ipv6 ula", value: "fc00::/7", wantErr: true},
+		{name: "placeholder", value: "REPLACE_WITH_INGRESS_NGINX_POD_CIDR", wantErr: true},
+		{name: "malformed", value: "not-a-cidr", wantErr: true},
+		{name: "ipv6 wildcard", value: "::/0", wantErr: true},
+		{name: "ipv4 zero prefix", value: "10.0.0.0/0", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			cfg.App.TrustProxy = true
+			cfg.App.TrustedProxies = []string{tt.value}
+			err := cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidate_WebhookSettings(t *testing.T) {
 	t.Run("dedicated key", func(t *testing.T) {
 		cfg := baseValidConfig()
@@ -524,8 +557,12 @@ func baseValidConfig() Config {
 			Port: 8080, Env: "local", BodyLimit: 12582912, JSONBodyLimit: 1048576,
 			RequestTimeout: 12 * time.Second, FrontendURL: "http://localhost:3000",
 		},
-		JWT:       JWTConfig{Secret: testJWTKey, AccessTTL: 15 * time.Minute, RefreshTTL: 720 * time.Hour, SessionMaxLifetime: 720 * time.Hour},
-		DB:        DBConfig{MaxConns: 25, MinConns: 5, ConnectTimeout: 10 * time.Second},
+		JWT: JWTConfig{Secret: testJWTKey, AccessTTL: 15 * time.Minute, RefreshTTL: 720 * time.Hour, SessionMaxLifetime: 720 * time.Hour},
+		DB: DBConfig{
+			MaxConns: 25, MinConns: 5, ConnectTimeout: 10 * time.Second,
+			StatementTimeout: 30 * time.Second, LockTimeout: 5 * time.Second,
+			IdleInTransactionSessionTimeout: 30 * time.Second,
+		},
 		Storage:   StorageConfig{Driver: "local", LocalPath: "./uploads", MaxFileSize: 10485760},
 		RateLimit: RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		CORS:      CORSConfig{AllowOrigins: []string{"*"}},
@@ -777,6 +814,26 @@ func TestValidate_InvalidMaxFileSize(t *testing.T) {
 	cfg.Storage.MaxFileSize = 0
 	if err := cfg.Validate(); err == nil {
 		t.Error("Validate() should fail for MaxFileSize < 1")
+	}
+}
+
+func TestValidate_InvalidDBTimeouts(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*DBConfig)
+	}{
+		{"statement timeout", func(db *DBConfig) { db.StatementTimeout = 0 }},
+		{"lock timeout", func(db *DBConfig) { db.LockTimeout = -time.Second }},
+		{"idle in transaction", func(db *DBConfig) { db.IdleInTransactionSessionTimeout = 0 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			tt.mutate(&cfg.DB)
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("%s must be rejected", tt.name)
+			}
+		})
 	}
 }
 
@@ -1207,6 +1264,42 @@ func TestValidate_MemoryCacheInProduction(t *testing.T) {
 	}
 }
 
+func TestNormalizeAppEnv(t *testing.T) {
+	for raw, want := range map[string]string{
+		" Production ": "production",
+		"STAGING":      "staging",
+		" local ":      "local",
+	} {
+		if got := normalizeAppEnv(raw); got != want {
+			t.Errorf("normalizeAppEnv(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestValidateNormalizesAppEnvBeforeProductionChecks(t *testing.T) {
+	cfg := productionValidConfig()
+	cfg.App.Env = " Production "
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() rejected a padded, case-insensitive production environment: %v", err)
+	}
+
+	cfg = productionValidConfig()
+	cfg.App.Env = " Production "
+	cfg.App.MetricsAuthToken = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() skipped production checks for a non-canonical APP_ENV")
+	}
+}
+
+func TestValidateMigratePortZeroIsUnset(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.DB.MigratePort = -1
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "0 (unset)") {
+		t.Fatalf("Validate() error = %v, want the DB_MIGRATE_PORT unset wording", err)
+	}
+}
+
 func TestValidate_JSONBodyLimit(t *testing.T) {
 	cfg := baseValidConfig()
 	cfg.App.JSONBodyLimit = 0
@@ -1219,6 +1312,31 @@ func TestValidate_JSONBodyLimit(t *testing.T) {
 	}
 	if got := (AppConfig{}).EffectiveJSONBodyLimit(); got != DefaultJSONBodyLimit {
 		t.Errorf("EffectiveJSONBodyLimit() for zero value = %d, want %d", got, DefaultJSONBodyLimit)
+	}
+}
+
+func TestAdminConfigValidateCountsNormalizedRunes(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+		wantErr  bool
+	}{
+		{"eleven full-width runes rejected", strings.Repeat("\uFF41", 11), true},
+		{"twelve full-width runes accepted", strings.Repeat("\uFF41", 12), false},
+		{"eleven composed runes rejected", strings.Repeat("e\u0301", 11), true},
+		{"twelve composed runes accepted", strings.Repeat("e\u0301", 12), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := AdminConfig{Email: "admin@example.com", Password: tt.password}
+			err := cfg.validate("production")
+			if tt.wantErr && err == nil {
+				t.Fatal("validate() accepted a password below the normalized rune minimum")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validate() rejected a valid password: %v", err)
+			}
+		})
 	}
 }
 

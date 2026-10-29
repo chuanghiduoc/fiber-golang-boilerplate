@@ -122,7 +122,11 @@ func (h *HIBPChecker) Breached(password string) (bool, error) {
 	}
 
 	suffix := digest[5:]
-	scanner := bufio.NewScanner(io.LimitReader(resp.Body, hibpMaxResponseBytes))
+	// Read one byte past the budget so an oversized response is detectable.
+	// A plain LimitReader reports EOF at the limit, which would make a
+	// truncated response look like a clean password.
+	limited := &io.LimitedReader{R: resp.Body, N: hibpMaxResponseBytes + 1}
+	scanner := bufio.NewScanner(limited)
 	for scanner.Scan() {
 		lineSuffix, count, ok := strings.Cut(strings.TrimSpace(scanner.Text()), ":")
 		if !ok || !strings.EqualFold(lineSuffix, suffix) {
@@ -133,6 +137,9 @@ func (h *HIBPChecker) Breached(password string) (bool, error) {
 	}
 	if err := scanner.Err(); err != nil {
 		return false, fmt.Errorf("read HIBP range response: %w", err)
+	}
+	if limited.N == 0 {
+		return false, fmt.Errorf("read HIBP range response: exceeds %d bytes", hibpMaxResponseBytes)
 	}
 	return false, nil
 }

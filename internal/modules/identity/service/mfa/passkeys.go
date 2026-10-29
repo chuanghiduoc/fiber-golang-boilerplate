@@ -52,9 +52,9 @@ type PasskeyLogin struct {
 // tenant-bound challenges sealed with the data-encryption codec and stored in
 // the cache, the same pattern as the MFA login challenge.
 type PasskeyService interface {
-	BeginRegistration(ctx context.Context, userID uuid.UUID) (*protocol.CredentialCreation, error)
+	BeginRegistration(ctx context.Context, userID uuid.UUID, proof ReauthProof) (*protocol.CredentialCreation, error)
 	FinishRegistration(ctx context.Context, userID uuid.UUID, name string, raw []byte) (*Passkey, error)
-	Delete(ctx context.Context, userID, passkeyID uuid.UUID) error
+	Delete(ctx context.Context, userID, passkeyID uuid.UUID, proof ReauthProof) error
 	List(ctx context.Context, userID uuid.UUID) ([]Passkey, error)
 	BeginLogin(ctx context.Context, email string) (*protocol.CredentialAssertion, error)
 	FinishLogin(ctx context.Context, raw []byte, admit Admission) (*PasskeyLogin, error)
@@ -93,6 +93,10 @@ func NewPasskeyService(deps PasskeyDeps) PasskeyService {
 
 func (s *passkeyService) now() time.Time { return s.Now() }
 
+func (s *passkeyService) reauthenticate(ctx context.Context, userID uuid.UUID, proof ReauthProof) error {
+	return (reauthVerifier{stores: s.Stores, attempts: s.Cache, now: s.now}).verify(ctx, userID, proof)
+}
+
 func passkeyInvalid() error {
 	return apperror.NewCode(identitycatalog.CodeAuthPasskeyInvalid, "invalid or expired passkey ceremony")
 }
@@ -120,6 +124,7 @@ type passkeyCeremony struct {
 	Kind      string               `json:"kind"`
 	TenantID  uuid.UUID            `json:"tid"`
 	UserID    uuid.UUID            `json:"uid,omitempty"`
+	SessionID uuid.UUID            `json:"sid,omitempty"`
 	EmailHint string               `json:"email,omitempty"`
 	Session   webauthn.SessionData `json:"session"`
 	ExpiresAt int64                `json:"exp"`
@@ -243,9 +248,15 @@ func toPasskeyUser(user *User, passkeys []Passkey) *passkeyUser {
 	}
 }
 
-func (s *passkeyService) BeginRegistration(ctx context.Context, userID uuid.UUID) (*protocol.CredentialCreation, error) {
+func (s *passkeyService) BeginRegistration(ctx context.Context, userID uuid.UUID, proof ReauthProof) (*protocol.CredentialCreation, error) {
 	if s.WebAuthn == nil {
 		return nil, passkeyNotConfigured()
+	}
+	if err := s.reauthenticate(ctx, userID, proof); err != nil {
+		return nil, err
+	}
+	if proof.SessionID == uuid.Nil {
+		return nil, apperror.NewUnauthorized("session is required")
 	}
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
@@ -275,6 +286,7 @@ func (s *passkeyService) BeginRegistration(ctx context.Context, userID uuid.UUID
 		Kind:      passkeyCeremonyRegistration,
 		TenantID:  tenantID,
 		UserID:    userID,
+		SessionID: proof.SessionID,
 		Session:   *session,
 		ExpiresAt: s.now().Add(PasskeyCeremonyTTL).Unix(),
 	}); err != nil {
@@ -324,6 +336,9 @@ func (s *passkeyService) FinishRegistration(ctx context.Context, userID uuid.UUI
 	}
 	var result *Passkey
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if err := s.ensureRegistrationAuthorized(ctx, tx, userID, ceremony); err != nil {
+			return err
+		}
 		created, err := tx.Passkeys.Create(ctx, passkey)
 		if err != nil {
 			if errors.Is(err, ErrPasskeyAlreadyRegistered) {
@@ -359,7 +374,41 @@ func (s *passkeyService) FinishRegistration(ctx context.Context, userID uuid.UUI
 	return result, nil
 }
 
-func (s *passkeyService) Delete(ctx context.Context, userID, passkeyID uuid.UUID) error {
+// ensureRegistrationAuthorized rechecks the authorization that allowed the
+// ceremony to start. The membership may have been suspended or removed, and
+// the browser session may have been revoked or expired during the five-minute
+// ceremony; creating a credential after either change would be a privilege
+// escalation.
+func (s *passkeyService) ensureRegistrationAuthorized(ctx context.Context, tx TxRepos, userID uuid.UUID, ceremony *passkeyCeremony) error {
+	// FOR SHARE on the membership row makes a concurrent ban/removal wait for
+	// this transaction; one that committed first leaves no active row here.
+	if _, err := tx.Memberships.LockPrincipal(ctx, userID); err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return accountNotActive()
+		}
+		return apperror.NewInternal("failed to verify membership")
+	}
+	if ceremony.SessionID == uuid.Nil {
+		return apperror.NewUnauthorized("session is required")
+	}
+	session, err := tx.Sessions.Get(ctx, ceremony.SessionID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return mfaReauthRequired()
+		}
+		return apperror.NewInternal("failed to verify session")
+	}
+	if session.UserID != userID || session.TenantID != ceremony.TenantID ||
+		session.RevokedAt != nil || !session.ExpiresAt.After(s.now()) {
+		return mfaReauthRequired()
+	}
+	return nil
+}
+
+func (s *passkeyService) Delete(ctx context.Context, userID, passkeyID uuid.UUID, proof ReauthProof) error {
+	if err := s.reauthenticate(ctx, userID, proof); err != nil {
+		return err
+	}
 	user, err := s.Stores.Users.GetByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {

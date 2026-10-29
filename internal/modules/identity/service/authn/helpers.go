@@ -67,6 +67,9 @@ func CleanupStaleSessions(ctx context.Context, sessions SessionRepository, userI
 func CleanupOtherSessions(ctx context.Context, sessions SessionRepository, userID, keepID uuid.UUID, why RevokeReason) {
 	cleanupOtherSessions(ctx, sessions, userID, keepID, why)
 }
+func RevokeOtherSessions(ctx context.Context, sessions SessionRepository, userID, keepID uuid.UUID, why RevokeReason) error {
+	return revokeOtherSessions(ctx, sessions, userID, keepID, why)
+}
 func LoginLockoutUnavailable(err error) error { return loginLockoutUnavailable(err) }
 func CurrentPasswordIncorrect() error         { return currentPasswordIncorrect() }
 func LoginAttemptKeys(ctx context.Context, email string) (source, account string) {
@@ -99,7 +102,7 @@ var _ = []any{
 	hashToken, newOpaqueToken, tokenLink, withLinkTenantSlug, buildCursor, auditWriteError,
 	checkAudit, userEvent, emailTaken, emailUnavailable, accountNotActive, ensureEmailNotBanned,
 	createAccount, ValidatePasswordForEmail, hashPassword, verifyPassword, spendDummyPasswordWork,
-	ensureNotLastOwner, EnsureCanManageMember, CleanupStaleSessions, CleanupOtherSessions,
+	ensureNotLastOwner, EnsureCanManageMember, CleanupStaleSessions, CleanupOtherSessions, RevokeOtherSessions,
 	LoginLockoutUnavailable, CurrentPasswordIncorrect, LoginAttemptKeys, DeleteAccount,
 	ReserveReauthAttempt, ClearReauthAttempts, ClearMFAAttempts, ReserveMFAAttempt, ClearLoginAttempts,
 }

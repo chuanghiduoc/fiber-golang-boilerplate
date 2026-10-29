@@ -62,6 +62,13 @@ func (r *PasskeyRegistrationRequest) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &r.Credential)
 }
 
+// PasskeyReauthRequest proves intent before adding or removing a credential.
+// Password accounts must send CurrentPassword; passwordless accounts instead
+// need an interactive session no older than the MFA re-authentication window.
+type PasskeyReauthRequest struct {
+	CurrentPassword string `json:"currentPassword,omitempty" maxLength:"128"`
+}
+
 // PasskeyLoginOptionsRequest optionally hints at the account. The hint only
 // narrows what the assertion must resolve to; the options never reveal whether
 // the address exists and always allow a discoverable credential.
@@ -98,4 +105,10 @@ type PasskeyResponse struct {
 	BackupState    bool       `json:"backupState"`
 	CreatedAt      time.Time  `json:"createdAt"`
 	LastUsedAt     *time.Time `json:"lastUsedAt,omitempty"`
+}
+
+// PasskeyListResponse is the caller's complete passkey set. Passkeys are few
+// enough that this collection is not paginated.
+type PasskeyListResponse struct {
+	Passkeys []PasskeyResponse `json:"passkeys"`
 }

@@ -25,9 +25,11 @@ import (
 // Reclaiming intentionally leaves attempts unchanged and records the lease
 // expiry in last_error; the subsequent claim increments attempts once. A worker
 // that dies on its final allowed attempt is dead-lettered instead of being
-// requeued forever, which prevents poison jobs from crash-looping. The due CTE
-// locks candidate rows with SKIP LOCKED so concurrent workers never claim the
-// same job, and the UPDATE increments attempts at claim time.
+// requeued forever, which prevents poison jobs from crash-looping. Both CTEs
+// process at most $1 rows and lock candidates with SKIP LOCKED, so a crash that
+// leaves a large backlog cannot make one claim update (and hold locks on) every
+// expired row while concurrent workers deadlock on an arbitrary row order. The
+// due CTE increments attempts at claim time.
 //
 // $4 (include) and $5 (exclude) are optional kind filters set by WithKinds and
 // WithExcludeKinds; NULL disables a filter. They only narrow the due CTE: the
@@ -38,8 +40,17 @@ import (
 // and a lease_dead marker: dead rows from the expired CTE are returned too, so
 // the caller can log and count them instead of leaving them invisible.
 const claimJobsSQL = `
-WITH expired AS (
-    UPDATE jobs
+WITH expired_ids AS (
+    SELECT id
+    FROM jobs
+    WHERE status = 'running'
+      AND lease_expires_at < now()
+    ORDER BY lease_expires_at, id
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+),
+expired AS (
+    UPDATE jobs AS j
     SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
         payload = CASE WHEN attempts >= max_attempts THEN '{}'::jsonb ELSE payload END,
         run_at = CASE WHEN attempts >= max_attempts THEN run_at ELSE now() END,
@@ -51,9 +62,9 @@ WITH expired AS (
             ELSE 'jobs: worker lease expired'
         END,
         updated_at = now()
-    WHERE status = 'running'
-      AND lease_expires_at < now()
-    RETURNING id, tenant_id, kind, status
+    FROM expired_ids AS e
+    WHERE j.id = e.id
+    RETURNING j.id, j.tenant_id, j.kind, j.status
 ),
 due AS (
     SELECT id

@@ -9,8 +9,8 @@ import (
 	identity "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity"
 )
 
-// TestBuildRequiresEmailOutbox keeps the post-commit fallbacks from creeping
-// back: identity cannot be constructed without the transactional outbox.
+// TestBuildRequiresEmailOutbox keeps direct-send fallbacks from creeping back:
+// identity cannot be constructed without the transactional outbox.
 func TestBuildRequiresEmailOutbox(t *testing.T) {
 	_, err := identity.Build(app.Infra{}, identity.Settings{}, identity.Deps{})
 	require.ErrorContains(t, err, "transactional email outbox")

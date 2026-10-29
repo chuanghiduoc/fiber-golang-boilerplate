@@ -1,6 +1,7 @@
 .git
 .gitignore
 .env
+.env.*
 .env.example
 .vscode
 .idea
@@ -9,8 +10,12 @@
 .dockerignore
 .github/
 .superpowers/
+.claude/
+.workbuddy-ai/
 deploy/
 .opencode-brief.md
+CLAUDE.md
+AGENTS.md
 REPORT-*.md
 tmp/
 bin/

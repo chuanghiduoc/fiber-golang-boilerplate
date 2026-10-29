@@ -178,6 +178,10 @@ func (m *Module) RegisterRoutes(api *httpapi.API, _ app.Deps) {
 	receive := op(http.MethodPost, "/webhooks/inbound/{sourceId}", "receiveInboundWebhook",
 		"Receive an inbound webhook")
 	receive.Errors = []int{http.StatusUnauthorized}
+	// A duplicate delivery is acknowledged with 200 and the same receipt body,
+	// while a newly stored event returns 202. Huma documents only the default
+	// status, so declare the duplicate status explicitly.
+	receive.ExtraSuccessStatuses = []int{http.StatusOK}
 	httpapi.Register(api, receive, httpapi.Policy{
 		Public:    true,
 		RateLimit: httpapi.RateLimitStrict,

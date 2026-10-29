@@ -163,12 +163,12 @@ type intentRecorder struct {
 
 func (r *intentRecorder) Record(context.Context, audit.Event) error { return nil }
 
-func (r *intentRecorder) RecordID(_ context.Context, event audit.Event) (uuid.UUID, error) {
+func (r *intentRecorder) RecordID(_ context.Context, event audit.Event) (audit.IntentRef, error) {
 	r.intents = append(r.intents, event)
-	return testID(len(r.intents)), nil
+	return audit.IntentRef{ID: testID(len(r.intents))}, nil
 }
 
-func (r *intentRecorder) Complete(_ context.Context, _ uuid.UUID, completion audit.Completion) error {
+func (r *intentRecorder) Complete(_ context.Context, _ audit.IntentRef, completion audit.Completion) error {
 	r.completions = append(r.completions, completion)
 	return nil
 }
@@ -184,7 +184,11 @@ func doRoute(t *testing.T, application *fiber.App, method, path, jwt string, bod
 	req, err := http.NewRequest(method, path, reader)
 	require.NoError(t, err)
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		mediaType := "application/json"
+		if method == http.MethodPatch {
+			mediaType = "application/merge-patch+json"
+		}
+		req.Header.Set("Content-Type", mediaType)
 	}
 	if jwt != "" {
 		req.Header.Set("Authorization", "Bearer "+jwt)
@@ -255,12 +259,30 @@ func TestModuleRequiresAuthenticationAndPermissions(t *testing.T) {
 	})
 	assert.Equal(t, fiber.StatusCreated, resp.StatusCode)
 	assert.Equal(t, testID(11), svc.lastMemberID)
-	assert.Equal(t, "/api/v1/me/notifications/"+testID(1).String(), resp.Header.Get("Location"))
+	assert.Equal(t, "/api/v1/members/"+testID(11).String()+"/notifications/"+testID(1).String(), resp.Header.Get("Location"))
 	var created map[string]any
 	require.NoError(t, json.Unmarshal(payload, &created))
 	assert.Equal(t, true, created["emailQueued"])
 }
 
+func TestModuleGetMemberNotificationRequiresSendPermission(t *testing.T) {
+	svc := &routeService{}
+	application := newRouteApp(t, svc, &intentRecorder{})
+	memberID := testID(11)
+	notificationID := testID(9)
+	path := "/api/v1/members/" + memberID.String() + "/notifications/" + notificationID.String()
+
+	resp, _ := doRoute(t, application, http.MethodGet, path, memberToken(t), nil)
+	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+	assert.Zero(t, svc.lastUserID, "a member cannot read another member's feed without notifications:send")
+
+	resp, payload := doRoute(t, application, http.MethodGet, path, adminToken(t), nil)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	assert.Equal(t, memberID, svc.lastUserID)
+	var notification map[string]any
+	require.NoError(t, json.Unmarshal(payload, &notification))
+	assert.Equal(t, notificationID.String(), notification["id"])
+}
 func TestModuleSendFailsClosedWithoutAuditStore(t *testing.T) {
 	svc := &routeService{}
 	module := New(notificationshandler.New(svc))
@@ -286,12 +308,12 @@ func TestModuleWriteRoutesAreIdempotent(t *testing.T) {
 
 	first, firstBody := doRouteWithKey(t, application, http.MethodPatch, "/api/v1/me/notifications", jwt, "read-all-key",
 		map[string]any{"read": true})
-	assert.Equal(t, fiber.StatusOK, first.StatusCode)
+	assert.Equalf(t, fiber.StatusOK, first.StatusCode, "response body: %s", firstBody)
 	assert.Equal(t, 1, svc.markAllCalls)
 
 	second, secondBody := doRouteWithKey(t, application, http.MethodPatch, "/api/v1/me/notifications", jwt, "read-all-key",
 		map[string]any{"read": true})
-	assert.Equal(t, fiber.StatusOK, second.StatusCode)
+	assert.Equalf(t, fiber.StatusOK, second.StatusCode, "response body: %s", secondBody)
 	assert.Equal(t, "true", second.Header.Get("Idempotent-Replayed"))
 	assert.Equal(t, 1, svc.markAllCalls, "the replay must not execute the mutation twice")
 	assert.JSONEq(t, string(firstBody), string(secondBody))

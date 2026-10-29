@@ -121,13 +121,26 @@ func ensureBucket(ctx context.Context, client *s3.Client, bucket, region string)
 	return nil
 }
 
+// putBufferPrealloc bounds the initial buffer reservation for a non-seekable
+// upload body. The buffer still grows to the declared size while it is read,
+// but a bogus or very large declared size cannot force one huge allocation up
+// front.
+const putBufferPrealloc = 1 << 20
+
 func (s *Storage) Put(ctx context.Context, path string, reader io.Reader, size int64, contentType string) error {
+	if size < 0 {
+		return fmt.Errorf("invalid upload size %d", size)
+	}
 	// The SDK signs the payload hash, which needs a seekable body over plain
 	// HTTP. Multipart uploads are already seekable; other readers are buffered,
 	// bounded by the caller-supplied size.
 	body, ok := reader.(io.ReadSeeker)
 	if !ok {
-		buf := bytes.NewBuffer(make([]byte, 0, size))
+		prealloc := size
+		if prealloc > putBufferPrealloc {
+			prealloc = putBufferPrealloc
+		}
+		buf := bytes.NewBuffer(make([]byte, 0, prealloc))
 		if _, err := io.CopyN(buf, reader, size); err != nil {
 			return fmt.Errorf("failed to read upload body: %w", err)
 		}
@@ -201,8 +214,14 @@ func (c *cancelReadCloser) Close() error {
 	return err
 }
 
+const deleteTimeout = 30 * time.Second
+
 func (s *Storage) Delete(ctx context.Context, path string) error {
-	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+	// Delete is also used for best-effort cleanup on detached contexts. Bound
+	// it here so an unreachable endpoint cannot hang a request or worker.
+	deleteCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
+	if _, err := s.client.DeleteObject(deleteCtx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(path),
 	}); err != nil {

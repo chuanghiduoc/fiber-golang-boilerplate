@@ -163,11 +163,11 @@ ORDER BY e.id;
 -- immutable once written, so the existing row is kept as is.
 INSERT INTO webhook_events (
     tenant_id, event_id, event_type, data_version, actor_type, actor_id,
-    occurred_at, payload
+    subject_user_ids, occurred_at, payload
 )
 VALUES (
     @tenant_id, @event_id, @event_type, @data_version, @actor_type,
-    sqlc.narg(actor_id), @occurred_at, @payload::jsonb
+    sqlc.narg(actor_id), @subject_user_ids::uuid[], @occurred_at, @payload::jsonb
 )
 ON CONFLICT (tenant_id, event_id) DO NOTHING;
 

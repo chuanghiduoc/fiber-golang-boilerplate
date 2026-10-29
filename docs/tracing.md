@@ -89,7 +89,7 @@ connects lazily and export failures only drop spans.
 ```mermaid
 flowchart LR
     subgraph TA["Trace A: HTTP request"]
-        H["server span<br/>POST /api/v1/files/upload"]
+        H["server span<br/>POST /api/v1/files"]
         D1["client span<br/>db INSERT (files)"]
         D2["client span<br/>db INSERT (jobs)<br/>stores trace_parent"]
         H --> D1

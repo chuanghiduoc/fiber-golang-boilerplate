@@ -32,7 +32,7 @@ func NewRoleHandler(roles RoleAdmin) *RoleHandler {
 }
 
 type listRolesInput struct {
-	Limit         int    `query:"limit" minimum:"1" maximum:"100" default:"20"`
+	Limit         int    `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string `query:"startingAfter"`
 }
 
@@ -45,9 +45,9 @@ type roleInput struct {
 }
 
 type updateRoleInput struct {
-	RoleID  string `path:"roleId" format:"uuid"`
-	IfMatch string `header:"If-Match"`
-	RawBody []byte `rawBody:"application/merge-patch+json" contentType:"application/merge-patch+json" required:"true"`
+	RoleID  string        `path:"roleId" format:"uuid"`
+	IfMatch string        `header:"If-Match"`
+	Body    dto.RolePatch `contentType:"application/merge-patch+json" required:"true"`
 }
 
 // ListRoles returns system roles plus the request tenant's roles.
@@ -105,9 +105,12 @@ func (h *RoleHandler) UpdateRole(ctx context.Context, input *updateRoleInput) (*
 	if err := checkETag(input.IfMatch, existing.UpdatedAt); err != nil {
 		return nil, err
 	}
-	var req dto.RolePatch
-	if err := decodeMergePatch(input.RawBody, &req); err != nil {
-		return nil, err
+	req := input.Body
+	if !req.Name.Present && !req.Permissions.Present {
+		return &httpapi.ETagOutput[dto.RoleResponse]{
+			ETag: etagHeader(existing.UpdatedAt),
+			Body: toRoleResponse(existing),
+		}, nil
 	}
 	if req.Name.Present && req.Name.Null {
 		return nil, unprocessable("name cannot be cleared")

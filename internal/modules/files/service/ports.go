@@ -56,6 +56,21 @@ type UploadOptions struct {
 	Scanner          scan.Scanner
 }
 
+// QuotaScope selects the counters a quota check needs. User-only deployments
+// must never read or lock tenant-wide usage.
+type QuotaScope struct {
+	Tenant bool
+	User   bool
+}
+
+// QuotaUsage is the selected storage counters. UserBytes is one indexed row;
+// TenantBytes is the SUM of users' rows only when the tenant quota is enabled.
+// The unrequested side stays zero.
+type QuotaUsage struct {
+	TenantBytes int64
+	UserBytes   int64
+}
+
 // FileRepository is the metadata persistence port. Implementations scope every
 // query to the request tenant (tenant.Require(ctx)) and return
 // apperror.ErrNotFound when no row matches.
@@ -71,14 +86,15 @@ type FileRepository interface {
 	Delete(ctx context.Context, id uuid.UUID) (*File, error)
 	Restore(ctx context.Context, id uuid.UUID) (*File, error)
 	AdminFileStats(ctx context.Context) (FileStats, error)
-	// LockQuota serializes uploads of the context tenant for the rest of the
-	// transaction. It must be called inside the upload's metadata transaction,
-	// before StorageUsage, so two concurrent uploads cannot both observe the
-	// same free space and both pass.
-	LockQuota(ctx context.Context) error
-	// StorageUsage returns the tenant's total stored bytes (live plus trash)
-	// and the same total for one user.
-	StorageUsage(ctx context.Context, userID uuid.UUID) (tenantBytes, userBytes int64, err error)
+	// StorageUsage reads only the counters selected by scope. It is the cheap,
+	// lock-free pre-check; user-only quota checks do not touch tenant usage.
+	StorageUsage(ctx context.Context, userID uuid.UUID, scope QuotaScope) (QuotaUsage, error)
+	// LockStorageUsage serializes only the selected quota scope and returns its
+	// current values. It must run inside the upload's metadata transaction. A
+	// user quota locks one user row; a tenant quota takes the tenant advisory
+	// lock and sums per-user rows. The tenant lock is taken first when both are
+	// enabled, so unrelated users stay concurrent under user-only quota.
+	LockStorageUsage(ctx context.Context, userID uuid.UUID, scope QuotaScope) (QuotaUsage, error)
 }
 
 // AuditWriter records a Tier 1 audit event in the current transaction, so the

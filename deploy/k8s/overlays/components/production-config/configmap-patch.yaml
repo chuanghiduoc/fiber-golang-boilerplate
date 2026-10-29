@@ -14,6 +14,13 @@ data:
   APP_FRONTEND_URL: "https://app.example.com"
   CORS_ALLOW_ORIGINS: "https://app.example.com"
 
+  # Replace with the exact ingress-nginx pod/service CIDR for this cluster, or
+  # the node CIDR when the controller uses hostNetwork. Startup rejects this
+  # placeholder, /0, and the broad private aggregates (including 10.0.0.0/8),
+  # so a forgotten or over-broad override cannot trust spoofed X-Forwarded-For.
+  APP_TRUST_PROXY: "true"
+  APP_TRUSTED_PROXIES: "REPLACE_WITH_INGRESS_NGINX_POD_CIDR"
+
   # Managed PostgreSQL/Redis/SMTP endpoints for production.
   DB_HOST: "db.production.example.com"
   DB_MAX_CONNS: "10"
@@ -22,8 +29,3 @@ data:
 
   # Separate bucket and credentials (credentials stay in the Secret).
   STORAGE_S3_BUCKET: "REPLACE_WITH_PRODUCTION_S3_BUCKET"
-
-  # Bootstrap admin identity for the one-shot seed Job. The password is in
-  # fiber-boilerplate-seed-secrets (ADMIN_PASSWORD).
-  ADMIN_EMAIL: "admin@example.com"
-  ADMIN_NAME: "Admin"

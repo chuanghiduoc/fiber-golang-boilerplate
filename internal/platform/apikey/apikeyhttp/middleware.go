@@ -103,11 +103,12 @@ func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier, catalog *
 // effectiveScopes intersects the key's stored scopes with the owner's current
 // effective permissions. A key issued while its owner could grant a scope
 // therefore loses it immediately after a role change, matching the principal
-// revalidation performed on every request. A principal without a loaded
-// permission set (tests, minimal deployments) falls back to its role.
+// revalidation performed on every request. A principal without either a role
+// or a loaded permission set is invalid and grants no scopes: a malformed
+// principal must fail closed rather than revive a key's stored grants.
 func effectiveScopes(principal identitycontracts.Principal, scopes []authz.Permission, authorizer authz.Authorizer) []authz.Permission {
 	if principal.Role == "" && principal.Permissions == nil {
-		return scopes
+		return nil
 	}
 	effective := make([]authz.Permission, 0, len(scopes))
 	for _, scope := range scopes {

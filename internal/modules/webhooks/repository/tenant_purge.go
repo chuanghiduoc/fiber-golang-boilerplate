@@ -70,6 +70,9 @@ func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) erro
 // drainInBatches repeats one bounded delete until it reports no rows.
 func drainInBatches(ctx context.Context, batch func() (int64, error)) error {
 	for {
+		if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+			return err
+		}
 		deleted, err := batch()
 		if err != nil {
 			return err

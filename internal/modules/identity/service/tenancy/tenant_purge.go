@@ -154,11 +154,27 @@ func (s *TenantPurgeService) HandlePurgeJob(ctx context.Context, _ json.RawMessa
 // purgeDeletedTenant reports completed=false when its per-tenant budget ran
 // out before the tenant was finished; the persisted cursor lets the next run
 // resume after the last finished member.
+type tenantPurgeRun struct {
+	parentCtx context.Context
+	budgetCtx context.Context
+	start     time.Time
+}
+
+// purgeDeletedTenant reports completed=false when its per-tenant budget ran
+// out before the tenant was finished; the persisted cursor lets the next run
+// resume after the last finished member.
 func (s *TenantPurgeService) purgeDeletedTenant(ctx context.Context, t PurgeTenant) (bool, error) {
 	start := s.clock()
 	tctx := tenant.WithID(ctx, t.ID)
-	completed, err := s.eraseMemberships(tctx, start, t.ID, t.Cursor)
+	budgetCtx, cancel := context.WithTimeout(tctx, tenantPurgeTenantBudget)
+	defer cancel()
+	run := tenantPurgeRun{parentCtx: ctx, budgetCtx: budgetCtx, start: start}
+
+	completed, err := s.eraseMemberships(budgetCtx, start, t.ID, t.Cursor)
 	if err != nil {
+		if s.deferredByBudget(run.parentCtx, run.budgetCtx, err) {
+			return false, nil
+		}
 		return false, err
 	}
 	if !completed {
@@ -168,35 +184,32 @@ func (s *TenantPurgeService) purgeDeletedTenant(ctx context.Context, t PurgeTena
 		return false, fmt.Errorf("tenant purge registry is not configured")
 	}
 	providers := s.registry.Providers()
-	identitySeen := false
 	for _, provider := range providers {
 		if provider.Name == tenantPurgerName {
 			continue
 		}
-		if s.budgetExhausted(start) {
-			return false, nil
-		}
-		if err := provider.Purger.PurgeTenant(tctx, t.ID); err != nil {
-			return false, fmt.Errorf("purge %s: %w", provider.Name, err)
+		ready, err := s.purgeProvider(run, provider, t.ID)
+		if err != nil || !ready {
+			return false, err
 		}
 	}
+	identitySeen := false
 	for _, provider := range providers {
 		if provider.Name != tenantPurgerName {
 			continue
 		}
-		if s.budgetExhausted(start) {
-			return false, nil
+		ready, err := s.purgeProvider(run, provider, t.ID)
+		if err != nil || !ready {
+			return false, err
 		}
 		identitySeen = true
-		if err := provider.Purger.PurgeTenant(tctx, t.ID); err != nil {
-			return false, fmt.Errorf("purge %s: %w", provider.Name, err)
-		}
 	}
 	if !identitySeen {
 		return false, fmt.Errorf("identity tenant purger is not registered")
 	}
-	if s.budgetExhausted(start) {
-		return false, nil
+	ready, err := s.purgeBudgetReady(run)
+	if err != nil || !ready {
+		return false, err
 	}
 
 	event := audit.NewServiceEvent(tctx, "tenant.purged", "tenant")
@@ -214,6 +227,30 @@ func (s *TenantPurgeService) purgeDeletedTenant(ctx context.Context, t PurgeTena
 	return true, nil
 }
 
+func (s *TenantPurgeService) purgeProvider(run tenantPurgeRun, provider tenancycontracts.Provider, tenantID uuid.UUID) (bool, error) {
+	ready, err := s.purgeBudgetReady(run)
+	if err != nil || !ready {
+		return false, err
+	}
+	if err := provider.Purger.PurgeTenant(run.budgetCtx, tenantID); err != nil {
+		if s.deferredByBudget(run.parentCtx, run.budgetCtx, err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("purge %s: %w", provider.Name, err)
+	}
+	return true, nil
+}
+
+func (s *TenantPurgeService) purgeBudgetReady(run tenantPurgeRun) (bool, error) {
+	if err := tenancycontracts.CheckPurgeBudget(run.budgetCtx); err != nil {
+		if errors.Is(err, tenancycontracts.ErrPurgeBudgetExceeded) {
+			return false, nil
+		}
+		return false, err
+	}
+	return !s.budgetExhausted(run.start), nil
+}
+
 // eraseMemberships runs the privacy erasers for every membership of the
 // tenant, including removed ones, in user-id pages from cursor. Each member's
 // membership is deleted as soon as every eraser succeeded, so a resumed run
@@ -225,6 +262,9 @@ func (s *TenantPurgeService) eraseMemberships(ctx context.Context, start time.Ti
 	}
 	after := cursor
 	for {
+		if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+			return false, err
+		}
 		if s.budgetExhausted(start) {
 			return false, nil
 		}
@@ -233,6 +273,9 @@ func (s *TenantPurgeService) eraseMemberships(ctx context.Context, start time.Ti
 			return false, fmt.Errorf("list tenant memberships: %w", err)
 		}
 		for _, userID := range userIDs {
+			if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+				return false, err
+			}
 			if s.budgetExhausted(start) {
 				return false, nil
 			}
@@ -262,6 +305,19 @@ func (s *TenantPurgeService) budgetExhausted(start time.Time) bool {
 	return s.clock().Sub(start) >= tenantPurgeTenantBudget
 }
 
+// deferredByBudget distinguishes the per-tenant deadline from a real failure.
+// A parent cancellation or deadline still fails the job; only the child budget
+// that this service created is a resumable partial run.
+func (s *TenantPurgeService) deferredByBudget(parent, budget context.Context, err error) bool {
+	if parent.Err() != nil {
+		return false
+	}
+	if errors.Is(err, tenancycontracts.ErrPurgeBudgetExceeded) {
+		return true
+	}
+	return budget.Err() != nil && errors.Is(err, context.DeadlineExceeded)
+}
+
 // clock is the budget clock; the constructor sets time.Now.
 func (s *TenantPurgeService) clock() time.Time {
 	if s.now != nil {
@@ -280,17 +336,17 @@ func (s *TenantPurgeService) PurgeTenant(ctx context.Context, tenantID uuid.UUID
 	if err := s.purgeDataExports(ctx, tenantID); err != nil {
 		return err
 	}
-	if err := purgeInBatches(func() (int64, error) {
+	if err := purgeInBatches(ctx, func() (int64, error) {
 		return s.repo.DeleteInvitationsBatch(ctx, tenantID, tenancycontracts.PurgeBatchSize)
 	}); err != nil {
 		return fmt.Errorf("delete tenant invitations: %w", err)
 	}
-	if err := purgeInBatches(func() (int64, error) {
+	if err := purgeInBatches(ctx, func() (int64, error) {
 		return s.repo.DeleteMembershipsBatch(ctx, tenantID, tenancycontracts.PurgeBatchSize)
 	}); err != nil {
 		return fmt.Errorf("delete tenant memberships: %w", err)
 	}
-	if err := purgeInBatches(func() (int64, error) {
+	if err := purgeInBatches(ctx, func() (int64, error) {
 		return s.repo.DeleteTenantRolesBatch(ctx, tenantID, tenancycontracts.PurgeBatchSize)
 	}); err != nil {
 		return fmt.Errorf("delete tenant roles: %w", err)
@@ -306,6 +362,9 @@ func (s *TenantPurgeService) PurgeTenant(ctx context.Context, tenantID uuid.UUID
 // counts as deleted, so a retry after a partial run finishes the same page.
 func (s *TenantPurgeService) purgeDataExports(ctx context.Context, tenantID uuid.UUID) error {
 	for {
+		if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+			return err
+		}
 		exports, err := s.repo.ListDataExports(ctx, tenantID, tenancycontracts.PurgeBatchSize)
 		if err != nil {
 			return fmt.Errorf("list tenant data exports: %w", err)
@@ -323,15 +382,22 @@ func (s *TenantPurgeService) purgeDataExports(ctx context.Context, tenantID uuid
 				return fmt.Errorf("delete tenant data export %s: %w", export.ID, err)
 			}
 		}
+		if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+			return err
+		}
 		if err := s.repo.DeleteDataExports(ctx, tenantID, ids); err != nil {
 			return fmt.Errorf("delete tenant data exports: %w", err)
 		}
 	}
 }
 
-// purgeInBatches repeats one bounded delete until it reports no rows.
-func purgeInBatches(batch func() (int64, error)) error {
+// purgeInBatches repeats one bounded delete until it reports no rows or the
+// caller's purge budget ends.
+func purgeInBatches(ctx context.Context, batch func() (int64, error)) error {
 	for {
+		if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+			return err
+		}
 		deleted, err := batch()
 		if err != nil {
 			return err

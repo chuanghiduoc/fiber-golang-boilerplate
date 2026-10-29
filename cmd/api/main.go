@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
@@ -29,7 +30,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/storage/drivers"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
@@ -72,6 +72,9 @@ var version = "dev"
 // infrastructure, register catalogs and modules, run startup checks), start
 // background work, serve until a signal or listener error, then shut down
 // inside config.ShutdownBudget.
+// main runs the container health check subcommand or the server lifecycle.
+// run returns an exit code so deferred cleanup in the normal path executes
+// before the process exits.
 func main() {
 	// The distroless runtime has no shell, curl, or wget, so the container
 	// health check is this binary's own subcommand. Handle it before loading
@@ -79,30 +82,44 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == healthcheckCommand {
 		os.Exit(runHealthcheck(os.Args[2:], os.Stdout, os.Stderr, os.Getenv))
 	}
+	os.Exit(run())
+}
 
-	cfg := loadConfig()
+// run executes one server lifecycle and returns its process exit code.
+func run() int {
+	// Register signal handling before startup. A SIGTERM during a slow database
+	// or storage initialization must cancel startup and run cleanup instead of
+	// using the default action and bypassing the shutdown path.
+	shutdownCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		slog.Error("failed to load config", slog.Any("error", err))
+		return 1
+	}
 	slog.Info("build info", slog.String("version", version))
 
-	rt, err := start(cfg)
+	rt, err := start(shutdownCtx, cfg)
 	if err != nil {
-		exitStartup(err)
+		logStartupFailure(err)
+		return 1
 	}
 
 	bg, err := rt.startBackground()
 	if err != nil {
 		rt.closeDatabasePools()
-		exitStartup(err)
+		logStartupFailure(err)
+		return 1
 	}
 
-	exitCode := rt.serve()
+	exitCode := rt.serve(shutdownCtx)
 	if !rt.shutdown(bg) {
 		exitCode = 1
 	}
 
 	slog.Info("server exited")
-	if exitCode != 0 {
-		os.Exit(exitCode)
-	}
+	return exitCode
 }
 
 // runtime is everything start builds that the later phases run or close.
@@ -150,25 +167,23 @@ func startupFailed(msg string, err error) error {
 	return &startupError{msg: msg, err: err}
 }
 
-// exitStartup logs a startup failure and exits with status 1.
-func exitStartup(err error) {
+// logStartupFailure logs a startup failure; the caller returns exit status 1.
+func logStartupFailure(err error) {
 	var se *startupError
 	if errors.As(err, &se) {
 		slog.Error(se.msg, slog.Any("error", se.err))
 	} else {
 		slog.Error("startup failed", slog.Any("error", err))
 	}
-	os.Exit(1)
 }
 
 // loadConfig loads configuration, sets up logging, and warns about settings
 // that are allowed but risky. Validate checks FEATURE_FLAGS syntax only;
 // unknown keys are rejected in start, once modules have registered their flags.
-func loadConfig() *config.Config {
+func loadConfig() (*config.Config, error) {
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("failed to load config", slog.Any("error", err))
-		os.Exit(1)
+		return nil, err
 	}
 
 	logger.SetupWith(cfg.App.Env, cfg.App.LogLevel, logging.Wrap)
@@ -182,11 +197,8 @@ func loadConfig() *config.Config {
 		validator.SetBreachChecker(nil)
 	}
 
-	// Base URL for RFC 9457 problem "type" links in error responses.
-	apperror.DocsBaseURL = cfg.App.ErrorDocsBaseURL
-
 	warnRiskySettings(cfg)
-	return cfg
+	return cfg, nil
 }
 
 // warnRiskySettings logs configurations that validation accepts on purpose
@@ -221,8 +233,8 @@ func warnRiskySettings(cfg *config.Config) {
 // modules and their catalogs, then module startup checks. The HTTP
 // application is composed after the deadline is released. On any error after
 // the database pool exists, the pool is closed before returning.
-func start(cfg *config.Config) (_ *runtime, err error) {
-	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
+func start(ctx context.Context, cfg *config.Config) (_ *runtime, err error) {
+	startupCtx, cancelStartup := context.WithTimeout(ctx, startupTimeout)
 	defer cancelStartup()
 
 	rt := &runtime{cfg: cfg}
@@ -522,9 +534,11 @@ func (rt *runtime) startBackground() (background, error) {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	workerDone := make(chan struct{})
 	go func() {
-		if err := rt.worker.Run(workerCtx); err != nil {
-			slog.Error("job worker stopped", slog.Any("error", err))
-		}
+		runGuarded("job worker", func() {
+			if err := rt.worker.Run(workerCtx); err != nil {
+				slog.Error("job worker stopped", slog.Any("error", err))
+			}
+		})
 		close(workerDone)
 	}()
 	// Module background loops are best-effort, but they hold the pools and
@@ -544,7 +558,7 @@ func startModuleLoops(ctx context.Context, loops []func(context.Context)) <-chan
 	for _, run := range loops {
 		go func() {
 			defer running.Done()
-			run(ctx)
+			runGuarded("module background loop", func() { run(ctx) })
 		}()
 	}
 	done := make(chan struct{})
@@ -576,17 +590,35 @@ func (rt *runtime) startScheduler() (context.CancelFunc, <-chan struct{}, error)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := sched.Run(schedulerCtx); err != nil {
-			slog.Error("scheduler stopped", slog.Any("error", err))
-		}
+		runGuarded("scheduler", func() {
+			if err := sched.Run(schedulerCtx); err != nil {
+				slog.Error("scheduler stopped", slog.Any("error", err))
+			}
+		})
 	}()
 	slog.Info("scheduler enabled", slog.Int("schedules", rt.schedules.Len()))
 	return cancel, done, nil
 }
 
+// runGuarded isolates a panic in a background loop. HTTP requests and per-job
+// handlers already recover; a bare goroutine would otherwise crash the process
+// without a 500 response and without a stack trace.
+func runGuarded(name string, run func()) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error("background task panicked",
+				slog.String("task", name),
+				slog.Any("panic", recovered),
+				slog.String("stack", string(debug.Stack())),
+			)
+		}
+	}()
+	run()
+}
+
 // serve listens until the listener fails or SIGINT/SIGTERM arrives. It
 // returns exit code 1 for a listener error and 0 for a signal.
-func (rt *runtime) serve() int {
+func (rt *runtime) serve(ctx context.Context) int {
 	serverErr := make(chan error, 1)
 	go func() {
 		addr := fmt.Sprintf(":%d", rt.cfg.App.Port)
@@ -595,18 +627,14 @@ func (rt *runtime) serve() int {
 		serverErr <- rt.app.Listen(addr)
 	}()
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigChan)
-
 	select {
 	case listenErr := <-serverErr:
 		if listenErr != nil {
 			slog.Error("server error", slog.Any("error", listenErr))
 			return 1
 		}
-	case sig := <-sigChan:
-		slog.Info("received signal, shutting down gracefully", slog.String("signal", sig.String()))
+	case <-ctx.Done():
+		slog.Info("received shutdown signal, shutting down gracefully")
 	}
 	return 0
 }
@@ -639,21 +667,18 @@ func (rt *runtime) drain(ctx context.Context, bg background) bool {
 	httpDone := make(chan error, 1)
 	go func() { httpDone <- rt.app.ShutdownWithContext(ctx) }()
 
-	// 2. Stop producing scheduled work first, then stop claiming new jobs and
-	//    let running handlers drain.
+	// 2. Signal every background producer/consumer before waiting for any one
+	//    of them. Waiting on the scheduler before canceling the worker lets a
+	//    slow scheduler pass consume the whole drain window while the worker
+	//    keeps claiming new jobs. The loops share the worker context, so they
+	//    are canceled here too and joined before the pools close.
 	if bg.schedulerCancel != nil {
 		bg.schedulerCancel()
-		waitForShutdown(ctx, bg.schedulerDone, "scheduler")
 	}
 	if bg.workerCancel != nil {
 		bg.workerCancel()
-		waitForShutdown(ctx, bg.workerDone, "job worker")
 	}
-	// The loops share the worker context, so they are already canceled. Join
-	// them before the caller closes the pools they use.
-	if bg.loopsDone != nil {
-		waitForShutdown(ctx, bg.loopsDone, "module background loops")
-	}
+	waitForBackground(ctx, bg)
 
 	clean := true
 	if err := <-httpDone; err != nil {
@@ -754,6 +779,33 @@ func closePools(primary, bypass *pgxpool.Pool, timeout time.Duration) {
 			slog.Int("acquired_conns", acquired),
 		)
 	}
+}
+
+// waitForBackground joins every background component concurrently under the
+// shared drain deadline. Components whose cancellation is already covered by
+// another signal (module loops share the worker context) still have their own
+// completion channel, so each one is joined before resources close.
+func waitForBackground(ctx context.Context, bg background) {
+	targets := []struct {
+		name string
+		done <-chan struct{}
+	}{
+		{"scheduler", bg.schedulerDone},
+		{"job worker", bg.workerDone},
+		{"module background loops", bg.loopsDone},
+	}
+	var wg sync.WaitGroup
+	for _, target := range targets {
+		if target.done == nil {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			waitForShutdown(ctx, target.done, target.name)
+		}()
+	}
+	wg.Wait()
 }
 
 // waitForShutdown waits for done or the shared drain deadline, logging which

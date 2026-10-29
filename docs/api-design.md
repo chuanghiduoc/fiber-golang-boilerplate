@@ -38,7 +38,7 @@ The helper attaches the policy to `huma.Operation.Metadata`, adds the OpenAPI
 security requirement, and builds the one correct middleware order:
 
 ```
-rate limit (IP) -> authenticate -> rate limit (principal) -> authz -> MFA
+rate limit (IP) -> tenant -> authenticate -> rate limit (principal) -> authz -> MFA
   -> idempotency -> audit guard -> handler
 ```
 
@@ -87,15 +87,20 @@ that principal quota.
   "object": "list",
   "url": "/api/v1/files",
   "data": [],
-  "hasMore": false,
-  "nextCursor": null
+  "hasMore": false
 }
 ```
 
 The envelope is `pagination.List[T]`; handlers construct it with
 `pagination.NewList` (or `httpapi.ListOutput[T]`). `httpapi.NewCreated` and
 `httpapi.NewAccepted` set the status and `Location`; `httpapi.Empty` is the
-204 body. There is no `{"message": ...}` success body.
+204 body. `nextCursor` is omitted on the last page; it is never `null`. There is
+no `{"message": ...}` success body.
+
+`url` is the canonical collection path without a query string. It is not a
+ready-made next-page link: clients must preserve their own filters and set
+`startingAfter` to `nextCursor`. Tenant context is resolved from the header or
+route, not encoded into `url`.
 
 ## Pagination
 
@@ -112,7 +117,7 @@ helpers stay limited to small admin/export tables.
 |---|---|
 | **Partial update** — `PATCH` with `application/merge-patch+json` (RFC 7396) | `/me/profile`, `/members/{id}`, `/roles/{id}`, `/webhooks/...`, `/platform/tenants/{id}`, `/platform/feature-flags/{key}` |
 | **Full replace** | None for config resources; every config field is a merge-patch member. Point-of-no-return state transitions use their state field (`status`, `enabled`) in `PATCH`. |
-| **Upsert** | `PATCH /me/notification-preferences` (one preference) and `POST /platform/feature-flags/{key}/targets` |
+| **Upsert** | `PUT /me/notification-preferences/{type}/{channel}` (replace one preference) and `PUT /platform/feature-flags/{key}/targets/{targetId}` (upsert one target) |
 | **Create** | `POST /collection` (multipart `POST /files`, file upload) |
 | **Custom method** | `POST /resource/{id}/verb` only where no state field fits: `restore`, `rotate-secret`, `replay`, `step-up`, and the auth ceremonies (`complete`, `verify`, `accept`, `signup`, `exchange`) |
 
@@ -195,6 +200,7 @@ middleware errors and huma handler/validation errors:
 | `detail` | Public text only. A 5xx logs `slog.ErrorContext` with the internal cause (`AppError.Cause`/`Unwrap`) and never returns it. Use `apperror.Internal(err, "public text")`. |
 | `type` | `ERROR_DOCS_BASE_URL` + the catalog `DocPath`. |
 | Validation | `422 request.validation_failed` with a flat `errors[]`; huma's validation details are mapped into the same list. |
+| `errors[].path` | Body fields are body-relative (`name`, `items[0].name`). Query, path, and header fields keep their location prefix (`query.limit`, `path.sessionId`, `header.X-...`). An error about the whole body is `body`. |
 | Localization | `title`, `errors[].message`, and opted-in `detail` follow `Accept-Language` (`en`/`vi`). `code`, `type`, `status`, `instance`, and paths never change. |
 | Authorization | `403 permission.denied`. MFA re-auth is `403 auth.mfa_required`. |
 | Existence | Never disclose another user's or tenant's resource; return `404 resource.not_found`. |
@@ -224,6 +230,25 @@ middleware errors and huma handler/validation errors:
 | 503 | Dependency degraded/unavailable, or required audit intent unavailable |
 | 504 | Request timeout |
 
+### Content negotiation
+
+Every JSON operation checks `Accept` before the feature gate, idempotency, and
+audit. The most specific matching media range decides: an exact
+`application/json;q=0` overrides a broader `*/*;q=1`, and an invalid or
+out-of-range q-value fails closed. An empty header, `*/*`, `application/*`,
+`application/json`, and `application/*+json` are accepted; any other
+representation is `406 request.not_acceptable`. Streamed non-JSON responses
+(file/export content, Prometheus metrics) and redirects bypass JSON
+negotiation. A typed body's
+`contentType` declaration is enforced before any mutation; a missing or
+different media type is `415 request.unsupported_media_type`. Multipart uploads
+are parsed only by the upload handler and are bounded by `APP_BODY_LIMIT`. The
+huma body reader is configured with the same ceiling instead of its built-in
+1 MiB default; every non-upload route is still rejected earlier by the global
+`APP_JSON_BODY_LIMIT` cap. The body read deadline is `APP_REQUEST_TIMEOUT` rather
+than huma's 5 s default, so a slow but valid upload is not cut off before the
+request budget.
+
 ## Authentication and authorization
 
 Every protected operation runs the same chain, in this order:
@@ -233,7 +258,10 @@ Every protected operation runs the same chain, in this order:
    JWT-only; both include the per-IP auth limiter;
 3. `authzhttp.Require`/`RequireAny`;
 4. `authzhttp.RequireMFA` when the policy requires it (always for `platform:*`);
-5. idempotency, audit guard, handler.
+5. `content_type`: a typed body must match its declared media type (otherwise `415`);
+6. `accept`: a JSON operation must accept `application/json` (otherwise `406`);
+7. the feature gate, then `No-store` where declared;
+8. idempotency, audit guard, handler.
 
 The JWT carries user id, `tenant_id`, `sid`, `token_version`, and optional `amr`
 (`pwd`/`google`/`otp`/`rc`); it never carries a role. The session snapshot
@@ -264,10 +292,12 @@ ceremonies live under `/auth`.
 | Route | Behavior |
 |---|---|
 | `GET /me/mfa` | Status and factors; recovery-codes remaining. |
+| `GET /me/mfa/totp/{factorId}` | Secret-free pending/active status for one enrollment; this is the dereference target of the enrollment `Location`. |
 | `POST /me/mfa/totp` | Start/restart a pending enrollment, return the `otpauth://` URI once. Re-enrollment replaces the secret and resets the 15-minute window. Re-authenticate with `currentPassword` or a fresh passwordless session. |
 | `POST /me/mfa/totp/{factorId}/confirm` | Verify the pending secret; enable the factor, issue ten single-use recovery codes, bump `token_version`, and re-issue the caller's session/tokens once. |
 | `DELETE /me/mfa/{factorId}` | Require a current TOTP/recovery code; delete the factor and codes, revoke other sessions. |
 | `POST /me/mfa/recovery-codes` | Require a code; return ten new codes and invalidate the old set. |
+| `GET /me/mfa/passkeys[/{passkeyId}]` | List the caller's passkeys or read one by id without credential/public-key material; another owner is `404`. |
 | `POST /me/mfa/step-up` | Refresh `sessions.mfa_verified_at` with a current TOTP/recovery code or a passkey assertion; used when an MFA-gated route returns `403 auth.mfa_required` for staleness. A passkey step-up also adds `hwk`/`swk` to the session's `amr`. |
 | `POST /me/mfa/passkeys/options`, `POST /me/mfa/passkeys`, `DELETE /me/mfa/passkeys/{passkeyId}` | WebAuthn registration ceremony and factor lifecycle. Options are JWT-only and `No-store`; the attestation is verified with user verification required and stored by credential id (global to the user). |
 | `POST /auth/mfa/verifications` | Public: single-use, tenant-bound, five-minute challenge plus TOTP/recovery code → normal tokens. |
@@ -318,14 +348,20 @@ signed state/source row instead.
 | `POST /me/data-exports` | Queue one tenant-scoped export; `202` with `Location`; a second queued/running export is `409 data_export.in_progress`. |
 | `GET /me/data-exports/{exportId}` | Status (`queued`, `running`, `ready`, `failed`, `expired`) and `downloadUrl` when ready. |
 | `GET /me/data-exports/{exportId}/content` | Stream the ready JSON document, `Cache-Control: no-store`; `409` not ready, `410` expired, `404` unknown/other owner. |
-| `POST /me/erasure-requests` | Self erasure: re-authenticate, reserve/suspend every membership, revoke sessions, queue one erase job per membership plus the global finalizer; `202` with `Location`. Refused while it would leave a tenant without an active owner (`409 user.last_admin`). |
+| `POST /me/erasure-requests` | Self erasure: re-authenticate, reserve/suspend every membership, revoke sessions, queue one erase job per membership plus the global finalizer; `202` with `Location`. Refused while it would leave a tenant without an active owner (`409 user.last_admin`). A password account proves `currentPassword`; an OAuth-only account proves a session no older than 15 minutes (`core.ReauthSessionMaxAge`), the same rule MFA and passkey changes use. |
 | `GET /me/erasure-requests[/{requestId}]` | Status resource for the accepted erasure. |
 | `POST /members/{memberId}/erasure-requests` | Tenant-scoped admin erasure; JWT-only, rank checked, one erase job for this tenant, no finalizer; `202` with `Location`. |
+| `GET /members/{memberId}/erasure-requests/{requestId}` | Tenant-scoped status resource for the admin erasure; `requestId` is the member id and another id is `404`. |
 
 The export document is `{userId,tenantId,generatedAt,sections:{identity,files,
 notifications,apikeys,features,webhooks}}`; it never includes secrets or
-hashes. Blobs are embedded up to 64 MiB, later files carry
-`contentOmitted:true`. Exports expire after 7 days; the hourly
+hashes. The identity, files, notifications, apikeys, features, and webhooks providers bound their collections
+(at most 1000 rows per collection) and report the applied limits in `budget`; omitted rows/content set
+`truncated:true`, and the document lists the affected providers in
+`truncatedSections`. Blobs are embedded up to 64 MiB, later files carry
+`contentOmitted:true`; once that byte budget is exhausted the exporter does not
+fetch more blobs. Audit export reports `auditEventsTruncated` instead of
+silently stopping at the audit row cap. Exports expire after 7 days; the hourly
 `privacy.exports.purge` removes the blob then the row. Self erasure anonymizes
 the global user only after every membership is removed; audit rows keep ids and
 outcomes only.
@@ -342,7 +378,7 @@ seeded, immutable, and visible to every tenant.
   `platform:features:read|write` (MFA required). Precedence: force-off > kill
   switch > user target > tenant target > database default > environment >
   compiled default. `killSwitch` fails closed while a snapshot is stale.
-  Targets use `POST /platform/feature-flags/{key}/targets` to upsert and
+  Targets use `PUT /platform/feature-flags/{key}/targets/{targetId}` to upsert and
   `DELETE .../{targetId}` to remove.
 - Feature-flag reads require `platform:features:read`; writes accept
   `Idempotency-Key`, return/honour ETags, and are Tier 1 or Guarded.
@@ -356,8 +392,10 @@ seeded, immutable, and visible to every tenant.
 - Optional byte quotas (`FILES_TENANT_QUOTA_BYTES`, `FILES_USER_QUOTA_BYTES`)
   count live plus trashed files. A cheap pre-check rejects an already-over
   upload before the blob is written; the authoritative check runs inside the
-  metadata transaction under a per-tenant advisory lock. Over quota is `413
-  file.quota_exceeded`.
+  metadata transaction. A user quota locks only that user's counter row; a
+  tenant quota takes a per-tenant advisory lock and sums the per-user counters,
+  so a user-only deployment never serializes unrelated users. Over quota is
+  `413 file.quota_exceeded`.
 - With `FILES_SCAN_DRIVER=clamav`, the blob is scanned before commit; a match is
   `422 file.infected`, scanner failure is `503 file.scan_unavailable` (fail
   closed).
@@ -412,8 +450,9 @@ user's/tenant's id is `404`.
 | `GET /me/notifications/{notificationId}` | One owned notification. |
 | `PATCH /me/notifications/{notificationId}` | Merge patch `{read}`; sets `read_at` once. |
 | `PATCH /me/notifications` | `{read:true}` marks every unread row; `{updated}`. |
-| `GET`/`PATCH /me/notification-preferences` | Explicit preferences; a missing row means both channels on. `type` matches `^[a-z0-9][a-z0-9._-]*$` (max 100); channels `in_app`, `email`. |
+| `GET /me/notification-preferences`; `PUT /me/notification-preferences/{type}/{channel}` | Explicit preferences; a missing row means both channels on. `type` matches `^[a-z0-9][a-z0-9._-]*$` (max 100); channels `in_app`, `email`. |
 | `POST /members/{memberId}/notifications` | Admin-only `notifications:send`; recipient must be an active member. `201` with `notification` (null when in-app is disabled) and `emailQueued`; Guarded. |
+| `GET /members/{memberId}/notifications/{notificationId}` | Admin read-back of one notification in a member feed; same `notifications:send` permission and tenant scope. |
 
 The caller's own read/preference writes are Guarded best-effort and allowlisted
 in `test/arch`; with email enabled the in-app row and durable
@@ -428,7 +467,7 @@ successful no-op.
 | `X-Tenant-Slug` | in | Selects the tenant; in the default CORS allow list. |
 | `Idempotency-Key` | in | Opt-in on retryable mutations; 1-128 chars of `[A-Za-z0-9._:-]`. |
 | `Idempotent-Replayed` | out | `true` on a replayed response. |
-| `If-Match` | in | Optimistic concurrency for config resources; stale is `412`. |
+| `If-Match` | in | Optimistic concurrency for config resources; stale or malformed is `412`. Browser clients may send it: it is in `CORS_ALLOW_HEADERS`. |
 | `Cookie: __Host-refresh` | in | BFF refresh token; refresh/logout only, and the body becomes optional. |
 | `Set-Cookie: __Host-refresh` | out | Issued/rotated on token responses and expired on logout in cookie mode. |
 | `Sec-Fetch-Site`, `Origin`, `X-CSRF-Token` | in | CSRF decision for a cookie-authenticated refresh/logout. |
@@ -436,6 +475,7 @@ successful no-op.
 | `Location` | out | Created resource (`201`) or status resource (`202`). |
 | `Cache-Control: no-store` | out | Tokens, secrets, and export content. |
 | `Accept-Language` | in | `en`/`vi`, q-values, wildcards, region truncation. |
+| `Accept` | in | JSON operations accept `application/json`, `application/*`, `application/*+json`, or `*/*`; otherwise `406`. Streams and redirects opt out. |
 | `Content-Language`, `Vary: Accept-Language` | out | Negotiated locale. |
 
 `Location`, `ETag`, `Idempotent-Replayed`, locale metadata, the rate-limit
@@ -465,7 +505,7 @@ headers (`RateLimit`, `RateLimit-Policy`, `X-RateLimit-Limit`,
 | First request with a key | Runs normally; a 2xx is cached for 24h |
 | Same key, same body, after success | Replayed with `Idempotent-Replayed: true` (not re-audited) |
 | Same key while the first is in progress | `409 resource.conflict` |
-| Same key, different body (non-multipart up to 1 MiB) | `422 idempotency.key_mismatch` |
+| Same key, different request body (including multipart, within the route body limit) | `422 idempotency.key_mismatch` |
 | Lock claim reply lost | Re-read the lock: own token runs, other token `409`, missing/read error fails open |
 | Cache unavailable | Fails open (request runs without idempotency) |
 

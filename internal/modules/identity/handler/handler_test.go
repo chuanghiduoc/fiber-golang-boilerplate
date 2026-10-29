@@ -12,10 +12,18 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/membership"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/patch"
 	"github.com/google/uuid"
 )
+
+func decodePatch[T any](t *testing.T, body string) T {
+	t.Helper()
+	var out T
+	require.NoError(t, httpapi.UnmarshalJSONStrict([]byte(body), &out))
+	return out
+}
 
 type updateProfileUsers struct {
 	authn.UserService
@@ -53,7 +61,7 @@ func TestUpdateMe_MergePatchAppliesOnlyPresentMembers(t *testing.T) {
 	handler := NewUserHandler(users)
 
 	_, err := handler.UpdateMe(profileTestContext(userID), &updateProfileInput{
-		RawBody: []byte(`{"name":"New Name"}`),
+		Body: decodePatch[dto.ProfilePatch](t, `{"name":"New Name"}`),
 	})
 	require.NoError(t, err)
 	require.NotNil(t, users.updated.Name)
@@ -70,7 +78,7 @@ func TestUpdateMe_EmailChangeRequiresCurrentPassword(t *testing.T) {
 	handler := NewUserHandler(users)
 
 	_, err := handler.UpdateMe(profileTestContext(userID), &updateProfileInput{
-		RawBody: []byte(`{"email":"new@example.com"}`),
+		Body: decodePatch[dto.ProfilePatch](t, `{"email":"new@example.com"}`),
 	})
 	require.Error(t, err)
 	var appErr *apperror.AppError
@@ -78,7 +86,7 @@ func TestUpdateMe_EmailChangeRequiresCurrentPassword(t *testing.T) {
 	require.Equal(t, 400, resolvedStatus(appErr))
 
 	_, err = handler.UpdateMe(profileTestContext(userID), &updateProfileInput{
-		RawBody: []byte(`{"email":"new@example.com","currentPassword":"` + handlerWrongPassword + `"}`),
+		Body: decodePatch[dto.ProfilePatch](t, `{"email":"new@example.com","currentPassword":"`+handlerWrongPassword+`"}`),
 	})
 	require.Error(t, err)
 	require.ErrorAs(t, err, &appErr)
@@ -88,7 +96,9 @@ func TestUpdateMe_EmailChangeRequiresCurrentPassword(t *testing.T) {
 func TestUpdateMe_ExplicitNullIsRejected(t *testing.T) {
 	userID := testID(1)
 	handler := NewUserHandler(&updateProfileUsers{member: &core.Member{User: core.User{ID: userID}}})
-	_, err := handler.UpdateMe(profileTestContext(userID), &updateProfileInput{RawBody: []byte(`{"name":null}`)})
+	_, err := handler.UpdateMe(profileTestContext(userID), &updateProfileInput{
+		Body: decodePatch[dto.ProfilePatch](t, `{"name":null}`),
+	})
 	require.Error(t, err)
 	var appErr *apperror.AppError
 	require.ErrorAs(t, err, &appErr)
@@ -128,7 +138,7 @@ func TestUpdateRole_StaleIfMatchReturnsPreconditionFailed(t *testing.T) {
 	_, err := handler.UpdateRole(context.Background(), &updateRoleInput{
 		RoleID:  testID(9).String(),
 		IfMatch: `"stale"`,
-		RawBody: []byte(`{"name":"New"}`),
+		Body:    decodePatch[dto.RolePatch](t, `{"name":"New"}`),
 	})
 	require.Error(t, err)
 	var appErr *apperror.AppError
@@ -145,7 +155,7 @@ func TestUpdateRole_CurrentIfMatchAppliesPatch(t *testing.T) {
 	out, err := handler.UpdateRole(context.Background(), &updateRoleInput{
 		RoleID:  testID(9).String(),
 		IfMatch: etagHeader(updatedAt),
-		RawBody: []byte(`{"name":"New"}`),
+		Body:    decodePatch[dto.RolePatch](t, `{"name":"New"}`),
 	})
 	require.NoError(t, err)
 	require.Equal(t, "New", out.Body.Name)
@@ -156,17 +166,28 @@ func TestUpdateRole_ExplicitNullPermissionsClearsThem(t *testing.T) {
 	roles := &roleTestService{role: &core.Role{ID: testID(9), Key: "auditor", Name: "Auditor", Permissions: []string{"profile:read"}}}
 	handler := NewRoleHandler(roles)
 	_, err := handler.UpdateRole(context.Background(), &updateRoleInput{
-		RoleID:  testID(9).String(),
-		RawBody: []byte(`{"permissions":null}`),
+		RoleID: testID(9).String(),
+		Body:   decodePatch[dto.RolePatch](t, `{"permissions":null}`),
 	})
 	require.NoError(t, err)
 	require.NotNil(t, roles.lastUpdate.Permissions)
 	require.Empty(t, *roles.lastUpdate.Permissions)
 }
 
+func TestUpdateRole_EmptyPatchIsNoOp(t *testing.T) {
+	roles := &roleTestService{role: &core.Role{ID: testID(9), Key: "auditor", Name: "Auditor"}}
+	handler := NewRoleHandler(roles)
+	out, err := handler.UpdateRole(context.Background(), &updateRoleInput{
+		RoleID: testID(9).String(),
+		Body:   decodePatch[dto.RolePatch](t, `{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, roles.updated, "an empty merge patch must not update or audit the role")
+	require.Equal(t, "Auditor", out.Body.Name)
+}
+
 func TestProfilePatch_DecodesAbsentAndNull(t *testing.T) {
-	var req dto.ProfilePatch
-	require.NoError(t, decodeMergePatch([]byte(`{"name":null}`), &req))
+	req := decodePatch[dto.ProfilePatch](t, `{"name":null}`)
 	require.True(t, req.Name.Present)
 	require.True(t, req.Name.Null)
 	require.False(t, req.Email.Present)
@@ -176,4 +197,14 @@ func TestProfilePatch_DecodesAbsentAndNull(t *testing.T) {
 	require.True(t, field.Present)
 	require.False(t, field.Null)
 	require.Equal(t, "x", field.Value)
+}
+
+func TestMergePatch_RejectsUnknownMembersAndTrailingValues(t *testing.T) {
+	var req dto.ProfilePatch
+	err := httpapi.UnmarshalJSONStrict([]byte(`{"name":"x","extra":1}`), &req)
+	require.Error(t, err)
+
+	req = dto.ProfilePatch{}
+	err = httpapi.UnmarshalJSONStrict([]byte(`{"name":"x"} {"name":"y"}`), &req)
+	require.Error(t, err)
 }

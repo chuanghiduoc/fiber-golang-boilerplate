@@ -207,3 +207,30 @@ func TestMiddleware_CountsAuditWriteFailures(t *testing.T) {
 	assert.Equal(t, before+1, counterValue(t, "audit_write_failures_total"),
 		"a failed audit write must increment audit_write_failures_total")
 }
+
+func TestMiddleware_ResourceIDUsesNamedPathParameters(t *testing.T) {
+	recorder := &recordingRecorder{}
+	app := fiber.New()
+	app.Use(Middleware(recorder))
+	app.Patch("/api/v1/members/:memberId", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+	app.Patch("/api/v1/members/:memberId/api-keys/:keyId", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	req, _ := http.NewRequest(http.MethodPatch, "/api/v1/members/member-7", http.NoBody)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
+	require.Len(t, recorder.events, 1)
+	assert.Equal(t, "member-7", recorder.events[0].ResourceID)
+
+	req, _ = http.NewRequest(http.MethodPatch, "/api/v1/members/member-7/api-keys/key-9", http.NoBody)
+	resp, err = app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
+	require.Len(t, recorder.events, 2)
+	assert.Equal(t, "key-9", recorder.events[1].ResourceID,
+		"the nested resource id wins over its owner id")
+}

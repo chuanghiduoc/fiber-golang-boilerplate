@@ -4,12 +4,40 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/google/uuid"
 )
+
+// ReauthSessionMaxAge is how recent an interactive sign-in must be to stand in
+// for a password when a passwordless (OAuth-only) account re-authenticates a
+// sensitive change: MFA enrollment, passkey registration, or account erasure.
+// A stolen access token alone is then not enough.
+const ReauthSessionMaxAge = 15 * time.Minute
+
+// RecentSessionIsLive reports whether sessionID is a live session of userID in
+// the request tenant that began within ReauthSessionMaxAge of now. An unknown,
+// foreign, revoked, expired, or stale session is reported as false without an
+// error; a failed lookup is returned so the caller can fail closed.
+func RecentSessionIsLive(ctx context.Context, stores Stores, userID, sessionID uuid.UUID, now time.Time) (bool, error) {
+	sess, err := stores.Sessions.Get(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if sess.UserID != userID || sess.TenantID != tenant.IDFromContext(ctx) ||
+		sess.RevokedAt != nil || !sess.ExpiresAt.After(now) ||
+		now.Sub(sess.CreatedAt) > ReauthSessionMaxAge {
+		return false, nil
+	}
+	return true, nil
+}
 
 // MemberPage trims the extra probe row from a member list.
 func MemberPage(members []Member, pageSize int) ([]Member, bool, error) {

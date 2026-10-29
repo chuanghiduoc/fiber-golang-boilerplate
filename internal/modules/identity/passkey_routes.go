@@ -8,9 +8,10 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 )
 
-// registerPasskeyRoutes mounts the passkey ceremonies. Registration and
-// management are JWT-only and audited by the service in its mutation
-// transaction; login is public and returns the normal token pair.
+// registerPasskeyRoutes mounts the passkey ceremonies. Registration options
+// and credential deletion require re-authentication, which the service checks
+// before touching the account; mutations are audited in their transaction.
+// Login is public and returns the normal token pair.
 func (m *Module) registerPasskeyRoutes(api *httpapi.API, deps app.Deps) {
 	if m.passkeys == nil {
 		return
@@ -44,6 +45,34 @@ func (m *Module) registerPasskeyRoutes(api *httpapi.API, deps app.Deps) {
 		NoStore:    true,
 		Audit:      httpapi.AuditPolicy{Tier1Action: "auth.passkey_registered"},
 	}, m.passkeys.Create)
+
+	httpapi.Register(api, httpapi.Op{
+		Method:      http.MethodGet,
+		Path:        "/api/v1/me/mfa/passkeys",
+		OperationID: "listPasskeys",
+		Tags:        []string{meTag},
+		Summary:     "List my passkeys",
+		Description: "Returns the caller's passkeys without credential ids, public keys, or other key material.",
+	}, httpapi.Policy{
+		Permission: identitycatalog.PermissionMFARead,
+		JWTOnly:    true,
+		RateLimit:  httpapi.RateLimitRelaxed,
+		NoStore:    true,
+	}, m.passkeys.List)
+
+	httpapi.Register(api, httpapi.Op{
+		Method:      http.MethodGet,
+		Path:        "/api/v1/me/mfa/passkeys/{passkeyId}",
+		OperationID: "getPasskey",
+		Tags:        []string{meTag},
+		Summary:     "Get a passkey",
+		Description: "Returns one of the caller's passkeys. Another user's id behaves as not found.",
+	}, httpapi.Policy{
+		Permission: identitycatalog.PermissionMFARead,
+		JWTOnly:    true,
+		RateLimit:  httpapi.RateLimitRelaxed,
+		NoStore:    true,
+	}, m.passkeys.Get)
 
 	httpapi.Register(api, httpapi.Op{
 		Method:      http.MethodDelete,

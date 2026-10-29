@@ -28,7 +28,14 @@ func applyEndpointPatch(current *webhookservice.Endpoint, req dto.UpdateWebhookE
 	eventTypes := current.EventTypes
 	req.EventTypes.Apply(&eventTypes)
 	status := current.Status
-	req.Status.Apply(&status)
+	switch {
+	case req.Status.Present && req.Status.Null:
+		// status is an enum with a documented default; an explicit null
+		// restores that default instead of producing the invalid empty value.
+		status = webhookservice.StatusActive
+	case req.Status.Present:
+		status = req.Status.Value
+	}
 
 	maxAttempts := int(current.MaxAttempts)
 	var maxPtr *int
@@ -73,8 +80,24 @@ func applyInboundSourcePatch(current *webhookservice.InboundSource, req dto.Upda
 	slug := current.Slug
 	req.Slug.Apply(&slug)
 	status := current.Status
-	req.Status.Apply(&status)
+	switch {
+	case req.Status.Present && req.Status.Null:
+		status = webhookservice.StatusActive
+	case req.Status.Present:
+		status = req.Status.Value
+	}
 	return webhookservice.UpdateInboundSourceInput{Name: name, Slug: slug, Status: status}
+}
+
+// endpointPatchEmpty reports whether the merge patch carries no members.
+func endpointPatchEmpty(req dto.UpdateWebhookEndpointRequest) bool {
+	return !req.URL.Present && !req.Description.Present && !req.EventTypes.Present &&
+		!req.Status.Present && !req.MaxAttempts.Present && !req.TimeoutMS.Present
+}
+
+// inboundSourcePatchEmpty reports whether the merge patch carries no members.
+func inboundSourcePatchEmpty(req dto.UpdateInboundSourceRequest) bool {
+	return !req.Name.Present && !req.Slug.Present && !req.Status.Present
 }
 
 func toEndpointResponse(endpoint *webhookservice.Endpoint) dto.WebhookEndpointResponse {

@@ -20,11 +20,6 @@ WHERE tenant_id = @tenant_id::uuid
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
--- name: ListDataExportsForUser :many
-SELECT * FROM data_exports
-WHERE tenant_id = @tenant_id::uuid AND user_id = @user_id::uuid
-ORDER BY id;
-
 -- name: MarkDataExportRunning :execrows
 UPDATE data_exports
 SET status = 'running', updated_at = NOW()
@@ -50,13 +45,12 @@ WHERE id = @id::uuid
   AND user_id = @user_id::uuid
   AND status IN ('queued', 'running', 'failed');
 
--- name: ExpireDataExportsForUser :many
+-- name: ExpireDataExportsForUser :exec
 UPDATE data_exports
 SET status = 'expired', expires_at = COALESCE(expires_at, NOW()), updated_at = NOW()
 WHERE tenant_id = @tenant_id::uuid
   AND user_id = @user_id::uuid
-  AND status <> 'expired'
-RETURNING *;
+  AND status <> 'expired';
 
 -- name: DeleteDataExportsForUser :exec
 DELETE FROM data_exports
@@ -78,7 +72,8 @@ DELETE FROM data_exports WHERE id = @id::uuid;
 -- name: ListUserSessionsForPrivacy :many
 SELECT * FROM sessions
 WHERE tenant_id = @tenant_id::uuid AND user_id = @user_id::uuid
-ORDER BY created_at DESC, id DESC;
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;
 
 -- name: DeleteTenantUserSessions :exec
 DELETE FROM sessions
@@ -154,7 +149,8 @@ WHERE tenant_id = @tenant_id::uuid
 SELECT provider, subject, created_at
 FROM user_identities
 WHERE user_id = $1
-ORDER BY provider, created_at, subject;
+ORDER BY provider, created_at, subject
+LIMIT @row_limit::int;
 
 -- name: ListUserInvitationsSent :many
 -- Export: invitations the user created in this tenant.
@@ -163,7 +159,8 @@ SELECT i.id, i.email_normalized, r.key AS role, i.invited_by, i.expires_at, i.ac
 FROM invitations i
 JOIN roles r ON r.id = i.role_id
 WHERE i.tenant_id = @tenant_id::uuid AND i.invited_by = @user_id::uuid
-ORDER BY i.created_at DESC, i.id DESC;
+ORDER BY i.created_at DESC, i.id DESC
+LIMIT @row_limit::int;
 
 -- name: ListUserInvitationsReceived :many
 -- Export: invitations addressed to the user's current address or accepted by
@@ -174,4 +171,5 @@ FROM invitations i
 JOIN roles r ON r.id = i.role_id
 WHERE i.tenant_id = @tenant_id::uuid
   AND (i.accepted_by = @user_id::uuid OR i.email_normalized = @email::text)
-ORDER BY i.created_at DESC, i.id DESC;
+ORDER BY i.created_at DESC, i.id DESC
+LIMIT @row_limit::int;

@@ -29,7 +29,7 @@ func NewSessionHandler(sessions SessionIssuer) *SessionHandler {
 func (h *SessionHandler) SetJWTKeyring(keyring *token.Keyring) { h.keyring = keyring }
 
 type listSessionsInput struct {
-	Limit         int    `query:"limit" minimum:"1" maximum:"100" default:"20"`
+	Limit         int    `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string `query:"startingAfter"`
 	Authorization string `header:"Authorization"`
 }

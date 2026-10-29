@@ -26,6 +26,8 @@ func NewRedisCache(cfg config.CacheConfig) (*RedisCache, error) {
 	defer cancel()
 
 	if err := client.Ping(ctx).Err(); err != nil {
+		// Release the pool and its background goroutines before reporting the failure.
+		_ = client.Close()
 		return nil, err
 	}
 

@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humafiber"
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -204,5 +207,61 @@ func TestBodyLimit_RejectsCompressedBodies(t *testing.T) {
 				t.Errorf("code = %q, want unsupported_media_type", problem.Code)
 			}
 		})
+	}
+}
+
+// TestBodyLimit_ChunkedBodyReachesHuma guards the stream handoff: humafiber
+// reads BodyStream() whenever StreamRequestBody is enabled, so buffering a
+// chunked body with SetBody (which clears the stream) makes Huma see an empty
+// request and reject it with 400.
+func TestBodyLimit_ChunkedBodyReachesHuma(t *testing.T) {
+	const limit = 1024
+	app := fiber.New(fiber.Config{
+		ErrorHandler:                 apperrorhttp.FiberErrorHandler,
+		BodyLimit:                    1 << 20,
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
+	})
+	app.Use(BodyLimit(limit))
+	api := humafiber.New(app, huma.DefaultConfig("test", "1.0.0"))
+
+	type echoInput struct {
+		Body struct {
+			Name string `json:"name"`
+		}
+	}
+	type echoOutput struct {
+		Body struct {
+			Name string `json:"name"`
+		}
+	}
+	huma.Register(api, huma.Operation{
+		OperationID: "echo",
+		Method:      http.MethodPost,
+		Path:        "/echo",
+	}, func(_ context.Context, in *echoInput) (*echoOutput, error) {
+		out := &echoOutput{}
+		out.Body.Name = in.Body.Name
+		return out, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader(`{"name":"chunked"}`))
+	req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	req.ContentLength = 0
+	req.TransferEncoding = []string{"chunked"}
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"name":"chunked"`) {
+		t.Fatalf("body = %s, want the echoed name", body)
 	}
 }

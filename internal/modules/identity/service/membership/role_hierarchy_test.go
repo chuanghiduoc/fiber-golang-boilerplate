@@ -151,3 +151,64 @@ func TestAuthorizeGrantFailsClosedWithoutSubject(t *testing.T) {
 	assert.NoError(t, authorizeGrant(subjectCtx, []string{"profile:read"}))
 	assert.Equal(t, http.StatusForbidden, statusOf(authorizeGrant(subjectCtx, []string{"admin:users:role"})))
 }
+
+func memberUpdateStatus(status string) *string { return &status }
+
+func TestAuthorizeMemberUpdateRequiresThePermissionForEachField(t *testing.T) {
+	roleOnly := authz.WithSubject(fakes.TenantCtx(), authz.NewSubjectWithPermissions(
+		fakes.TestID(1), fakes.TestID(2), core.RoleMember, authz.PermissionAdminUsersRole))
+	banOnly := authz.WithSubject(fakes.TenantCtx(), authz.NewSubjectWithPermissions(
+		fakes.TestID(1), fakes.TestID(2), core.RoleMember, authz.PermissionAdminUsersBan))
+	deleteOnly := authz.WithSubject(fakes.TenantCtx(), authz.NewSubjectWithPermissions(
+		fakes.TestID(1), fakes.TestID(2), core.RoleMember, authz.PermissionAdminUsersDelete))
+	all := authz.WithSubject(fakes.TenantCtx(), authz.NewSubjectWithPermissions(
+		fakes.TestID(1), fakes.TestID(2), core.RoleMember,
+		authz.PermissionAdminUsersRole, authz.PermissionAdminUsersBan, authz.PermissionAdminUsersDelete))
+
+	tests := []struct {
+		name    string
+		ctx     context.Context
+		update  MemberUpdate
+		allowed bool
+	}{
+		{"role manager may change roles", roleOnly, MemberUpdate{RoleKeys: []string{core.RoleMember}}, true},
+		{"role manager may not suspend", roleOnly, MemberUpdate{Status: memberUpdateStatus(string(core.MembershipStatusSuspended))}, false},
+		{"role manager may not remove", roleOnly, MemberUpdate{Status: memberUpdateStatus(string(core.MembershipStatusRemoved))}, false},
+		{"role manager may not combine a status", roleOnly, MemberUpdate{
+			RoleKeys: []string{core.RoleMember},
+			Status:   memberUpdateStatus(string(core.MembershipStatusSuspended)),
+		}, false},
+		{"ban manager may ban", banOnly, MemberUpdate{Status: memberUpdateStatus(string(core.MembershipStatusSuspended))}, true},
+		{"ban manager may reactivate", banOnly, MemberUpdate{Status: memberUpdateStatus(string(core.MembershipStatusActive))}, true},
+		{"ban manager may not change roles", banOnly, MemberUpdate{RoleKeys: []string{core.RoleMember}}, false},
+		{"ban manager may not combine a role change", banOnly, MemberUpdate{
+			RoleKeys: []string{core.RoleMember},
+			Status:   memberUpdateStatus(string(core.MembershipStatusSuspended)),
+		}, false},
+		{"delete manager may remove", deleteOnly, MemberUpdate{Status: memberUpdateStatus(string(core.MembershipStatusRemoved))}, true},
+		{"delete manager may not ban", deleteOnly, MemberUpdate{Status: memberUpdateStatus(string(core.MembershipStatusSuspended))}, false},
+		{"all grants allow both fields", all, MemberUpdate{
+			RoleKeys: []string{core.RoleMember},
+			Status:   memberUpdateStatus(string(core.MembershipStatusSuspended)),
+		}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := authorizeMemberUpdate(tc.ctx, tc.update)
+			if tc.allowed {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Equal(t, http.StatusForbidden, statusOf(err))
+			assert.Equal(t, string(apperror.CodePermissionDenied), codeOf(err))
+		})
+	}
+}
+
+func TestAuthorizeMemberUpdateFailsClosedWithoutSubject(t *testing.T) {
+	err := authorizeMemberUpdate(fakes.TenantCtx(), MemberUpdate{RoleKeys: []string{core.RoleMember}})
+	require.Error(t, err)
+	assert.Equal(t, http.StatusForbidden, statusOf(err))
+	assert.Equal(t, string(apperror.CodePermissionDenied), codeOf(err))
+}

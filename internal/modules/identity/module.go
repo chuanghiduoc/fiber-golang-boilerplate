@@ -102,9 +102,17 @@ func (m *Module) RegisterRoutes(api *httpapi.API, deps app.Deps) {
 	if m.mfa != nil {
 		m.mfa.SetJWTKeyring(keyring)
 		m.mfa.SetRefreshCookie(refreshCookie)
+		// The email-verification rule is resolved per tenant/user through the
+		// feature flags installed just above, so MFA completion must share it.
+		m.mfa.SetAdmission(m.auth.Admission)
 	}
 	if m.passkeys != nil {
 		m.passkeys.SetRefreshCookie(refreshCookie)
+	}
+	if m.privacy != nil {
+		// A passwordless account re-authenticates an erasure with a recent
+		// session, so the handler needs the session id from the access token.
+		m.privacy.SetJWTKeyring(keyring)
 	}
 
 	guard := func(action, resource string) *httpapi.GuardPolicy {
@@ -177,14 +185,15 @@ func (m *Module) registerAuthRoutes(api *httpapi.API, guard func(string, string)
 		Tags: []string{authTag}, Summary: "Start Google OAuth",
 		Description: "Redirects to Google with PKCE and a signed, tenant-bound state.",
 		Errors:      []int{http.StatusFound},
-	}, httpapi.Policy{Public: true, Feature: identitycatalog.KeyGoogleOAuth, RateLimit: httpapi.RateLimitNormal}, m.auth.GoogleRedirect)
+	}, httpapi.Policy{Public: true, Feature: identitycatalog.KeyGoogleOAuth, RateLimit: httpapi.RateLimitNormal,
+		NoStore: true}, m.auth.GoogleRedirect)
 
 	httpapi.Register(api, httpapi.Op{
 		Method: http.MethodGet, Path: "/api/v1/auth/google/callback", OperationID: "completeGoogleLogin",
 		Tags: []string{authTag}, Summary: "Complete Google OAuth",
 		Description: "Redirects with a single-use exchange code in the fragment, or an MFA challenge.",
 		Errors:      []int{http.StatusFound},
-	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitNormal,
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitNormal, NoStore: true,
 		Audit: httpapi.AuditPolicy{Tier1Action: "auth.google_login"}}, m.auth.GoogleCallback)
 
 	httpapi.Register(api, httpapi.Op{
@@ -274,6 +283,13 @@ func (m *Module) registerMeRoutes(api *httpapi.API, guard func(string, string) *
 			Audit: httpapi.AuditPolicy{Tier1Action: "auth.mfa_enrollment_started"}}, m.mfa.Enroll)
 
 		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodGet, Path: "/api/v1/me/mfa/totp/{factorId}", OperationID: "getTOTPEnrollment",
+			Tags: []string{meTag}, Summary: "Get TOTP enrollment status",
+			Description: "Returns pending or active status for one of the caller's TOTP factors. Secret material is never returned.",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionMFARead, JWTOnly: true,
+			RateLimit: httpapi.RateLimitRelaxed, NoStore: true}, m.mfa.GetTOTP)
+
+		httpapi.Register(api, httpapi.Op{
 			Method: http.MethodPost, Path: "/api/v1/me/mfa/totp/{factorId}/confirm", OperationID: "confirmTOTPEnrollment",
 			Tags: []string{meTag}, Summary: "Confirm TOTP enrollment",
 		}, httpapi.Policy{Permission: identitycatalog.PermissionMFAWrite, JWTOnly: true,
@@ -318,6 +334,7 @@ func (m *Module) registerMeRoutes(api *httpapi.API, guard func(string, string) *
 		httpapi.Register(api, httpapi.Op{
 			Method: http.MethodGet, Path: "/api/v1/me/data-exports/{exportId}/content", OperationID: "getDataExportContent",
 			Tags: []string{meTag}, Summary: "Download a data export",
+			ResponseContentType: "application/json", Errors: []int{http.StatusGone},
 		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileRead,
 			RateLimit: httpapi.RateLimitRelaxed, NoStore: true}, m.privacy.DownloadExport)
 
@@ -346,7 +363,7 @@ func (m *Module) registerMemberRoutes(api *httpapi.API) {
 	if m.members == nil {
 		return
 	}
-	anyMemberWrite := []authz.Permission{authz.PermissionAdminUsersRole, authz.PermissionAdminUsersBan}
+	anyMemberWrite := []authz.Permission{authz.PermissionAdminUsersRole, authz.PermissionAdminUsersBan, authz.PermissionAdminUsersDelete}
 
 	httpapi.Register(api, httpapi.Op{
 		Method: http.MethodGet, Path: "/api/v1/members", OperationID: "listMembers",
@@ -381,6 +398,12 @@ func (m *Module) registerMemberRoutes(api *httpapi.API) {
 		}, httpapi.Policy{Permission: authz.PermissionAdminUsersDelete, JWTOnly: true,
 			RateLimit: httpapi.RateLimitNormal, Idempotent: true,
 			Audit: httpapi.AuditPolicy{Tier1Action: "admin.user.erasure_requested"}}, m.privacy.EraseUser)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodGet, Path: "/api/v1/members/{memberId}/erasure-requests/{requestId}", OperationID: "getMemberErasureRequest",
+			Tags: []string{membersTag}, Summary: "Get a member's erasure request status",
+		}, httpapi.Policy{Permission: authz.PermissionAdminUsersDelete, JWTOnly: true,
+			RateLimit: httpapi.RateLimitRelaxed}, m.privacy.GetMemberErasureRequest)
 	}
 
 	httpapi.Register(api, httpapi.Op{

@@ -76,6 +76,8 @@ type WebhookEvent struct {
 	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
 	Payload     []byte             `json:"payload"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	// Users whose data this outbound event concerns; used by privacy export/erasure.
+	SubjectUserIds []uuid.UUID `json:"subject_user_ids"`
 }
 
 type WebhookInboundEvent struct {

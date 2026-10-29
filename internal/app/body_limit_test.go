@@ -120,3 +120,50 @@ func TestUploadPathAcceptsMultipartAboveJSONLimit(t *testing.T) {
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
 	assert.Equal(t, fmt.Sprintf("%d", fileSize), string(got))
 }
+
+// TestSlowChunkedBodyIsBoundedByRequestTimeout proves APP_REQUEST_TIMEOUT
+// covers the body-limit read, not just the routed handler. A chunked body has
+// no Content-Length, so BodyLimit must read it to enforce the limit. If that
+// read sits outside Timeout, a slow client can hold the request open until
+// Fiber's ReadTimeout (60s) instead of the configured request budget.
+func TestSlowChunkedBodyIsBoundedByRequestTimeout(t *testing.T) {
+	cfg := &config.Config{
+		App: config.AppConfig{
+			Env:            "production",
+			BodyLimit:      12 << 20,
+			JSONBodyLimit:  1 << 20,
+			RequestTimeout: 250 * time.Millisecond,
+		},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
+	application.Register(pingModule{})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- application.Fiber().Listener(listener) }()
+	t.Cleanup(func() {
+		_ = application.Fiber().Shutdown()
+		select {
+		case <-serveDone:
+		case <-time.After(2 * time.Second):
+		}
+	})
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	_, err = fmt.Fprint(conn,
+		"POST /api/v1/ping HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n")
+	require.NoError(t, err)
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+	require.NoError(t, err, "a stalled chunked body must be bounded by APP_REQUEST_TIMEOUT")
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
+}

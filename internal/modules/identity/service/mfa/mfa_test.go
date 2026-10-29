@@ -95,11 +95,32 @@ func (h *mfaHarness) seedUser(id uuid.UUID, email string) {
 	h.db.Passwords[id] = hash
 }
 
+func (h *mfaHarness) factorID(t *testing.T) uuid.UUID {
+	t.Helper()
+	h.db.Mu.Lock()
+	defer h.db.Mu.Unlock()
+	factor := h.db.Factors[fakes.TestID(100)]
+	if factor == nil {
+		t.Fatal("MFA factor not found")
+	}
+	return factor.ID
+}
+
+type failingOtherSessionRevocation struct {
+	core.SessionRepository
+	calls int
+}
+
+func (f *failingOtherSessionRevocation) RevokeOtherUserSessions(context.Context, uuid.UUID, uuid.UUID, core.RevokeReason) error {
+	f.calls++
+	return errors.New("session revocation unavailable")
+}
+
 // enrollAndConfirm returns the secret and the plaintext recovery codes.
 func (h *mfaHarness) enrollAndConfirm(t *testing.T) (secret string, codes []string) {
 	t.Helper()
 	ctx := fakes.TenantCtx()
-	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword)
+	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword})
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -108,7 +129,7 @@ func (h *mfaHarness) enrollAndConfirm(t *testing.T) (secret string, codes []stri
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	result, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword, code)
+	result, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{FactorID: enrollment.FactorID, SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: code})
 	if err != nil {
 		t.Fatalf("ConfirmTOTP: %v", err)
 	}
@@ -146,13 +167,13 @@ func TestMFAEnrollRequiresCurrentPassword(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := fakes.TenantCtx()
 
-	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), ""); statusOf(err) != 400 {
-		t.Fatalf("enroll without a password err = %v, want 400", err)
+	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: ""}); statusOf(err) != 403 {
+		t.Fatalf("enroll without a password err = %v, want 403", err)
 	}
-	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), fakes.WrongPassword); statusOf(err) != 400 {
+	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: fakes.WrongPassword}); statusOf(err) != 400 {
 		t.Fatalf("enroll with a wrong password err = %v, want 400", err)
 	}
-	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword); err != nil {
+	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword}); err != nil {
 		t.Fatalf("enroll with the current password: %v", err)
 	}
 }
@@ -163,11 +184,11 @@ func TestMFAEnrollWrongPasswordSpendsSecondFactorBudget(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := fakes.TenantCtx()
 	for i := range MaxMFAAttempts {
-		if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), fakes.WrongPassword); statusOf(err) != 400 {
+		if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: fakes.WrongPassword}); statusOf(err) != 400 {
 			t.Fatalf("attempt %d: err = %v, want 400", i+1, err)
 		}
 	}
-	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword); statusOf(err) != 429 {
+	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword}); statusOf(err) != 429 {
 		t.Fatalf("enroll after the budget err = %v, want 429", err)
 	}
 }
@@ -186,9 +207,9 @@ func TestMFAEnrollPasswordlessRequiresRecentSession(t *testing.T) {
 		t.Fatalf("Issue old session: %v", err)
 	}
 	h.db.Mu.Lock()
-	h.db.Sessions[old.SessionID].CreatedAt = h.clock.at.Add(-mfaReauthSessionMaxAge - time.Minute)
+	h.db.Sessions[old.SessionID].CreatedAt = h.clock.at.Add(-core.ReauthSessionMaxAge - time.Minute)
 	h.db.Mu.Unlock()
-	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), old.SessionID, ""); errorCode(err) != string(identitycatalog.CodeAuthMFAReauthRequired) {
+	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: old.SessionID, CurrentPassword: ""}); errorCode(err) != string(identitycatalog.CodeAuthMFAReauthRequired) {
 		t.Fatalf("old session err = %v, want mfa_reauth_required", err)
 	}
 
@@ -199,7 +220,7 @@ func TestMFAEnrollPasswordlessRequiresRecentSession(t *testing.T) {
 	h.db.Mu.Lock()
 	h.db.Sessions[fresh.SessionID].CreatedAt = h.clock.at
 	h.db.Mu.Unlock()
-	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fresh.SessionID, ""); err != nil {
+	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fresh.SessionID, CurrentPassword: ""}); err != nil {
 		t.Fatalf("fresh session enroll: %v", err)
 	}
 }
@@ -208,14 +229,14 @@ func TestMFAEnrollPasswordlessRequiresRecentSession(t *testing.T) {
 func TestMFAEnrollReplacesPendingSecret(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := fakes.TenantCtx()
-	first, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword)
+	first, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword})
 	if err != nil {
 		t.Fatalf("first enroll: %v", err)
 	}
 	firstSecret := secretFromURI(t, first.OtpauthURI)
 
 	h.clock.at = h.clock.at.Add(time.Minute)
-	second, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword)
+	second, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword})
 	if err != nil {
 		t.Fatalf("second enroll: %v", err)
 	}
@@ -228,14 +249,14 @@ func TestMFAEnrollReplacesPendingSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword, firstCode); errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
+	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{FactorID: second.FactorID, SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: firstCode}); errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
 		t.Fatalf("confirm with replaced secret err = %v, want mfa_invalid_code", err)
 	}
 	secondCode, err := totp.Code(secondSecret, h.clock.at)
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword, secondCode); err != nil {
+	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{FactorID: second.FactorID, SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: secondCode}); err != nil {
 		t.Fatalf("confirm with the current secret: %v", err)
 	}
 }
@@ -243,7 +264,7 @@ func TestMFAEnrollReplacesPendingSecret(t *testing.T) {
 func TestMFAConfirmRejectsExpiredEnrollment(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := fakes.TenantCtx()
-	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword)
+	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword})
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -256,7 +277,7 @@ func TestMFAConfirmRejectsExpiredEnrollment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword, code); errorCode(err) != string(identitycatalog.CodeAuthMFAEnrollmentExpired) {
+	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{FactorID: enrollment.FactorID, SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: code}); errorCode(err) != string(identitycatalog.CodeAuthMFAEnrollmentExpired) {
 		t.Fatalf("expired enrollment err = %v, want mfa_enrollment_expired", err)
 	}
 }
@@ -264,7 +285,7 @@ func TestMFAConfirmRejectsExpiredEnrollment(t *testing.T) {
 func TestMFAConfirmRequiresCurrentPassword(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := fakes.TenantCtx()
-	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword)
+	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword})
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -273,7 +294,10 @@ func TestMFAConfirmRequiresCurrentPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), fakes.TestID(1), fakes.WrongPassword, code); statusOf(err) != 400 {
+	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{FactorID: enrollment.FactorID, SessionID: fakes.TestID(1), CurrentPassword: "", Code: code}); statusOf(err) != 403 {
+		t.Fatalf("confirm without a password err = %v, want 403", err)
+	}
+	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{FactorID: enrollment.FactorID, SessionID: fakes.TestID(1), CurrentPassword: fakes.WrongPassword, Code: code}); statusOf(err) != 400 {
 		t.Fatalf("confirm with a wrong password err = %v, want 400", err)
 	}
 }
@@ -283,7 +307,7 @@ func TestMFAConfirmRequiresCurrentPassword(t *testing.T) {
 func TestPasswordChangeDeletesPendingMFA(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := fakes.TenantCtx()
-	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword); err != nil {
+	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword}); err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
 	users := authn.NewUserService(authn.UserDeps{
@@ -356,7 +380,7 @@ func TestMFAEnrollConfirmAndTOTPLogin(t *testing.T) {
 	if !status.Enabled || status.RecoveryCodesRemaining != 10 {
 		t.Fatalf("status = %+v, want enabled with 10 codes", status)
 	}
-	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword); errorCode(err) != string(identitycatalog.CodeAuthMFAAlreadyEnabled) {
+	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword}); errorCode(err) != string(identitycatalog.CodeAuthMFAAlreadyEnabled) {
 		t.Fatalf("second enroll err = %v, want mfa_already_enabled", err)
 	}
 
@@ -490,8 +514,9 @@ func TestMFADisableRevokesOtherSessions(t *testing.T) {
 		t.Fatalf("Issue other: %v", err)
 	}
 
+	factorID := h.factorID(t)
 	code, _ := totp.Code(secret, h.clock.at)
-	if err := h.svc.Disable(ctx, fakes.TestID(100), current.SessionID, code); err != nil {
+	if err := h.svc.Disable(ctx, fakes.TestID(100), MFACodeChange{FactorID: factorID, SessionID: current.SessionID, CurrentPassword: testMFAPassword, Code: code}); err != nil {
 		t.Fatalf("Disable: %v", err)
 	}
 	if h.db.Sessions[other.SessionID].RevokedAt == nil {
@@ -506,13 +531,47 @@ func TestMFADisableRevokesOtherSessions(t *testing.T) {
 	}
 }
 
+func TestMFADisableFailsClosedWhenOtherSessionsCannotBeRevoked(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := fakes.TenantCtx()
+	secret, _ := h.enrollAndConfirm(t)
+	h.clock.at = h.clock.at.Add(totp.Period)
+
+	current, err := h.sessions.Issue(ctx, fakes.TestID(100), h.db.Users[fakes.TestID(100)].TokenVersion, []string{core.AMRPassword})
+	if err != nil {
+		t.Fatalf("Issue current: %v", err)
+	}
+	svc := h.svc.(*mfaService)
+	failing := &failingOtherSessionRevocation{SessionRepository: svc.Stores.Sessions}
+	svc.Stores.Sessions = failing
+
+	code, _ := totp.Code(secret, h.clock.at)
+	err = svc.Disable(ctx, fakes.TestID(100), MFACodeChange{
+		FactorID: h.factorID(t), SessionID: current.SessionID,
+		CurrentPassword: testMFAPassword, Code: code,
+	})
+	if statusOf(err) != 500 {
+		t.Fatalf("Disable err = %v, want 500", err)
+	}
+	if failing.calls != 1 {
+		t.Fatalf("revocation attempts = %d, want 1", failing.calls)
+	}
+	status, statusErr := h.svc.Status(ctx, fakes.TestID(100))
+	if statusErr != nil {
+		t.Fatalf("Status: %v", statusErr)
+	}
+	if !status.Enabled || h.db.Factors[fakes.TestID(100)] == nil {
+		t.Fatal("a failed fail-closed revocation must leave MFA enabled")
+	}
+}
+
 func TestMFARegenerateRecoveryCodes(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := fakes.TenantCtx()
 	_, codes := h.enrollAndConfirm(t)
 	h.clock.at = h.clock.at.Add(totp.Period)
 
-	newCodes, err := h.svc.RegenerateRecoveryCodes(ctx, fakes.TestID(100), codes[0])
+	newCodes, err := h.svc.RegenerateRecoveryCodes(ctx, fakes.TestID(100), MFARecoveryChange{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: codes[0]})
 	if err != nil {
 		t.Fatalf("RegenerateRecoveryCodes: %v", err)
 	}
@@ -536,10 +595,11 @@ func TestMFARegenerateRecoveryCodes(t *testing.T) {
 func TestMFAConfirmRejectsInvalidCode(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := fakes.TenantCtx()
-	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword); err != nil {
+	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword})
+	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
-	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword, "000000"); errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
+	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{FactorID: enrollment.FactorID, SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: "000000"}); errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
 		t.Fatalf("confirm invalid code err = %v, want mfa_invalid_code", err)
 	}
 }
@@ -605,7 +665,7 @@ func TestGoogleSignInTwoStep(t *testing.T) {
 	}
 
 	// Enroll and confirm a TOTP factor for the Google account.
-	enrollment, err := mfa.EnrollTOTP(ctx, first.Member.User.ID, first.Tokens.SessionID, "")
+	enrollment, err := mfa.EnrollTOTP(ctx, first.Member.User.ID, ReauthProof{SessionID: first.Tokens.SessionID, CurrentPassword: ""})
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -614,7 +674,7 @@ func TestGoogleSignInTwoStep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	if _, err := mfa.ConfirmTOTP(ctx, first.Member.User.ID, first.Tokens.SessionID, "", code); err != nil {
+	if _, err := mfa.ConfirmTOTP(ctx, first.Member.User.ID, MFACodeChange{FactorID: enrollment.FactorID, SessionID: first.Tokens.SessionID, CurrentPassword: "", Code: code}); err != nil {
 		t.Fatalf("ConfirmTOTP: %v", err)
 	}
 
@@ -663,7 +723,7 @@ func TestMFAConfirmRevokesOtherSessions(t *testing.T) {
 		t.Fatalf("Issue other: %v", err)
 	}
 
-	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), fakes.TestID(1), testMFAPassword)
+	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword})
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -672,7 +732,7 @@ func TestMFAConfirmRevokesOtherSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), current.SessionID, testMFAPassword, code); err != nil {
+	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{FactorID: enrollment.FactorID, SessionID: current.SessionID, CurrentPassword: testMFAPassword, Code: code}); err != nil {
 		t.Fatalf("ConfirmTOTP: %v", err)
 	}
 	if h.db.Sessions[other.SessionID].RevokedAt == nil {
@@ -700,7 +760,7 @@ func TestMFAConfirmBumpsVersionAndKeepsCurrentSession(t *testing.T) {
 		t.Fatalf("Issue other: %v", err)
 	}
 
-	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), current.SessionID, testMFAPassword)
+	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: current.SessionID, CurrentPassword: testMFAPassword})
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -709,7 +769,7 @@ func TestMFAConfirmBumpsVersionAndKeepsCurrentSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	result, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), current.SessionID, testMFAPassword, code)
+	result, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{FactorID: enrollment.FactorID, SessionID: current.SessionID, CurrentPassword: testMFAPassword, Code: code})
 	if err != nil {
 		t.Fatalf("ConfirmTOTP: %v", err)
 	}
@@ -801,5 +861,129 @@ func TestMFABudgetSurvivesPasswordSuccess(t *testing.T) {
 	}
 	if _, err := h.svc.Verify(ctx, challenge, "000000"); statusOf(err) != 429 {
 		t.Fatalf("attempt after the budget err = %v, want 429", err)
+	}
+}
+func TestMFAConfirmRejectsUnknownFactor(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := fakes.TenantCtx()
+	enrollment, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword})
+	if err != nil {
+		t.Fatalf("EnrollTOTP: %v", err)
+	}
+	secret := secretFromURI(t, enrollment.OtpauthURI)
+	code, _ := totp.Code(secret, h.clock.at)
+	if _, err := h.svc.ConfirmTOTP(ctx, fakes.TestID(100), MFACodeChange{
+		FactorID: uuid.New(), SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: code,
+	}); statusOf(err) != 404 {
+		t.Fatalf("confirm with an unknown factor err = %v, want 404", err)
+	}
+	status, err := h.svc.Status(ctx, fakes.TestID(100))
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.Enabled {
+		t.Fatal("the unknown factor must not enable MFA")
+	}
+}
+
+func TestMFADisableRequiresReauthenticationAndMatchingFactor(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := fakes.TenantCtx()
+	secret, _ := h.enrollAndConfirm(t)
+	h.clock.at = h.clock.at.Add(totp.Period)
+	factorID := h.factorID(t)
+	code, _ := totp.Code(secret, h.clock.at)
+
+	if err := h.svc.Disable(ctx, fakes.TestID(100), MFACodeChange{
+		FactorID: factorID, SessionID: fakes.TestID(1), CurrentPassword: "", Code: code,
+	}); statusOf(err) != 403 {
+		t.Fatalf("disable without re-authentication err = %v, want 403", err)
+	}
+	if err := h.svc.Disable(ctx, fakes.TestID(100), MFACodeChange{
+		FactorID: uuid.New(), SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: code,
+	}); statusOf(err) != 404 {
+		t.Fatalf("disable with an unknown factor err = %v, want 404", err)
+	}
+	status, err := h.svc.Status(ctx, fakes.TestID(100))
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !status.Enabled {
+		t.Fatal("failed disable attempts must not remove MFA")
+	}
+
+	if err := h.svc.Disable(ctx, fakes.TestID(100), MFACodeChange{
+		FactorID: factorID, SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: code,
+	}); err != nil {
+		t.Fatalf("Disable with valid proofs: %v", err)
+	}
+}
+
+func TestMFARegenerateRequiresReauthentication(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := fakes.TenantCtx()
+	_, codes := h.enrollAndConfirm(t)
+	h.clock.at = h.clock.at.Add(totp.Period)
+
+	if _, err := h.svc.RegenerateRecoveryCodes(ctx, fakes.TestID(100), MFARecoveryChange{
+		SessionID: fakes.TestID(1), CurrentPassword: "", Code: codes[0],
+	}); statusOf(err) != 403 {
+		t.Fatalf("regenerate without re-authentication err = %v, want 403", err)
+	}
+
+	challenge, err := h.svc.BeginChallenge(ctx, fakes.TestID(100), core.AMRPassword)
+	if err != nil {
+		t.Fatalf("BeginChallenge: %v", err)
+	}
+	if _, err := h.svc.Verify(ctx, challenge, codes[0]); err != nil {
+		t.Fatalf("the rejected regeneration must not consume the recovery code: %v", err)
+	}
+}
+func TestMFAReauthMissingProofDoesNotSpendBudget(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := fakes.TenantCtx()
+	for i := range MaxMFAAttempts {
+		if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: ""}); statusOf(err) != 403 {
+			t.Fatalf("attempt %d: err = %v, want 403", i+1, err)
+		}
+	}
+	if _, err := h.svc.EnrollTOTP(ctx, fakes.TestID(100), ReauthProof{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword}); err != nil {
+		t.Fatalf("a missing proof must not consume the re-authentication budget: %v", err)
+	}
+}
+
+// Verify re-applies the sign-in admission the first factor enforced. A refused
+// admission must not consume the challenge or the code: once the requirement
+// is lifted the same challenge still completes.
+func TestMFAVerifyAppliesAdmission(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := fakes.TenantCtx()
+	secret, _ := h.enrollAndConfirm(t)
+	h.clock.at = h.clock.at.Add(totp.Period)
+
+	refused := false
+	h.svc.SetAdmission(func(_ context.Context, _ *core.Member) error {
+		refused = true
+		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
+	})
+
+	challenge, err := h.svc.BeginChallenge(ctx, fakes.TestID(100), core.AMRPassword)
+	if err != nil {
+		t.Fatalf("BeginChallenge: %v", err)
+	}
+	code, err := totp.Code(secret, h.clock.at)
+	if err != nil {
+		t.Fatalf("totp.Code: %v", err)
+	}
+	if _, err := h.svc.Verify(ctx, challenge, code); errorCode(err) != string(identitycatalog.CodeAuthEmailNotVerified) {
+		t.Fatalf("Verify err = %v, want auth.email_not_verified", err)
+	}
+	if !refused {
+		t.Fatal("Verify must consult the installed admission")
+	}
+
+	h.svc.SetAdmission(nil)
+	if _, err := h.svc.Verify(ctx, challenge, code); err != nil {
+		t.Fatalf("a refused admission must not burn the challenge: %v", err)
 	}
 }

@@ -41,11 +41,13 @@ FROM api_keys
 WHERE tenant_id = $1::uuid
   AND user_id = $2::uuid
 ORDER BY id
+LIMIT $3::int
 `
 
 type ListAPIKeysForPrivacyParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
 }
 
 type ListAPIKeysForPrivacyRow struct {
@@ -66,7 +68,7 @@ type ListAPIKeysForPrivacyRow struct {
 
 // Privacy export/erasure. The key hash is deliberately never selected.
 func (q *Queries) ListAPIKeysForPrivacy(ctx context.Context, arg ListAPIKeysForPrivacyParams) ([]ListAPIKeysForPrivacyRow, error) {
-	rows, err := q.db.Query(ctx, listAPIKeysForPrivacy, arg.TenantID, arg.UserID)
+	rows, err := q.db.Query(ctx, listAPIKeysForPrivacy, arg.TenantID, arg.UserID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}

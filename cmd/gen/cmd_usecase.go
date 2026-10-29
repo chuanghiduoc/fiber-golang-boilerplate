@@ -90,7 +90,7 @@ func (g *generator) wireUseCase(p *plan, data templateData) error {
 	}
 	return g.editFile(p, dir+"/build.go", func(src string) (string, error) {
 		return insertAtMarker("build.go", src, markerBuild, fmt.Sprintf(
-			"%s: %shandler.New%sHTTP(%sservice.New%sHandler()),", u.Name, m.Ident, u.Name, m.Ident, u.Name))
+			"%s: %shandler.New%sHTTP(%sservice.New%sHandler(authorizer)),", u.Name, m.Ident, u.Name, m.Ident, u.Name))
 	})
 }
 

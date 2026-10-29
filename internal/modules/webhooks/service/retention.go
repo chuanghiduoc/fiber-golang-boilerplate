@@ -50,7 +50,9 @@ func RunRetention(ctx context.Context, svc Service, retentionDays int32, interva
 		interval = time.Hour
 	}
 	run := func() {
-		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		// Keep the pass shorter than the API's shutdown drain (15s) so a
+		// purge cannot write after the pools are closed.
+		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		result, err := svc.PurgeRetention(runCtx, retentionDays)
 		if err != nil {

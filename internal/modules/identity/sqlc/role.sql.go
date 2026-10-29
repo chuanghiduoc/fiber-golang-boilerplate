@@ -321,11 +321,13 @@ WHERE mr.tenant_id = $1::uuid
   AND mr.user_id = $2::uuid
   AND r.scope = 'tenant'
 ORDER BY mr.created_at, r.key
+LIMIT $3::int
 `
 
 type ListUserRoleAssignmentsParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
 }
 
 type ListUserRoleAssignmentsRow struct {
@@ -337,7 +339,7 @@ type ListUserRoleAssignmentsRow struct {
 // tenant. Role changes are not historized, so created_at is when the current
 // assignment was granted.
 func (q *Queries) ListUserRoleAssignments(ctx context.Context, arg ListUserRoleAssignmentsParams) ([]ListUserRoleAssignmentsRow, error) {
-	rows, err := q.db.Query(ctx, listUserRoleAssignments, arg.TenantID, arg.UserID)
+	rows, err := q.db.Query(ctx, listUserRoleAssignments, arg.TenantID, arg.UserID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}

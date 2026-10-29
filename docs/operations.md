@@ -1,4 +1,4 @@
-| Shutdown | Spans flush after HTTP, workers, and module background loops stop, bounded by# Operations Runbook
+# Operations Runbook
 
 Runbook for the deployed API: health, metrics, logs, jobs, webhooks,
 idempotency, migrations, Kubernetes, and incident response. It describes the
@@ -32,8 +32,8 @@ line, or an error message.
 | `GET /healthz` | Liveness | Always `200` with `{"status":"up"}` while the process runs. Checks no dependency. |
 | `GET /readyz` | Readiness | Pings PostgreSQL and cache concurrently (2s each). |
 | `GET /health` | Readiness alias | Same handler and response as `/readyz`. |
-| `GET /metrics` | Prometheus | Bearer token required when `METRICS_AUTH_TOKEN` is set; production requires a token of at least 16 characters. |
-| `GET /openapi.yaml` | OpenAPI 3.1 document | Public (no UI) |
+| `GET /metrics` | Prometheus | Bearer token required when `METRICS_AUTH_TOKEN` is set; production requires a token of at least 16 bytes (the code checks byte length; use an ASCII token). |
+| `GET /openapi.json`, `GET /openapi.yaml` | OpenAPI 3.1 document | Public (no UI) |
 
 ```mermaid
 flowchart TD
@@ -272,6 +272,12 @@ UUID, so ordinary clients cannot forge or collide correlation IDs. The value is
 echoed on the response and returned as `requestId` in RFC 9457 problem
 responses.
 
+`Recovery`, `RequestID`, and the security-header middleware run before CORS.
+Consequently a CORS preflight still carries `X-Request-Id` and the baseline
+security headers, and a panic in CORS (or in any later middleware) returns a
+problem document whose `requestId` matches the header. A panic after a handler
+already wrote a partial body discards that body before rendering the 500.
+
 ```bash
 # JSON logs
 ... | jq -c 'select(."app.request_id"=="<id>")'
@@ -311,6 +317,17 @@ audited in two tiers:
   terminal outcome, only completion fields may change, and `DELETE`/`TRUNCATE`
   are rejected by triggers (a reviewed retention job must disable
   `trigger_audit_events_no_delete` as the owner).
+- Intent completion updates by `(id, created_at)`, the partitioned primary key,
+  so PostgreSQL prunes the update to one monthly partition. `cmd/migrate`
+  creates the current and next UTC month partitions in one advisory-locked
+  transaction, and the migration kustomization also renders a monthly
+  `CronJob` (`fiber-boilerplate-migrate-maintenance`, 02:23 UTC on the first)
+  that re-runs the same idempotent path, so partitions keep rolling even when
+  no deploy happens. If a deployment was down long enough for the default
+  partition to receive rows for a month that now needs its own partition,
+  migration backs up those rows, recreates the default and missing partitions,
+  and restores the rows through the parent so each lands in the correct
+  partition.
 - Alert on `audit_intent_failures_total`, `audit_completion_failures_total`,
   `audit_tx_missing_total`, and `audit_domain_missing_total`; investigate rows
   where `outcome = 'started' AND created_at < NOW() - INTERVAL '10 minutes'`.
@@ -333,7 +350,7 @@ effects, and keep handlers idempotent.
 | Global passes | Claim, lease recovery, and purge are global, so the only tenant-leading jobs index is the dedupe key; ad-hoc per-tenant inspection scans `idx_jobs_status_run_at`. Retention and metric labels (`kind` only) are deliberately global to avoid cardinality growth. |
 | Tracing | Enqueue stores the active W3C `traceparent` in `jobs.trace_parent` when the caller has a recording span. Each attempt runs as a new-root `<kind> process` span linked to the enqueue span, with `job.id`, `job.kind`, tenant, attempt, and outcome attributes; database spans nest under it. `NULL`/malformed traceparents are ignored. See [Tracing](tracing.md) and [Jobs `trace_parent`](#jobs-trace_parent). |
 | Process role | `APP_ROLE=api` serves HTTP only: it enqueues jobs but never claims them. `worker` runs the worker, scheduler, and background loops; its listener serves only `/healthz`, `/readyz` (database and cache), and `/metrics`. `all` does both and remains the single-container local default (`docker compose`); Kubernetes defaults to the split (an `api` Deployment and a `worker` Deployment), and CI rejects a rendered `APP_ROLE=all`. Every role registers the same job handlers. |
-| Authorization | Module (`JobProvider`) and durable-event handlers run under `authz.SystemContext`, so `authz.Authorize` allows their subject-less calls; without it they would be denied (fail closed). |
+| Authorization | Module (`JobProvider`) and durable-event handlers run under `authz.SystemContext`, so the injected `authz.Authorizer` allows their subject-less calls; without it they would be denied (fail closed). |
 | Identity | Worker and scheduler identities (`locked_by`, lease `holder`) are `<hostname>-<pid>-<random>`, so replicas with the same hostname never share one. |
 
 ### Lifecycle and retries
@@ -428,8 +445,9 @@ ORDER BY updated_at DESC;
 
 Notification emails carry no links or secrets, so a dead-lettered row only
 needs a re-send through the admin endpoint or the producing module. The
-generic audit trail records successful `POST /notifications/:id/read`,
-`POST /notifications/read-all`, and `PUT /notification-preferences`;
+generic audit trail records successful `PATCH /api/v1/me/notifications/{notificationId}`,
+`PATCH /api/v1/me/notifications`, and
+`PUT /api/v1/me/notification-preferences/{type}/{channel}`;
 `POST /members/{memberId}/notifications` is guarded by a required `notification.sent` intent
 row (503 when the audit store is down). Replays are skipped.
 
@@ -573,7 +591,7 @@ is `ready`; a failed module export marks the row `failed` and the job retries.
 | Two export requests for one membership | The partial unique index `idx_data_exports_active` makes the second insert fail; the service returns `409 data_export.in_progress` (the request idempotency key additionally collapses retries). The request also holds the active membership `FOR SHARE` so it cannot slip past an erasure. |
 | Erasure while an export is building | The erasure request updates the tenant's active/ready exports to `expired`; the export job's `running → ready` update is conditional, so a late writer cannot revive it and deletes its own document. The identity eraser deletes every export document (including already-expired ones), and the finalizer sweeps an export that committed just before the last membership was removed. |
 | Retried export/erase jobs | Each job re-reads state and is idempotent: export stops on `ready`/`expired`, a failed/timed-out/panicking export is marked `failed` on a detached context (and stale active rows are purged after a day), erase deletes by `(tenant, user)`, and finalization only anonymizes after every membership is `removed`. |
-| Already-deleted account | A finalizer still queued from an earlier self-erasure request upgrades an account deleted before it ran: it still anonymizes the email/name and deletes credentials, identities, sessions, and tokens. A plain `DELETE /users/:id` leaves no finalizer behind, so it does not trigger this upgrade. |
+| Already-deleted account | A finalizer still queued from an earlier self-erasure request upgrades an account deleted before it ran: it still anonymizes the email/name and deletes credentials, identities, sessions, and tokens. A plain `DELETE /api/v1/members/{memberId}` leaves no finalizer behind, so it does not trigger this upgrade. |
 | Last-admin erasure | The request transaction takes the per-tenant owner lock and returns `409 user.last_admin` before it reserves anything; the per-tenant job re-checks under the same lock if a reserved membership was reactivated, and a refusal there is permanent. |
 | Two owners erase at once | Each self-erasure request suspends (reserves) the caller's membership under the same per-tenant owner advisory lock, so the transactions serialize and the second one counts the first owner already gone and returns `409 user.last_admin` up front. Sequentially the same is true: the second request sees one active owner. The reservation also revokes the member's sessions in that tenant, so neither an upload nor an invitation acceptance can happen while erasure is pending. |
 | Unrequested erase job | A `privacy.erase` job only proceeds for a membership marked by a request (`erasure_requested_at`); a live membership without it is a `jobs.Permanent` refusal, logged at Error with the tenant and user ids, so it dead-letters immediately instead of retrying. |
@@ -596,17 +614,25 @@ Erasure has two paths:
   finalizer fails and retries with backoff. It also sweeps leftover export
   documents and invitation addresses, including invitations in tenants the
   user never joined.
+  The webhooks eraser selects events by `subject_user_ids`, plus the actor and
+  legacy payload keys for rows written before that column existed, and deletes
+  their deliveries and event rows in one transaction, so a failed second
+  statement cannot leave a partially erased history.
 - **Admin erasure** (`POST /members/{memberId}/erasure-requests`): one `privacy.erase` job
   for the request tenant, no finalizer. The request suspends that membership
   (and revokes its sessions) the same way; only that tenant's membership and
   data are removed, the global user and memberships in other tenants stay
-  intact, and a cross-tenant id is `404`.
+  intact, and a cross-tenant id is `404`. A request for a membership already
+  reserved by an earlier request is a replay: it records
+  `admin.user.erasure_replayed`, returns the same `202`, and enqueues no
+  second job.
 
 Pending `email.send.encrypted` payloads are sealed at rest and terminal jobs clear
 them; a queued email already committed before the request may still be
 delivered, and delivered webhooks cannot be recalled from third-party
 receivers. Audit rows are append-only and contain only ids/outcomes
-(`user.erasure_requested`, `admin.user.erasure_requested`, `user.erased`),
+(`user.erasure_requested`, `admin.user.erasure_requested`,
+`admin.user.erasure_replayed`, `user.erased`),
 never email, name, or document content; that is the retention basis for the
 request history itself. The per-membership `banned_email_hash` is the only
 pseudonymous identity marker retained after erasure: a keyed HMAC-SHA256 of the
@@ -1094,6 +1120,15 @@ honored) and the User-Agent once per request. Login lockout is per
 consecutive failures, so a handful of addresses cannot lock a victim out.
 Session rows and audit metadata use the same values.
 
+The Kubernetes shared base leaves `APP_TRUST_PROXY=false`; staging and
+production overlays must replace `REPLACE_WITH_INGRESS_NGINX_POD_CIDR` with the
+exact ingress-nginx pod/service CIDR (or node CIDR when it uses `hostNetwork`).
+Startup rejects malformed values, placeholders, zero-length prefixes such as
+`0.0.0.0/0` or `::/0`, and the broad private aggregates `10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, and `fc00::/7` (including supernets). A
+narrower pod/service, node, or single-address CIDR is required; any peer in a
+broad aggregate that can reach the API could spoof the client address.
+
 ### Conditional writes
 
 Every `ETag`/`If-Match` resource performs its compare-and-swap in SQL:
@@ -1151,8 +1186,8 @@ the handler, so a retry that races the owner's completion still replays.
   `/Users/7/ban/` and `/users/7/ban` (same route under case-insensitive,
   non-strict routing) share one scope. Keys written before tenant/route scoping
   stop matching and expire within 24h.
-- Only 2xx responses are cached. Non-multipart bodies up to 1 MiB are
-  body-bound with SHA-256; multipart and larger bodies are not bound.
+- Only 2xx responses are cached. Every request body, including multipart uploads,
+  is body-bound with SHA-256; the route body limit bounds the read.
 - Cache failures **fail open**: the handler runs and the client gets the normal
   response, so a cache outage can cause duplicate mutations. That is the
   deliberate availability trade-off; clients should still send stable keys.
@@ -1937,6 +1972,8 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `JOBS_WORKER_KINDS` / `JOBS_WORKER_EXCLUDE_KINDS` | Comma-separated job kinds this process claims / skips (bulkhead workers); every kind must be claimed by some worker, and a kind in both lists fails startup |
 | `APP_BODY_LIMIT` | Must exceed `STORAGE_MAX_FILE_SIZE` (multipart overhead) |
 | `DB_CONNECT_TIMEOUT` | Database connect timeout (default 10s) |
+| `DB_STATEMENT_TIMEOUT` / `DB_LOCK_TIMEOUT` | PostgreSQL statement and lock timeouts applied to API/worker/seed pools (defaults 30s and 5s); migrations are exempt. They are sent as startup parameters, so a transaction-mode PgBouncer must forward them (`track_extra_parameters`) or drop them and set the GUCs on the roles. |
+| `DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT` | Closes a session left idle inside a transaction (default 30s), releasing its locks and snapshot after a leaked transaction; not applied to `cmd/migrate`. |
 | `DB_SSLMODE` | Production requires `verify-full`; `require` and `verify-ca` accept any server certificate and are rejected there, as are `disable`, `allow`, and `prefer` |
 | `DB_SSLROOTCERT` | Optional CA bundle path for `verify-full` (passed as `sslrootcert`); empty uses the system trust store |
 | `DB_QUERY_EXEC_MODE` | pgx execution mode: `cache_statement` (default; behind a transaction-mode PgBouncer needs 1.21+ with `max_prepared_statements > 0`), `cache_describe`, or `describe_exec`; `exec`/`simple_protocol` are rejected (json parameters break) |
@@ -1962,14 +1999,14 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `SCHEDULER_CATCHUP` / `SCHEDULER_CATCHUP_LIMIT` | `none` \| `latest` \| `all` (default `latest`); limit bounds `all` per pass |
 | `SCHEDULER_RETENTION` | `scheduler_runs` retention (default 720h) |
 | `FILES_TRASH_RETENTION` / `NOTIFICATIONS_RETENTION` | How long a soft-deleted file stays restorable before its blob and row are purged (default 720h), and how long a read notification is kept after being read (default 4320h; unread are kept). Purged hourly only when `SCHEDULER_ENABLED=true` |
-| `FILES_TENANT_QUOTA_BYTES` / `FILES_USER_QUOTA_BYTES` | Total stored-byte quotas for one tenant and one user within it (live plus trash; 0 = unlimited, default 0). Uploads over quota are refused with `413 file.quota_exceeded`; a cheap lock-free pre-check rejects an already-over-quota upload before the blob `Put` and clamd scan, and the per-tenant advisory lock makes the authoritative check serializable |
+| `FILES_TENANT_QUOTA_BYTES` / `FILES_USER_QUOTA_BYTES` | Total stored-byte quotas for one tenant and one user within it (live plus trash; 0 = unlimited, default 0). Uploads over quota are refused with `413 file.quota_exceeded`; a cheap lock-free pre-check rejects an already-over-quota upload before the blob `Put` and clamd scan. The authoritative user check locks only that user's counter row; the tenant check takes a per-tenant advisory lock and sums per-user counters, so user-only deployments do not serialize unrelated users |
 | `FILES_SCAN_DRIVER` / `FILES_CLAMAV_ADDR` / `FILES_CLAMAV_TIMEOUT` | Upload malware scanner: `none` (default) or `clamav` (clamd INSTREAM over TCP; address required, timeout default 10s). A configured scanner fails closed: infected is `422 file.infected`, scanner errors are `503 file.scan_unavailable`, and the blob is removed either way. Production warns at startup when scanning is off |
 | `STORAGE_DRIVER` | `local` \| `s3` \| `seaweedfs` |
 | `CACHE_DRIVER` | `memory` \| `redis` (Redis shares rate limits, login lockouts, session invalidation, and idempotency across replicas) |
 | `EMAIL_DRIVER` | `console` \| `smtp` (`console` rejected in production) |
 | `METRICS_AUTH_TOKEN` | Required in production; sent as `Authorization: Bearer <token>` |
 | `TRACING_ENABLED` | Enable tracing (default `false`). The standard SDK `OTEL_*` variables configure the endpoint, protocol, sampler, resource, and batching; `METRICS_OTLP_ENABLED` adds OTLP metric export |
-| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Used only by `cmd/seed` (`make seed`, the Compose `seed` service, or the Kubernetes seed Job); API startup never seeds. Password 12+ chars in production |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Used only by `cmd/seed` (`make seed`, the opt-in Compose `seed` profile, or the Kubernetes seed Job); API startup never seeds. When set, the password must be 12-64 NFKC-normalized Unicode code points (runes) and must not be a common or repetitive password |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` / `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` | AES-256-GCM key for stored webhook secrets (base64-encoded 32 random bytes, required in every environment, no `JWT_SECRET` fallback) and decrypt-only previous keys |
 | `OAUTH_STATE_KEY` | Dedicated OAuth state/PKCE HMAC key (base64-encoded 32 random bytes); required when Google sign-in is configured |
 | `CORS_ALLOW_CREDENTIALS` | Must be false in JSON mode; cookie mode always sends credentials and requires explicit origins |
@@ -1989,10 +2026,10 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | Tenant claim | A conflicting explicit `X-Tenant-Slug` returns `403`; a missing/zero/negative claim `401`. Unknown or suspended tenants are rejected with `404` before authentication; a cached suspended snapshot returns `401` until the 5-second TTL expires. |
 | Emails | Normalized and unique case-insensitively among live accounts globally. Email changes require the current password, reset verification, revoke sessions, and send a fresh link. An email banned in a tenant cannot re-register or be invited there, even after the banned account deleted itself; otherwise a self-deleted address can re-register. |
 | Logout | `POST /auth/logout` revokes one session by possession of its refresh token; `DELETE /me/sessions` revokes every session in every tenant and bumps the token version. |
-| Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. Upload quotas are enforced transactionally per tenant, and an optional clamd scan runs before metadata commits (infected/unknown fails closed and removes the blob). |
+| Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. Upload quotas are enforced transactionally with user-scoped counter rows and a tenant advisory lock only when the tenant quota is enabled; an optional clamd scan runs before metadata commits (infected/unknown fails closed and removes the blob). |
 | Outbound webhooks | Endpoint create/update resolves the host once (3s) and rejects internal targets; the delivery client checks again at dial time: private, loopback, link-local, multicast, CGNAT, 6to4 anycast `192.88.99.0/24`, discard-only `100::/64`, benchmarking `2001:2::/48`, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. `WEBHOOK_REQUIRE_HTTPS` defaults to true in production. Standard Webhooks HMAC-SHA256 signing (`webhook-signature: v1,<base64>` over `id.timestamp.body`) with a per-endpoint `whsec_` secret; receivers deduplicate on `webhook-id`. |
 | Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`) and bind the secret's purpose, tenant, and owning endpoint/source as AAD (v3), so a ciphertext copied to another row fails to open; unbound v1/v2 envelopes are rejected. |
 | Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [key rotation](#key-rotation). |
-| Authorization | `authz.Authorize` is the single service-level path and fails closed: a call with neither a subject nor an explicit `authz.SystemContext` (job handlers, admin seed) is `403`. |
+| Authorization | The injected `authz.Authorizer.Authorize` is the single service-level path and fails closed: a call with neither a subject nor an explicit `authz.SystemContext` (job handlers, admin seed) is `403`. |
 | Idempotency | Cache scope includes tenant ID and slug, so a key/body from one IP cannot replay across tenants. |
-| Production startup | Rejects the sample JWT secret and default admin password, a missing `DATA_ENCRYPTION_KEY` or one equal to `JWT_SECRET`, console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics auth, any `DB_SSLMODE` other than `verify-full`, `TENANT_REQUIRE_HEADER=false`, an incomplete or plain-HTTP `WEBAUTHN_*` configuration, and a body limit smaller than the upload size. |
+| Production startup | Rejects a missing or malformed JWT secret (every application key must be base64-encoded 32 bytes), an `ADMIN_PASSWORD` shorter than 12 NFKC-normalized runes when configured, a missing `DATA_ENCRYPTION_KEY` or one equal to `JWT_SECRET`, console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics auth, any `DB_SSLMODE` other than `verify-full`, `TENANT_REQUIRE_HEADER=false`, an incomplete or plain-HTTP `WEBAUTHN_*` configuration, and a body limit smaller than the upload size. |

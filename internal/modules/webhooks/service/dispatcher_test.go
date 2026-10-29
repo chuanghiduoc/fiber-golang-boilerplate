@@ -129,6 +129,60 @@ func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 	}
 }
 
+func TestDispatcher_SubjectUserIDsIncludeActorAndExplicitSubjects(t *testing.T) {
+	store := &fakeDispatchStore{
+		endpoints: map[uuid.UUID][]ActiveEndpoint{
+			tenant.DefaultID: {activeEndpoint(testID(1), tenant.DefaultID, "*")},
+		},
+	}
+	dispatcher := NewDispatcher(store)
+	event := testEvent(testID(14), "file.deleted", tenant.DefaultID, time.Now())
+	event.SubjectUserIDs = []uuid.UUID{testID(6), testID(5)}
+
+	created, err := dispatcher.Dispatch(context.Background(), event)
+	if err != nil || created != 1 {
+		t.Fatalf("Dispatch() = (%d, %v), want (1, nil)", created, err)
+	}
+	draft := store.deliveries[deliveryKey(tenant.DefaultID, testID(1), testID(14))]
+	if len(draft.SubjectUserIDs) != 2 {
+		t.Fatalf("subject ids = %v, want the actor and explicit owner once each", draft.SubjectUserIDs)
+	}
+	want := map[uuid.UUID]bool{testID(5): true, testID(6): true}
+	for _, id := range draft.SubjectUserIDs {
+		if !want[id] {
+			t.Fatalf("unexpected subject id %s in %v", id, draft.SubjectUserIDs)
+		}
+		delete(want, id)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing subject ids %v", want)
+	}
+}
+
+func TestDispatcher_SubjectUserIDsFallBackToPayloadForLegacyEvents(t *testing.T) {
+	store := &fakeDispatchStore{
+		endpoints: map[uuid.UUID][]ActiveEndpoint{
+			tenant.DefaultID: {activeEndpoint(testID(1), tenant.DefaultID, "*")},
+		},
+	}
+	dispatcher := NewDispatcher(store)
+	event := testEvent(testID(15), "file.deleted", tenant.DefaultID, time.Now())
+	event.SubjectUserIDs = nil
+	event.Data = json.RawMessage(`{"ownerId":"` + testID(6).String() + `"}`)
+
+	if _, err := dispatcher.Dispatch(context.Background(), event); err != nil {
+		t.Fatalf("Dispatch(): %v", err)
+	}
+	draft := store.deliveries[deliveryKey(tenant.DefaultID, testID(1), testID(15))]
+	want := map[uuid.UUID]bool{testID(5): true, testID(6): true}
+	for _, id := range draft.SubjectUserIDs {
+		delete(want, id)
+	}
+	if len(want) != 0 {
+		t.Fatalf("subject ids = %v, missing %v", draft.SubjectUserIDs, want)
+	}
+}
+
 // The tenant comes from the envelope, never from the job context.
 func TestDispatcher_UsesEnvelopeTenant(t *testing.T) {
 	otherTenant := testID(42)
@@ -161,6 +215,10 @@ func TestDispatcher_InvalidEventsArePermanent(t *testing.T) {
 		"non-uuid actor": func(e *events.Event) { e.Actor = events.Actor{Type: events.ActorUser, ID: "api-key-name"} },
 		"pattern type":   func(e *events.Event) { e.Type = "file.*" },
 		"no version":     func(e *events.Event) { e.DataVersion = 0 },
+		"nil subject":    func(e *events.Event) { e.SubjectUserIDs = []uuid.UUID{uuid.Nil} },
+		"duplicate subject": func(e *events.Event) {
+			e.SubjectUserIDs = []uuid.UUID{testID(6), testID(6)}
+		},
 	}
 	for name, mutate := range cases {
 		event := valid

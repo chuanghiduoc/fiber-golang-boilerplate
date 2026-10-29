@@ -23,7 +23,7 @@ type FileResponse struct {
 
 // FileIDInput is the {fileId} path parameter shared by the item operations.
 type FileIDInput struct {
-	FileID string `path:"fileId" doc:"File ID (UUID)."`
+	FileID string `path:"fileId" format:"uuid" doc:"File ID (UUID)."`
 }
 
 // ListFilesInput is the collection query. The service narrows a caller without
@@ -41,5 +41,5 @@ type CreateFileInput struct {
 
 // CreateFileForm names the multipart file part.
 type CreateFileForm struct {
-	File huma.FormFile `form:"file" required:"false" contentType:"application/octet-stream" doc:"File to upload."`
+	File huma.FormFile `form:"file" required:"true" contentType:"application/octet-stream" doc:"File to upload."`
 }

@@ -133,6 +133,29 @@ func TestLocalStorage_PutCreatesSubdirectories(t *testing.T) {
 	}
 }
 
+func TestLocalStorage_PutHonorsCanceledContext(t *testing.T) {
+	dir := tempDir(t)
+	ls, err := NewLocalStorage(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStorage: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	body := []byte("must not be written")
+	err = ls.Put(ctx, "canceled/file.txt", bytes.NewReader(body), int64(len(body)), "text/plain")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Put error = %v, want context.Canceled", err)
+	}
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatalf("ReadDir: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("canceled Put left %d entries in storage: %v", len(entries), entries)
+	}
+}
+
 func TestLocalStorage_List(t *testing.T) {
 	dir := tempDir(t)
 	ls, err := NewLocalStorage(dir)

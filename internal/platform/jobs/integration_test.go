@@ -276,6 +276,89 @@ func TestClaimIntegrationDeadLettersExpiredFinalAttempt(t *testing.T) {
 	assert.Contains(t, *lastError, "lease expired after max attempts")
 }
 
+// TestClaimIntegrationBoundsExpiredLeaseRecovery proves one claim does not
+// update the entire expired-lease backlog. A crash can leave thousands of
+// running rows behind; bounding the expired CTE keeps lock time and result
+// memory proportional to the claim limit, and the next claims make progress.
+func TestClaimIntegrationBoundsExpiredLeaseRecovery(t *testing.T) {
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
+
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
+	defer cancel()
+
+	const (
+		kind  = "jobs.integration.bounded_reclaim"
+		total = 5
+		limit = 2
+	)
+	queue := NewQueue(pgtest.Scoped(pools))
+	ids := make([]uuid.UUID, 0, total)
+	for range total {
+		id, err := queue.Enqueue(ctx, Job{
+			Kind:        kind,
+			Payload:     json.RawMessage(`{"n":1}`),
+			MaxAttempts: 3,
+			RunAt:       time.Now().Add(-time.Minute),
+		})
+		require.NoError(t, err)
+		ids = append(ids, id)
+	}
+
+	// Simulate a crashed worker that claimed every job once. The leases are
+	// expired, but no attempt has exhausted its budget.
+	_, err := pool.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'running',
+		    attempts = 1,
+		    locked_at = now() - interval '10 minutes',
+		    locked_by = 'crashed-worker',
+		    lease_expires_at = now() - interval '5 minutes'
+		WHERE id = ANY($1)`, ids)
+	require.NoError(t, err)
+
+	counts := func() (queued, running int) {
+		require.NoError(t, pool.QueryRow(ctx, `
+			SELECT count(*) FILTER (WHERE status = 'queued'),
+			       count(*) FILTER (WHERE status = 'running')
+			FROM jobs
+			WHERE id = ANY($1)`, ids).Scan(&queued, &running))
+		return queued, running
+	}
+
+	store := newPGStore(pgtest.Scoped(pools))
+
+	first, err := store.Claim(ctx, "recovering-worker", limit, time.Minute)
+	require.NoError(t, err)
+	require.Empty(t, first.Jobs, "requeued rows become visible to the next claim")
+	require.Empty(t, first.LeaseDead)
+	queued, running := counts()
+	assert.Equal(t, limit, queued, "one claim must not requeue the whole backlog")
+	assert.Equal(t, total-limit, running)
+
+	second, err := store.Claim(ctx, "recovering-worker", limit, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, second.Jobs, limit)
+	queued, running = counts()
+	assert.Equal(t, limit, queued)
+	assert.Equal(t, total-limit, running)
+
+	third, err := store.Claim(ctx, "recovering-worker", limit, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, third.Jobs, limit)
+	queued, running = counts()
+	assert.Equal(t, total-limit-limit, queued)
+	assert.Equal(t, total-(total-limit-limit), running)
+
+	last, err := store.Claim(ctx, "recovering-worker", limit, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, last.Jobs, total-limit-limit)
+	queued, running = counts()
+	assert.Zero(t, queued)
+	assert.Equal(t, total, running)
+}
+
 // TestWorkerIntegrationReclaimsExpiredLease simulates a worker that claimed a
 // job and then crashed: the row is running with an old locked_at. A live worker
 // must requeue it, claim it again, and process it without consuming an extra

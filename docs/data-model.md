@@ -1,8 +1,9 @@
 # Data Model
 
-The fresh-install schema is one init migration,
-`migrations/20260101000000_platform_init_schema.{up,down}.sql`, applied only by
-`cmd/migrate`. Its `-- owner:` sections, in order:
+The baseline schema is the init migration,
+`migrations/20260101000000_platform_init_schema.{up,down}.sql`; later schema
+changes are separate paired migrations applied by `cmd/migrate`. The baseline
+file's `-- owner:` sections, in order:
 
 | Section owner | Creates |
 |---|---|
@@ -18,6 +19,9 @@ The fresh-install schema is one init migration,
 | `webhooks` | every `webhook_*` table |
 
 The down file drops exactly what the up file created, leaving an empty schema.
+`files_storage_usage` is added later by
+`migrations/20261029100000_files_storage_usage.{up,down}.sql`, which computes
+the per-user counters and owns the corresponding down migration.
 Every table has exactly one owner, and a migration file or section may only
 create its owner's tables; modules read
 other modules' data through contracts, never through SQL (both enforced by
@@ -30,10 +34,10 @@ migration policy.
 |---|---|
 | `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `data_exports`, `permissions`, `roles`, `role_permissions`, `membership_roles`, `platform_role_assignments`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes`, `webauthn_credentials` |
 | `apikeys` | `api_keys`, `api_key_scopes` |
-| `files` | `files` |
+| `files` | `files`, `files_storage_usage` |
 | `notifications` | `notifications`, `notification_preferences` |
 | `features` | `feature_flags` (global), `feature_flag_targets` |
-| `webhooks` | `webhook_endpoints`, `webhook_endpoint_subscriptions`, `webhook_endpoint_secrets`, `webhook_events`, `webhook_deliveries`, `webhook_delivery_attempts`, `webhook_inbound_sources`, `webhook_inbound_events` |
+| `webhooks` | `webhook_endpoints`, `webhook_endpoint_subscriptions`, `webhook_endpoint_secrets`, `webhook_events`, `webhook_deliveries`, `webhook_delivery_attempts`, `webhook_inbound_sources`, `webhook_inbound_source_secrets`, `webhook_inbound_events` |
 | platform | `jobs`, `audit_events`, `scheduler_leases`, `scheduler_runs` |
 
 Conventions that apply to every diagram below:
@@ -441,7 +445,7 @@ erDiagram
 | `membership_roles` | primary key `(tenant_id, user_id, role_id)`; `(role_id)` | Load a member's roles; invalidate the holders of a changed role and reject a role delete in use. |
 | `role_permissions` | primary key `(role_id, permission_key)`; `(permission_key)` | Grant set; catalog prune and permission delete. |
 | `invitations` | `token_hash` unique; partial unique `(tenant_id, email_normalized) WHERE accepted_at IS NULL`; `(tenant_id, created_at DESC, id DESC)`; partial `(expires_at)` on pending rows | Token lookup; one pending invite per address; list cursor; expiry purge. |
-| `sessions` | unique `(tenant_id, id)`; `(tenant_id, user_id, created_at DESC)`; partial `(user_id) WHERE revoked_at IS NULL`; `(last_used_at)` | Refresh-token FK parent; "my sessions"; revoking a user's live sessions across tenants; stale-session purge. |
+| `sessions` | unique `(tenant_id, id)`; `(tenant_id, user_id, created_at DESC, id DESC)`; partial `(user_id) WHERE revoked_at IS NULL`; `(last_used_at)` | Refresh-token FK parent; `my sessions` cursor; stale-session purge. |
 | `refresh_tokens` | `token_hash` unique; `(tenant_id, session_id)`; `(expires_at)` | Rotation lookup; FK cascade and the purge's live-token check; expiry purge. |
 | `mfa_factors` | partial unique `(user_id) WHERE type = 'totp' AND confirmed_at IS NOT NULL`; partial unique `(user_id) WHERE type = 'totp' AND confirmed_at IS NULL` | One confirmed factor and one pending enrollment per user. |
 | `mfa_recovery_codes` | unique `(user_id, code_hash)`; partial `(user_id) WHERE used_at IS NULL` | Code lookup; unused-code count. |
@@ -451,6 +455,7 @@ erDiagram
 ```mermaid
 erDiagram
     memberships ||--o{ files : "(tenant_id, user_id), RESTRICT"
+    memberships ||--o{ files_storage_usage : "(tenant_id, user_id), CASCADE"
     memberships ||--o{ notifications : "(tenant_id, user_id), RESTRICT"
     memberships ||--o{ notification_preferences : "(tenant_id, user_id), RESTRICT"
     feature_flags ||--o{ feature_flag_targets : "flag_key, RESTRICT"
@@ -467,6 +472,11 @@ erDiagram
         timestamptz purge_started_at "purge claim; blocks restore"
         int purge_attempts "failed blob deletes"
         timestamptz purge_retry_after "per-row backoff; claim skips until due"
+    }
+    files_storage_usage {
+        uuid tenant_id PK
+        uuid user_id PK
+        bigint bytes "CHECK >= 0; maintained by files trigger"
     }
     notifications {
         uuid id PK
@@ -501,6 +511,7 @@ erDiagram
 | Table | Key constraint / index | Why |
 |---|---|---|
 | `files` | `storage_path` unique | Authoritative blob key (`<tenantID>/<userID>/<uuid>.<ext>` for new uploads). |
+| `files_storage_usage` | unique `(tenant_id, user_id) INCLUDE (bytes)` | One atomic per-user byte counter maintained by the files trigger; user quota reads one row and tenant quota sums these rows under its advisory lock. |
 | `notifications` | feed index `(tenant_id, user_id, created_at DESC, id DESC)` + partial unread variant | Cursor feed and unread badge. |
 | `notification_preferences` | unique `(tenant_id, user_id, type, channel)` | Idempotent upsert; a missing row means enabled. |
 | `feature_flag_targets` | `UNIQUE NULLS NOT DISTINCT (tenant_id, flag_key, user_id)`; index `(flag_key)` | One tenant-wide target (`user_id` NULL) and one target per user, with one `ON CONFLICT` target for both upserts; the unique index is also the tenant-leading list index, and `(flag_key)` serves the `RESTRICT` check on flag delete. |
@@ -547,6 +558,7 @@ erDiagram
         int data_version "envelope dataVersion"
         varchar actor_type "user | service | system"
         uuid actor_id "NULL iff system"
+        uuid[] subject_user_ids "privacy attribution; not sent"
         timestamptz occurred_at "envelope occurredAt"
         jsonb payload "envelope data"
         timestamptz created_at "retention clock"
@@ -606,8 +618,11 @@ erDiagram
   endpoints of the event reuse it. Its columns are the versioned event
   envelope, and every delivery of the event signs the same
   `{id, type, dataVersion, occurredAt, tenantId, actor, data}` body built from
-  this row. A replay is a new event (new id and `occurredAt`) carrying the
-  original type, `dataVersion`, actor, and payload.
+  this row. `subject_user_ids` is the union of the user actor and the
+  producer-supplied subjects; privacy export/erasure queries it through a GIN
+  index, and it is never included in the signed body. A replay is a new event
+  (new id and `occurredAt`) carrying the original type, `dataVersion`, actor,
+  and payload.
 - `(tenant_id, endpoint_id, event_id)` is unique, so re-dispatching the same
   domain event never creates a second delivery.
 - `(tenant_id, source_id, external_event_id)` is unique: the inbound dedupe key.

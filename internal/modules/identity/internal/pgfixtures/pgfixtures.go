@@ -206,16 +206,24 @@ func (Sealer) Open(p []byte) ([]byte, error) {
 	return []byte(strings.TrimPrefix(string(p), "sealed:")), nil
 }
 
-// EnrollTOTPSecret enrolls TOTP for userID and returns the shared secret.
-func EnrollTOTPSecret(t *testing.T, e *Env, userID uuid.UUID) string {
+// TOTPEnrollment is a pending TOTP enrollment created by the fixture.
+type TOTPEnrollment struct {
+	Secret   string
+	FactorID uuid.UUID
+}
+
+// EnrollTOTP enrolls TOTP for userID and returns the shared secret and the
+// pending factor id, which confirmation and disable calls must bind to.
+func EnrollTOTP(t *testing.T, e *Env, userID uuid.UUID) TOTPEnrollment {
 	t.Helper()
-	enrollment, err := e.MFA.EnrollTOTP(tenant.WithID(context.Background(), tenant.DefaultID), userID, uuid.Nil, Passphrase)
+	enrollment, err := e.MFA.EnrollTOTP(tenant.WithID(context.Background(), tenant.DefaultID), userID,
+		mfa.ReauthProof{SessionID: uuid.Nil, CurrentPassword: Passphrase})
 	require.NoError(t, err)
 	u, err := url.Parse(enrollment.OtpauthURI)
 	require.NoError(t, err)
 	secret := u.Query().Get("secret")
 	require.NotEmpty(t, secret)
-	return secret
+	return TOTPEnrollment{Secret: secret, FactorID: enrollment.FactorID}
 }
 
 // Passphrase is the fixture account password, built at runtime so the

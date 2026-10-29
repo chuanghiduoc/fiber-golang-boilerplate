@@ -46,16 +46,29 @@ type MFAConfirmResponse struct {
 
 type MFADisableRequest struct {
 	Code string `json:"code" required:"true" maxLength:"64"`
+	// CurrentPassword re-authenticates the caller (password accounts).
+	CurrentPassword string `json:"currentPassword,omitempty" maxLength:"128"`
 }
 
 type MFARegenerateRequest struct {
 	Code string `json:"code" required:"true" maxLength:"64"`
+	// CurrentPassword re-authenticates the caller (password accounts).
+	CurrentPassword string `json:"currentPassword,omitempty" maxLength:"128"`
 }
 
 type MFAStatusResponse struct {
 	Enabled                bool       `json:"enabled"`
 	ConfirmedAt            *time.Time `json:"confirmedAt,omitempty"`
 	RecoveryCodesRemaining int64      `json:"recoveryCodesRemaining"`
+}
+
+// MFAFactorResponse is the secret-free status resource for one enrollment.
+type MFAFactorResponse struct {
+	FactorID    uuid.UUID  `json:"factorId"`
+	Type        string     `json:"type" enum:"totp"`
+	Status      string     `json:"status" enum:"pending,active"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	ConfirmedAt *time.Time `json:"confirmedAt,omitempty"`
 }
 
 // MFAVerifyRequest completes a two-step login. Code is a TOTP code or one of

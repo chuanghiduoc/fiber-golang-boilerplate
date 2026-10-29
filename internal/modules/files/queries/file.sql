@@ -24,10 +24,10 @@ RETURNING *;
 
 -- name: AdminFileStats :one
 SELECT
-    count(*) FILTER (WHERE deleted_at IS NULL)::bigint AS total_files,
-    COALESCE(SUM(size) FILTER (WHERE deleted_at IS NULL), 0)::bigint AS total_file_size
+    count(*)::bigint AS total_files,
+    COALESCE(SUM(size), 0)::bigint AS total_file_size
 FROM files
-WHERE tenant_id = $1;
+WHERE tenant_id = $1 AND deleted_at IS NULL;
 
 -- name: ListFilesByUserCursor :many
 SELECT * FROM files
@@ -55,18 +55,32 @@ WHERE tenant_id = @tenant_id::uuid
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
--- name: LockFilesQuota :exec
--- Serializes uploads of one tenant for the rest of the metadata transaction,
--- so a concurrent upload cannot read the same free space and also pass.
-SELECT pg_advisory_xact_lock(hashtextextended('files.quota:' || @tenant_id::uuid, 0));
-
--- name: FilesStorageUsage :one
--- Both quotas count trashed rows: a soft-deleted blob still occupies storage.
-SELECT
-    COALESCE(SUM(size), 0)::bigint AS tenant_bytes,
-    COALESCE(SUM(size) FILTER (WHERE user_id = @user_id::uuid), 0)::bigint AS user_bytes
-FROM files
+-- name: TenantStorageUsage :one
+-- Tenant usage is the sum of per-user counters, so this is O(users), never
+-- O(files), and user-only quota checks never read it.
+SELECT COALESCE(SUM(bytes), 0)::bigint AS bytes
+FROM files_storage_usage
 WHERE tenant_id = @tenant_id::uuid;
+
+-- name: UserStorageUsage :one
+SELECT COALESCE((
+    SELECT bytes FROM files_storage_usage
+    WHERE tenant_id = @tenant_id::uuid AND user_id = @user_id::uuid
+), 0)::bigint AS bytes;
+
+-- name: LockTenantQuota :exec
+-- Serialize authoritative tenant-quota checks without writing a shared tenant
+-- aggregate row. This is taken only when the tenant quota is enabled.
+SELECT pg_advisory_xact_lock(
+    hashtextextended('files.quota:' || @tenant_id::text, 0)
+);
+
+-- name: LockUserStorageUsage :one
+INSERT INTO files_storage_usage (tenant_id, user_id, bytes)
+VALUES (@tenant_id::uuid, @user_id::uuid, 0)
+ON CONFLICT ON CONSTRAINT uq_files_storage_usage_tenant_user DO UPDATE
+SET bytes = files_storage_usage.bytes
+RETURNING bytes;
 
 -- name: ListFileStoragePaths :many
 -- The orphan sweep checks candidate storage keys against the owning tenant's

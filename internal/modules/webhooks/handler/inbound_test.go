@@ -108,6 +108,26 @@ func TestUpdateInboundSourceMergePatchAndETag(t *testing.T) {
 	assert.Equal(t, string(apperror.CodeResourcePreconditionFailed), decode[apperror.ProblemDetails](t, body).Code)
 }
 
+func TestUpdateInboundSourceEmptyPatchIsNoOp(t *testing.T) {
+	id := uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000044")
+	updated := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	current := sourceFixture(id, updated)
+	svc := &fakeService{
+		getInboundSource: func(context.Context, uuid.UUID) (*webhookservice.InboundSource, error) {
+			return current, nil
+		},
+	}
+	fiberApp, _ := newAPI(t, svc)
+
+	resp, body := do(t, fiberApp, http.MethodPatch, "/api/v1/webhooks/inbound-sources/"+id.String(), map[string]any{}, map[string]string{
+		"If-Match":     strconv.Quote(strconv.FormatInt(updated.UnixNano(), 10)),
+		"Content-Type": "application/merge-patch+json",
+	})
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", body)
+	assert.Equal(t, strconv.Quote(strconv.FormatInt(updated.UnixNano(), 10)), resp.Header.Get("ETag"))
+	assert.Equal(t, "Stripe", decode[dto.InboundSourceResponse](t, body).Name)
+}
+
 func TestRotateInboundSourceSecretReturnsOnlySecret(t *testing.T) {
 	id := uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000033")
 	var gotExpire bool

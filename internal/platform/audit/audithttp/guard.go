@@ -111,28 +111,28 @@ func Guard(recorder audit.Recorder, policy Policy, catalogs ...*apperror.Catalog
 		}
 
 		target := policy.target(c)
-		eventID, err := beginIntent(c, recorder, mode, target)
+		intent, err := beginIntent(c, recorder, mode, target)
 		if err != nil {
 			return err
 		}
 
-		info := requestInfoFor(c, eventID, target.action, target.resource)
+		info := requestInfoFor(c, intent.ID, target.action, target.resource)
 		c.SetContext(audit.WithRequestInfo(c.Context(), info))
-		fiber.Locals[uuid.UUID](c, "audit_event_id", eventID)
+		fiber.Locals[uuid.UUID](c, "audit_event_id", intent.ID)
 		fiber.Locals[bool](c, auditGuardedLocal, true)
 
-		if eventID == uuid.Nil {
+		if intent.ID == uuid.Nil {
 			// Best-effort mode with no intent row: nothing to complete.
 			return c.Next()
 		}
-		return runAndCompleteIntent(c, recorder, policy, eventID, info, catalog)
+		return runAndCompleteIntent(c, recorder, policy, intent, info, catalog)
 	}
 }
 
-// beginIntent stores the started intent row and returns its id. When the row
+// beginIntent stores the started intent row and returns its identity. When the row
 // cannot be stored it returns system.audit_unavailable in required mode and a
 // zero id with no error in best-effort mode.
-func beginIntent(c fiber.Ctx, recorder audit.Recorder, mode Mode, target guardTarget) (uuid.UUID, error) {
+func beginIntent(c fiber.Ctx, recorder audit.Recorder, mode Mode, target guardTarget) (audit.IntentRef, error) {
 	idRecorder, ok := recorder.(audit.IDRecorder)
 	if !ok {
 		metrics.AuditIntentFailuresTotal.Inc()
@@ -141,13 +141,13 @@ func beginIntent(c fiber.Ctx, recorder audit.Recorder, mode Mode, target guardTa
 			slog.String("mode", string(mode)),
 			slog.String("request_id", requestctx.RequestID(c.Context())),
 		)
-		return uuid.Nil, intentUnavailable(mode)
+		return audit.IntentRef{}, intentUnavailable(mode)
 	}
 
 	intent := intentEvent(c, target)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), audit.WriteTimeout)
 	defer cancel()
-	id, err := idRecorder.RecordID(ctx, intent)
+	ref, err := idRecorder.RecordID(ctx, intent)
 	if err != nil {
 		metrics.AuditIntentFailuresTotal.Inc()
 		slog.WarnContext(c.Context(), "failed to write audit intent row",
@@ -155,9 +155,9 @@ func beginIntent(c fiber.Ctx, recorder audit.Recorder, mode Mode, target guardTa
 			slog.String("request_id", intent.RequestID),
 			slog.Any("error", err),
 		)
-		return uuid.Nil, intentUnavailable(mode)
+		return audit.IntentRef{}, intentUnavailable(mode)
 	}
-	return id, nil
+	return ref, nil
 }
 
 func intentUnavailable(mode Mode) error {
@@ -195,10 +195,10 @@ func intentEvent(c fiber.Ctx, target guardTarget) audit.Event {
 
 // runAndCompleteIntent runs the handler and completes the intent row with the
 // observed outcome, including a panic, which is recorded and re-raised.
-func runAndCompleteIntent(c fiber.Ctx, recorder audit.Recorder, policy Policy, eventID uuid.UUID, info *audit.RequestInfo, catalog *apperror.Catalog) error {
+func runAndCompleteIntent(c fiber.Ctx, recorder audit.Recorder, policy Policy, intent audit.IntentRef, info *audit.RequestInfo, catalog *apperror.Catalog) error {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			completeGuarded(c, recorder, eventID, audit.Completion{
+			completeGuarded(c, recorder, intent, audit.Completion{
 				Outcome:    audit.OutcomeFailed,
 				StatusCode: fiber.StatusInternalServerError,
 				ErrorCode:  "panic",
@@ -218,26 +218,26 @@ func runAndCompleteIntent(c fiber.Ctx, recorder audit.Recorder, policy Policy, e
 			slog.String("request_id", info.RequestID),
 		)
 	}
-	completeGuarded(c, recorder, eventID, completion)
+	completeGuarded(c, recorder, intent, completion)
 	return handlerErr
 }
 
-func completeGuarded(c fiber.Ctx, recorder audit.Recorder, eventID uuid.UUID, completion audit.Completion) {
+func completeGuarded(c fiber.Ctx, recorder audit.Recorder, intent audit.IntentRef, completion audit.Completion) {
 	completer, ok := recorder.(audit.CompletionRecorder)
 	if !ok {
 		metrics.AuditCompletionFailuresTotal.Inc()
 		slog.ErrorContext(c.Context(), "audit guard recorder cannot complete intent rows",
-			slog.String("audit_event_id", eventID.String()),
+			slog.String("audit_event_id", intent.ID.String()),
 			slog.String("request_id", requestctx.RequestID(c.Context())),
 		)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), audit.WriteTimeout)
 	defer cancel()
-	if err := completer.Complete(ctx, eventID, completion); err != nil {
+	if err := completer.Complete(ctx, intent, completion); err != nil {
 		metrics.AuditCompletionFailuresTotal.Inc()
 		slog.WarnContext(c.Context(), "failed to complete audit intent row",
-			slog.String("audit_event_id", eventID.String()),
+			slog.String("audit_event_id", intent.ID.String()),
 			slog.String("request_id", requestctx.RequestID(c.Context())),
 			slog.Any("error", err),
 		)

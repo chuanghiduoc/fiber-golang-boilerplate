@@ -55,6 +55,7 @@ func Load() (*Config, error) {
 	if err := env.ParseWithOptions(cfg, env.Options{Environment: environment}); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
+	cfg.App.Env = normalizeAppEnv(cfg.App.Env)
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -82,7 +83,7 @@ func LoadDatabase() (DBConfig, error) {
 	if err := parsed.DB.Validate(); err != nil {
 		return DBConfig{}, fmt.Errorf("invalid database config: %w", err)
 	}
-	appEnv := strings.ToLower(strings.TrimSpace(parsed.App.Env))
+	appEnv := normalizeAppEnv(parsed.App.Env)
 	if err := validateAppEnv(appEnv, parsed.App.Env); err != nil {
 		return DBConfig{}, err
 	}
@@ -111,7 +112,8 @@ func LoadSeed() (*Config, error) {
 	if err := env.ParseWithOptions(cfg, env.Options{Environment: environment}); err != nil {
 		return nil, fmt.Errorf("failed to parse seed config: %w", err)
 	}
-	appEnv := strings.ToLower(strings.TrimSpace(cfg.App.Env))
+	cfg.App.Env = normalizeAppEnv(cfg.App.Env)
+	appEnv := cfg.App.Env
 	if err := validateAppEnv(appEnv, cfg.App.Env); err != nil {
 		return nil, err
 	}
@@ -136,6 +138,7 @@ func LoadSeed() (*Config, error) {
 // them one restart at a time. The order is still stable: general checks run
 // first, then the production-only safety rails.
 func (cfg *Config) Validate() error {
+	cfg.App.Env = normalizeAppEnv(cfg.App.Env)
 	checks := []func() error{
 		cfg.App.validate,
 		// The sample JWT secret is public and must never sign tokens outside

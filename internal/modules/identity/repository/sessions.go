@@ -8,6 +8,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/google/uuid"
 )
@@ -217,13 +218,17 @@ func (r *SessionRepository) Touch(ctx context.Context, id uuid.UUID, userAgent, 
 	if err != nil {
 		return err
 	}
-	if err := r.q.TouchSession(ctx, identitysqlc.TouchSessionParams{
+	n, err := r.q.TouchSession(ctx, identitysqlc.TouchSessionParams{
 		TenantID:  tenantID,
 		ID:        id,
 		UserAgent: optionalText(userAgent),
 		Ip:        ipAddr(ip),
-	}); err != nil {
+	})
+	if err != nil {
 		return wrapErr(err)
+	}
+	if n == 0 {
+		return apperror.ErrNotFound
 	}
 	return nil
 }
@@ -261,8 +266,10 @@ func (r *SessionRepository) MarkMFAVerifiedWithMethod(ctx context.Context, userI
 	return verifiedAt.Time, nil
 }
 
-func (r *SessionRepository) State(ctx context.Context, sessionID, userID uuid.UUID) (*core.SessionState, error) {
-	row, err := r.q.GetSessionState(ctx, identitysqlc.GetSessionStateParams{ID: sessionID, UserID: userID})
+func (r *SessionRepository) State(ctx context.Context, tenantID, sessionID, userID uuid.UUID) (*core.SessionState, error) {
+	row, err := r.q.GetSessionState(ctx, identitysqlc.GetSessionStateParams{
+		ID: sessionID, UserID: userID, TenantID: tenantID,
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}

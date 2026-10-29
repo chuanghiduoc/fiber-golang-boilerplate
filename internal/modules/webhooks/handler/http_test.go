@@ -37,11 +37,11 @@ type recordingAudit struct{}
 
 func (recordingAudit) Record(context.Context, audit.Event) error { return nil }
 
-func (recordingAudit) RecordID(context.Context, audit.Event) (uuid.UUID, error) {
-	return uuid.New(), nil
+func (recordingAudit) RecordID(context.Context, audit.Event) (audit.IntentRef, error) {
+	return audit.IntentRef{ID: uuid.New()}, nil
 }
 
-func (recordingAudit) Complete(context.Context, uuid.UUID, audit.Completion) error { return nil }
+func (recordingAudit) Complete(context.Context, audit.IntentRef, audit.Completion) error { return nil }
 
 var testActorID = uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000001")
 

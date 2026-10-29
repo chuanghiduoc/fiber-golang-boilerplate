@@ -17,16 +17,21 @@ import (
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 const (
+	// exportCleanupTimeout bounds detached storage cleanup after a job finishes.
+	exportCleanupTimeout = 30 * time.Second
+
 	// JobKindDataExport builds one export document.
 	JobKindDataExport = "privacy.data_export"
 	// JobKindErase erases one user's data in one tenant.
@@ -44,6 +49,13 @@ const (
 
 	exportPurgeBatchSize = 100
 	exportPurgeBudget    = time.Minute
+	// exportDocumentByteLimit is the total in-memory budget for one JSON
+	// export. Providers bound themselves too, but six 64 MiB sections would
+	// still put an unbounded document on the worker heap. The allowance lets
+	// one provider section at its own byte ceiling still fit after JSON
+	// framing.
+	exportDocumentOverheadAllowance = int64(8 << 10)
+	exportDocumentByteLimit         = privacycontracts.DefaultByteLimit + exportDocumentOverheadAllowance
 
 	// identityProviderName is identity's own privacy provider. Its eraser
 	// removes the membership, so it runs last in a tenant erase job.
@@ -75,10 +87,12 @@ type FinalizeJob struct {
 }
 
 type ExportDocument struct {
-	UserID      uuid.UUID                  `json:"userId"`
-	TenantID    uuid.UUID                  `json:"tenantId"`
-	GeneratedAt time.Time                  `json:"generatedAt"`
-	Sections    map[string]json.RawMessage `json:"sections"`
+	UserID            uuid.UUID                  `json:"userId"`
+	TenantID          uuid.UUID                  `json:"tenantId"`
+	GeneratedAt       time.Time                  `json:"generatedAt"`
+	Sections          map[string]json.RawMessage `json:"sections"`
+	Truncated         bool                       `json:"truncated"`
+	TruncatedSections []string                   `json:"truncatedSections,omitempty"`
 }
 
 type identityExport struct {
@@ -120,7 +134,11 @@ type identityExport struct {
 	InvitationsReceived []invitationExport `json:"invitationsReceived"`
 	// AuditEvents is capped at privacyAuditEventLimit, newest first. Only the
 	// user's own rows are included; audit metadata is never exported.
-	AuditEvents []auditEventExport `json:"auditEvents"`
+	AuditEvents          []auditEventExport      `json:"auditEvents"`
+	AuditEventsTruncated bool                    `json:"auditEventsTruncated,omitempty"`
+	Budget               privacycontracts.Budget `json:"budget"`
+	Truncated            bool                    `json:"truncated"`
+	OmittedCollections   []string                `json:"omittedCollections,omitempty"`
 }
 
 type externalIdentityExport struct {
@@ -179,10 +197,10 @@ const (
 // IdentityExportRepository is the identity-only read side of the export:
 // linked external identities, current role assignments, and invitations.
 type IdentityExportRepository interface {
-	ListExternalIdentities(ctx context.Context, userID uuid.UUID) ([]ExternalIdentityExport, error)
-	ListRoleAssignments(ctx context.Context, tenantID, userID uuid.UUID) ([]RoleAssignmentExport, error)
-	ListInvitationsSent(ctx context.Context, tenantID, userID uuid.UUID) ([]InvitationExport, error)
-	ListInvitationsReceived(ctx context.Context, tenantID, userID uuid.UUID, email string) ([]InvitationExport, error)
+	ListExternalIdentities(ctx context.Context, userID uuid.UUID, limit int32) ([]ExternalIdentityExport, bool, error)
+	ListRoleAssignments(ctx context.Context, tenantID, userID uuid.UUID, limit int32) ([]RoleAssignmentExport, bool, error)
+	ListInvitationsSent(ctx context.Context, tenantID, userID uuid.UUID, limit int32) ([]InvitationExport, bool, error)
+	ListInvitationsReceived(ctx context.Context, tenantID, userID uuid.UUID, email string, limit int32) ([]InvitationExport, bool, error)
 }
 
 // ExternalIdentityExport is one linked provider account without any token.
@@ -370,17 +388,48 @@ func (s *PrivacyService) DownloadExport(ctx context.Context, userID, id uuid.UUI
 // The request transaction reserves every membership (suspends it under the
 // tenant owner lock and revokes its sessions), so the account cannot act while
 // the erase jobs are pending.
-func (s *PrivacyService) RequestSelfErasure(ctx context.Context, userID uuid.UUID, password string) error {
-	if s.verifier == nil {
-		return apperror.NewInternal("password verification is not configured")
-	}
-	if err := s.verifier.VerifyPassword(ctx, userID, password); err != nil {
+func (s *PrivacyService) RequestSelfErasure(ctx context.Context, userID uuid.UUID, password string, sessionID uuid.UUID) error {
+	if err := s.reauthenticateSelfErasure(ctx, userID, password, sessionID); err != nil {
 		return err
 	}
 	if err := s.RequestErasure(ctx, userID, "user.erasure_requested"); err != nil {
 		return err
 	}
 	invalidateSessions(ctx, s.sessionCache, userID)
+	return nil
+}
+
+// reauthenticateSelfErasure follows the MFA and passkey rule: an account with a
+// password proves the current password, while a passwordless (OAuth-only)
+// account proves possession of an interactive session no older than
+// core.ReauthSessionMaxAge. Without the fallback an OAuth-only user could never
+// exercise the right to erasure, and a stolen access token alone is still not
+// enough.
+func (s *PrivacyService) reauthenticateSelfErasure(ctx context.Context, userID uuid.UUID, password string, sessionID uuid.UUID) error {
+	user, err := s.stores.Users.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewNotFound("user not found")
+		}
+		return apperror.NewInternal("failed to load user")
+	}
+	if user.HasPassword {
+		if s.verifier == nil {
+			return apperror.NewInternal("password verification is not configured")
+		}
+		if password == "" {
+			return apperror.NewBadRequest("current password is required")
+		}
+		return s.verifier.VerifyPassword(ctx, userID, password)
+	}
+	live, err := core.RecentSessionIsLive(ctx, s.stores, userID, sessionID, time.Now())
+	if err != nil {
+		return apperror.NewInternal("failed to load session")
+	}
+	if !live {
+		return apperror.NewCode(identitycatalog.CodeAuthMFAReauthRequired,
+			"sign in again before erasing the account")
+	}
 	return nil
 }
 
@@ -407,6 +456,58 @@ func (s *PrivacyService) GetErasureRequest(ctx context.Context, userID, id uuid.
 	return s.selfErasureRequest(ctx, userID)
 }
 
+// GetMemberErasureRequest returns the tenant-scoped admin erasure status for a
+// member. The request id is the target member id: a membership has at most one
+// active erasure request, and another member's id is not visible.
+func (s *PrivacyService) GetMemberErasureRequest(ctx context.Context, userID, requestID uuid.UUID) (*ErasureRequest, error) {
+	if requestID != userID {
+		return nil, apperror.NewNotFound("erasure request not found")
+	}
+	// Reading a member's status follows the same rank rule as requesting the
+	// erasure. A membership removed by a completed erasure has no rank left to
+	// compare, so ErrNotFound is tolerated: the audit row still answers the
+	// request and the caller already holds admin:users:delete.
+	if err := EnsureCanManageMember(ctx, s.stores, userID); err != nil && !errors.Is(err, apperror.ErrNotFound) {
+		return nil, err
+	}
+	if s.auditEvents == nil {
+		return nil, apperror.NewNotFound("erasure request not found")
+	}
+	tenantID := tenant.IDFromContext(ctx)
+	// The admin is the actor and the member is the resource of an admin
+	// erasure, so the status row is read by resource, not by actor.
+	event, found, err := s.auditEvents.LatestUserTargetEvent(ctx, tenantID, userID, "admin.user.erasure_requested")
+	if err != nil {
+		return nil, apperror.Internal(err, "failed to load erasure request")
+	}
+	if !found {
+		return nil, apperror.NewNotFound("erasure request not found")
+	}
+	requestedAt := event.CreatedAt
+	request := &ErasureRequest{
+		ID:          userID,
+		TenantID:    tenantID,
+		UserID:      userID,
+		Scope:       ErasureScopeMember,
+		Status:      ErasureQueued,
+		RequestedAt: requestedAt,
+	}
+	member, err := s.stores.Memberships.Get(ctx, userID)
+	switch {
+	case errors.Is(err, apperror.ErrNotFound):
+		request.Status = ErasureCompleted
+		request.CompletedAt = &requestedAt
+	case err != nil:
+		return nil, apperror.Internal(err, "failed to load erasure request")
+	case member.Membership.Status == MembershipStatusRemoved:
+		request.Status = ErasureCompleted
+		request.CompletedAt = member.Membership.RemovedAt
+	default:
+		request.Status = ErasureProcessing
+	}
+	return request, nil
+}
+
 // selfErasureRequest derives the status resource from the request's audit row
 // and the membership's current erasure reservation.
 func (s *PrivacyService) selfErasureRequest(ctx context.Context, userID uuid.UUID) (*ErasureRequest, error) {
@@ -414,20 +515,14 @@ func (s *PrivacyService) selfErasureRequest(ctx context.Context, userID uuid.UUI
 		return nil, apperror.NewNotFound("erasure request not found")
 	}
 	tenantID := tenant.IDFromContext(ctx)
-	userEvents, err := s.auditEvents.ListUserEvents(ctx, tenantID, userID, 100)
+	event, found, err := s.auditEvents.LatestUserActorEvent(ctx, tenantID, userID, "user.erasure_requested")
 	if err != nil {
 		return nil, apperror.Internal(err, "failed to load erasure requests")
-	}
-	requestedAt, found := time.Time{}, false
-	for _, event := range userEvents {
-		if event.Action == "user.erasure_requested" {
-			requestedAt, found = event.CreatedAt, true
-			break
-		}
 	}
 	if !found {
 		return nil, apperror.NewNotFound("erasure request not found")
 	}
+	requestedAt := event.CreatedAt
 	request := &ErasureRequest{
 		ID:          userID,
 		TenantID:    tenantID,
@@ -479,51 +574,63 @@ func enqueueEraseJob(ctx context.Context, queue JobEnqueuer, userID uuid.UUID) e
 // concurrent one) sees the reservation and acts on the remaining owners.
 func (s *PrivacyService) RequestAdminErasure(ctx context.Context, userID uuid.UUID) error {
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		if tx.Privacy == nil || tx.Jobs == nil {
-			return apperror.NewInternal("privacy services are not configured")
-		}
-		if err := EnsureCanManageMember(ctx, tx.Stores, userID); err != nil {
-			return err
-		}
-		member, err := tx.Memberships.Get(ctx, userID)
-		if err != nil {
-			if errors.Is(err, apperror.ErrNotFound) {
-				return apperror.NewNotFound("user not found")
-			}
-			return apperror.NewInternal("failed to get user")
-		}
-		// A cross-tenant id and a member who already left both look absent.
-		if member.Membership.Status == MembershipStatusRemoved {
-			return apperror.NewNotFound("user not found")
-		}
-		if member.Membership.Status == MembershipStatusActive && member.Membership.Role == RoleOwner {
-			if err := ensureNotLastOwner(ctx, tx.Memberships, "cannot erase the last active owner"); err != nil {
-				return err
-			}
-		}
-		if err := tx.Memberships.SuspendForErasure(ctx, userID); err != nil {
-			if errors.Is(err, apperror.ErrNotFound) {
-				return apperror.NewNotFound("user not found")
-			}
-			return apperror.NewInternal("failed to reserve the member for erasure")
-		}
-		if err := tx.Sessions.RevokeAllInTenant(ctx, userID, RevokeMembershipChanged); err != nil {
-			return apperror.NewInternal("failed to revoke sessions")
-		}
-		if _, err := tx.Privacy.ExpireForUser(ctx, userID); err != nil {
-			return apperror.NewInternal("failed to expire data exports")
-		}
-		if err := enqueueEraseJob(ctx, tx.Jobs, userID); err != nil {
-			return err
-		}
-		event := userEvent(ctx, "admin.user.erasure_requested", userID, map[string]any{"scope": "tenant"})
-		return checkAudit(tx.Audit.RecordTx(ctx, event))
+		return s.requestAdminErasureInTx(ctx, tx, userID)
 	})
 	if err != nil {
 		return err
 	}
 	invalidateSessions(ctx, s.sessionCache, userID)
 	return nil
+}
+
+func (s *PrivacyService) requestAdminErasureInTx(ctx context.Context, tx TxRepos, userID uuid.UUID) error {
+	if tx.Privacy == nil || tx.Jobs == nil {
+		return apperror.NewInternal("privacy services are not configured")
+	}
+	if err := EnsureCanManageMember(ctx, tx.Stores, userID); err != nil {
+		return err
+	}
+	member, err := tx.Memberships.Get(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewNotFound("user not found")
+		}
+		return apperror.NewInternal("failed to get user")
+	}
+	// A cross-tenant id and a member who already left both look absent.
+	if member.Membership.Status == MembershipStatusRemoved {
+		return apperror.NewNotFound("user not found")
+	}
+	// EnsureCanManageMember holds this row FOR UPDATE for the rest of the
+	// transaction, so a concurrent duplicate waits here and then sees the
+	// reservation committed by the first request. A replay must not reset
+	// the request time or enqueue a second erase job.
+	if member.Membership.ErasureRequestedAt != nil {
+		return checkAudit(tx.Audit.RecordTx(ctx,
+			userEvent(ctx, "admin.user.erasure_replayed", userID, map[string]any{"scope": "tenant"})))
+	}
+	if member.Membership.Status == MembershipStatusActive && member.Membership.Role == RoleOwner {
+		if err := ensureNotLastOwner(ctx, tx.Memberships, "cannot erase the last active owner"); err != nil {
+			return err
+		}
+	}
+	if err := tx.Memberships.SuspendForErasure(ctx, userID); err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewNotFound("user not found")
+		}
+		return apperror.NewInternal("failed to reserve the member for erasure")
+	}
+	if err := tx.Sessions.RevokeAllInTenant(ctx, userID, RevokeMembershipChanged); err != nil {
+		return apperror.NewInternal("failed to revoke sessions")
+	}
+	if err := tx.Privacy.ExpireForUser(ctx, userID); err != nil {
+		return apperror.NewInternal("failed to expire data exports")
+	}
+	if err := enqueueEraseJob(ctx, tx.Jobs, userID); err != nil {
+		return err
+	}
+	event := userEvent(ctx, "admin.user.erasure_requested", userID, map[string]any{"scope": "tenant"})
+	return checkAudit(tx.Audit.RecordTx(ctx, event))
 }
 
 // requestErasure refuses to erase the last active owner of any tenant, then
@@ -558,7 +665,7 @@ func (s *PrivacyService) RequestErasure(ctx context.Context, userID uuid.UUID, a
 			if !queue {
 				continue
 			}
-			if _, err := tx.Privacy.ExpireForUser(tctx, userID); err != nil {
+			if err := tx.Privacy.ExpireForUser(tctx, userID); err != nil {
 				return apperror.NewInternal("failed to expire data exports")
 			}
 			if _, err := tx.Jobs.Enqueue(tctx, jobs.Job{
@@ -624,17 +731,62 @@ func reserveMembershipForErasure(ctx context.Context, tx TxRepos, userID uuid.UU
 // Export implements privacy.Exporter for identity's own data.
 func (s *PrivacyService) Export(ctx context.Context, tenantID, userID uuid.UUID) (privacycontracts.Section, error) {
 	tctx := tenant.WithID(ctx, tenantID)
-	user, err := s.stores.Users.GetByID(tctx, userID)
+	out, truncated, err := s.loadIdentityExportBase(tctx, userID)
 	if err != nil {
 		return privacycontracts.Section{}, err
 	}
-	member, err := s.stores.Memberships.Get(tctx, userID)
+	if s.exportStore != nil {
+		relationsTruncated, err := s.addIdentityExportRelations(tctx, tenantID, userID, out.Profile.Email, &out)
+		if err != nil {
+			return privacycontracts.Section{}, err
+		}
+		truncated = truncated || relationsTruncated
+	}
+	normalizeIdentityExportSlices(&out)
+
+	mfa, err := s.exportMFAStatus(tctx, userID)
 	if err != nil {
 		return privacycontracts.Section{}, err
 	}
-	sessions, err := s.stores.Privacy.ListSessions(tctx, userID)
+	out.MFA = mfa
+
+	passkeys, passkeysTruncated, err := s.exportPasskeys(tctx, userID)
 	if err != nil {
 		return privacycontracts.Section{}, err
+	}
+	truncated = truncated || passkeysTruncated
+	out.Passkeys = passkeys
+
+	auditTruncated, err := s.addIdentityAuditEvents(tctx, tenantID, userID, &out)
+	if err != nil {
+		return privacycontracts.Section{}, err
+	}
+	truncated = truncated || auditTruncated
+
+	out.Truncated = truncated
+	out.Budget = privacycontracts.Budget{
+		RowLimit: privacycontracts.DefaultRowLimit, ByteLimit: privacycontracts.DefaultByteLimit,
+		Returned: identityExportRowCount(&out), Truncated: truncated,
+	}
+	data, err := marshalIdentityExport(&out)
+	if err != nil {
+		return privacycontracts.Section{}, err
+	}
+	return privacycontracts.Section{Name: "identity", Data: data, Truncated: out.Truncated}, nil
+}
+
+func (s *PrivacyService) loadIdentityExportBase(ctx context.Context, userID uuid.UUID) (identityExport, bool, error) {
+	user, err := s.stores.Users.GetByID(ctx, userID)
+	if err != nil {
+		return identityExport{}, false, err
+	}
+	member, err := s.stores.Memberships.Get(ctx, userID)
+	if err != nil {
+		return identityExport{}, false, err
+	}
+	sessions, truncated, err := s.stores.Privacy.ListSessions(ctx, userID, privacycontracts.DefaultRowLimit)
+	if err != nil {
+		return identityExport{}, false, err
 	}
 
 	var out identityExport
@@ -660,34 +812,51 @@ func (s *PrivacyService) Export(ctx context.Context, tenantID, userID uuid.UUID)
 			RevokedAt: sess.RevokedAt, RevokedReason: string(sess.RevokedReason),
 		}
 	}
-	if s.exportStore != nil {
-		identities, err := s.exportStore.ListExternalIdentities(tctx, userID)
-		if err != nil {
-			return privacycontracts.Section{}, err
-		}
-		out.Identities = make([]externalIdentityExport, len(identities))
-		for i, identity := range identities {
-			out.Identities[i] = externalIdentityExport(identity)
-		}
-		roles, err := s.exportStore.ListRoleAssignments(tctx, tenantID, userID)
-		if err != nil {
-			return privacycontracts.Section{}, err
-		}
-		out.RoleAssignments = make([]roleAssignmentExport, len(roles))
-		for i, role := range roles {
-			out.RoleAssignments[i] = roleAssignmentExport(role)
-		}
-		sent, err := s.exportStore.ListInvitationsSent(tctx, tenantID, userID)
-		if err != nil {
-			return privacycontracts.Section{}, err
-		}
-		out.InvitationsSent = toInvitationExports(sent)
-		received, err := s.exportStore.ListInvitationsReceived(tctx, tenantID, userID, user.Email)
-		if err != nil {
-			return privacycontracts.Section{}, err
-		}
-		out.InvitationsReceived = toInvitationExports(received)
+	return out, truncated, nil
+}
+
+func (s *PrivacyService) addIdentityExportRelations(
+	ctx context.Context,
+	tenantID, userID uuid.UUID,
+	email string,
+	out *identityExport,
+) (bool, error) {
+	identities, identitiesTruncated, err := s.exportStore.ListExternalIdentities(ctx, userID, privacycontracts.DefaultRowLimit)
+	if err != nil {
+		return false, err
 	}
+	out.Identities = make([]externalIdentityExport, len(identities))
+	for i, identity := range identities {
+		out.Identities[i] = externalIdentityExport(identity)
+	}
+
+	roles, rolesTruncated, err := s.exportStore.ListRoleAssignments(ctx, tenantID, userID, privacycontracts.DefaultRowLimit)
+	if err != nil {
+		return false, err
+	}
+	out.RoleAssignments = make([]roleAssignmentExport, len(roles))
+	for i, role := range roles {
+		out.RoleAssignments[i] = roleAssignmentExport(role)
+	}
+
+	sent, sentTruncated, err := s.exportStore.ListInvitationsSent(ctx, tenantID, userID, privacycontracts.DefaultRowLimit)
+	if err != nil {
+		return false, err
+	}
+	out.InvitationsSent = toInvitationExports(sent)
+
+	received, receivedTruncated, err := s.exportStore.ListInvitationsReceived(
+		ctx, tenantID, userID, email, privacycontracts.DefaultRowLimit,
+	)
+	if err != nil {
+		return false, err
+	}
+	out.InvitationsReceived = toInvitationExports(received)
+
+	return identitiesTruncated || rolesTruncated || sentTruncated || receivedTruncated, nil
+}
+
+func normalizeIdentityExportSlices(out *identityExport) {
 	if out.Identities == nil {
 		out.Identities = []externalIdentityExport{}
 	}
@@ -700,41 +869,74 @@ func (s *PrivacyService) Export(ctx context.Context, tenantID, userID uuid.UUID)
 	if out.InvitationsReceived == nil {
 		out.InvitationsReceived = []invitationExport{}
 	}
+}
 
-	mfa, err := s.exportMFAStatus(tctx, userID)
-	if err != nil {
-		return privacycontracts.Section{}, err
-	}
-	out.MFA = mfa
-
-	passkeys, err := s.exportPasskeys(tctx, userID)
-	if err != nil {
-		return privacycontracts.Section{}, err
-	}
-	out.Passkeys = passkeys
-
-	if s.auditEvents != nil {
-		userEvents, err := s.auditEvents.ListUserEvents(tctx, tenantID, userID, privacyAuditEventLimit)
-		if err != nil {
-			return privacycontracts.Section{}, err
-		}
-		out.AuditEvents = make([]auditEventExport, len(userEvents))
-		for i, event := range userEvents {
-			out.AuditEvents[i] = auditEventExport{
-				Action: event.Action, CreatedAt: event.CreatedAt,
-				IP: event.IP, UserAgent: event.UserAgent,
-				Resource: event.Resource, ResourceID: event.ResourceID, Outcome: event.Outcome,
-			}
-		}
-	}
-	if out.AuditEvents == nil {
+func (s *PrivacyService) addIdentityAuditEvents(
+	ctx context.Context,
+	tenantID, userID uuid.UUID,
+	out *identityExport,
+) (bool, error) {
+	if s.auditEvents == nil {
 		out.AuditEvents = []auditEventExport{}
+		return false, nil
 	}
+	page, err := s.auditEvents.ListUserEvents(ctx, tenantID, userID, privacyAuditEventLimit)
+	if err != nil {
+		return false, err
+	}
+	out.AuditEventsTruncated = page.Truncated
+	out.AuditEvents = make([]auditEventExport, len(page.Events))
+	for i, event := range page.Events {
+		out.AuditEvents[i] = auditEventExport{
+			Action: event.Action, CreatedAt: event.CreatedAt,
+			IP: event.IP, UserAgent: event.UserAgent,
+			Resource: event.Resource, ResourceID: event.ResourceID, Outcome: event.Outcome,
+		}
+	}
+	return page.Truncated, nil
+}
+
+func identityExportRowCount(out *identityExport) int {
+	return len(out.Sessions) + len(out.Identities) + len(out.Passkeys) + len(out.RoleAssignments) +
+		len(out.InvitationsSent) + len(out.InvitationsReceived) + len(out.AuditEvents)
+}
+
+func marshalIdentityExport(out *identityExport) ([]byte, error) {
 	data, err := json.Marshal(out)
 	if err != nil {
-		return privacycontracts.Section{}, fmt.Errorf("marshal identity export: %w", err)
+		return nil, fmt.Errorf("marshal identity export: %w", err)
 	}
-	return privacycontracts.Section{Name: "identity", Data: data}, nil
+	if int64(len(data)) <= privacycontracts.DefaultByteLimit {
+		return data, nil
+	}
+	// The per-collection row limits keep normal exports far below this
+	// ceiling. If unusual field sizes still exceed it, keep the bounded
+	// profile/membership/MFA facts and mark the collections as omitted
+	// instead of writing an unbounded document.
+	omitIdentityExportCollections(out)
+	data, err = json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("marshal bounded identity export: %w", err)
+	}
+	return data, nil
+}
+
+func omitIdentityExportCollections(out *identityExport) {
+	out.Sessions = []sessionExport{}
+	out.Identities = []externalIdentityExport{}
+	out.Passkeys = []passkeyExport{}
+	out.RoleAssignments = []roleAssignmentExport{}
+	out.InvitationsSent = []invitationExport{}
+	out.InvitationsReceived = []invitationExport{}
+	out.AuditEvents = []auditEventExport{}
+	out.AuditEventsTruncated = true
+	out.OmittedCollections = []string{
+		"sessions", "identities", "passkeys", "roleAssignments",
+		"invitationsSent", "invitationsReceived", "auditEvents",
+	}
+	out.Truncated = true
+	out.Budget.Returned = 0
+	out.Budget.Truncated = true
 }
 
 // exportMFAStatus reports configuration only: the sealed secret and the
@@ -763,13 +965,13 @@ func (s *PrivacyService) exportMFAStatus(ctx context.Context, userID uuid.UUID) 
 
 // exportPasskeys lists the user's passkeys by name and lifecycle only. The
 // credential id, public key, and AAGUID stay out of the export.
-func (s *PrivacyService) exportPasskeys(ctx context.Context, userID uuid.UUID) ([]passkeyExport, error) {
+func (s *PrivacyService) exportPasskeys(ctx context.Context, userID uuid.UUID) ([]passkeyExport, bool, error) {
 	if s.stores.Passkeys == nil {
-		return []passkeyExport{}, nil
+		return []passkeyExport{}, false, nil
 	}
-	passkeys, err := s.stores.Passkeys.ListByUser(ctx, userID)
+	passkeys, truncated, err := s.stores.Passkeys.ListByUserLimited(ctx, userID, privacycontracts.DefaultRowLimit)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	out := make([]passkeyExport, len(passkeys))
 	for i, passkey := range passkeys {
@@ -779,7 +981,7 @@ func (s *PrivacyService) exportPasskeys(ctx context.Context, userID uuid.UUID) (
 			LastUsedAt: passkey.LastUsedAt,
 		}
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 func toInvitationExports(invitations []InvitationExport) []invitationExport {
@@ -841,19 +1043,34 @@ func (s *PrivacyService) Erase(ctx context.Context, tenantID, userID uuid.UUID) 
 // as deleted), then deletes the rows. Already-expired rows are included, so an
 // erasure request that pre-expired them cannot strand their documents.
 func (s *PrivacyService) eraseExports(ctx context.Context, userID uuid.UUID) error {
-	if _, err := s.stores.Privacy.ExpireForUser(ctx, userID); err != nil {
+	if err := s.stores.Privacy.ExpireForUser(ctx, userID); err != nil {
 		return fmt.Errorf("expire data exports: %w", err)
 	}
-	exports, err := s.stores.Privacy.ListForUser(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("list data exports: %w", err)
-	}
-	for _, export := range exports {
-		if export.StoragePath == "" {
-			continue
+	cur := pagination.DBCursor{Limit: pagination.RowLimit(exportPurgeBatchSize + 1)}
+	for {
+		exports, err := s.stores.Privacy.ListCursor(ctx, userID, cur)
+		if err != nil {
+			return fmt.Errorf("list data exports: %w", err)
 		}
-		if err := s.storage.Delete(ctx, export.StoragePath); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("delete data export %s: %w", export.ID, err)
+		hasMore := len(exports) > exportPurgeBatchSize
+		if hasMore {
+			exports = exports[:exportPurgeBatchSize]
+		}
+		for _, export := range exports {
+			if export.StoragePath == "" {
+				continue
+			}
+			if err := s.storage.Delete(ctx, export.StoragePath); err != nil && !errors.Is(err, storage.ErrNotFound) {
+				return fmt.Errorf("delete data export %s: %w", export.ID, err)
+			}
+		}
+		if !hasMore {
+			break
+		}
+		last := exports[len(exports)-1]
+		cur = pagination.DBCursor{
+			HasCursor: true, CreatedAt: last.CreatedAt, ID: last.ID,
+			Limit: pagination.RowLimit(exportPurgeBatchSize + 1),
 		}
 	}
 	if err := s.stores.Privacy.DeleteForUser(ctx, userID); err != nil {
@@ -904,11 +1121,11 @@ func (s *PrivacyService) HandleExportJob(ctx context.Context, payload json.RawMe
 	expires := time.Now().Add(DataExportTTL)
 	ready, err := s.stores.Privacy.MarkReady(ctx, in.UserID, in.ExportID, path, expires)
 	if err != nil {
-		_ = s.storage.Delete(context.WithoutCancel(ctx), path)
+		s.deleteExportBlob(ctx, path)
 		return fmt.Errorf("mark data export ready: %w", err)
 	}
 	if !ready {
-		_ = s.storage.Delete(context.WithoutCancel(ctx), path)
+		s.deleteExportBlob(ctx, path)
 		return nil
 	}
 	finished = true
@@ -925,6 +1142,7 @@ func (s *PrivacyService) HandleExportJob(ctx context.Context, payload json.RawMe
 		}
 		event.TenantID = export.TenantID
 		event.Actor = events.UserActor(in.UserID)
+		event.SubjectUserIDs = []uuid.UUID{in.UserID}
 		if err := s.events.Publish(ctx, event); err != nil {
 			// The export is ready; the notification is a durable subscription,
 			// so a publish failure is logged and the job row (if it committed)
@@ -934,6 +1152,18 @@ func (s *PrivacyService) HandleExportJob(ctx context.Context, payload json.RawMe
 		}
 	}
 	return nil
+}
+
+// deleteExportBlob removes an orphaned export object after the metadata state
+// could not claim it. The job context may be canceled, so the cleanup is
+// detached but still bounded.
+func (s *PrivacyService) deleteExportBlob(ctx context.Context, path string) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), exportCleanupTimeout)
+	defer cancel()
+	if err := s.storage.Delete(cleanupCtx, path); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		slog.Warn("failed to delete orphaned data export",
+			slog.String("path", path), slog.Any("error", err))
+	}
 }
 
 // markExportFailed records a terminal failure even when the job context was
@@ -949,12 +1179,22 @@ func (s *PrivacyService) markExportFailed(ctx context.Context, userID, exportID 
 }
 
 func (s *PrivacyService) buildExportDocument(ctx context.Context, export *DataExport) ([]byte, error) {
+	return s.buildExportDocumentWithLimit(ctx, export, exportDocumentByteLimit)
+}
+
+func (s *PrivacyService) buildExportDocumentWithLimit(ctx context.Context, export *DataExport, limit int64) ([]byte, error) {
 	doc := ExportDocument{
 		UserID:      export.UserID,
 		TenantID:    export.TenantID,
 		GeneratedAt: time.Now().UTC(),
 		Sections:    map[string]json.RawMessage{},
 	}
+	base, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal empty data export: %w", err)
+	}
+	used := int64(len(base))
+	included := make([]string, 0, 6)
 	if s.registry != nil {
 		for _, provider := range s.registry.Providers() {
 			section, err := provider.Exporter.Export(ctx, export.TenantID, export.UserID)
@@ -964,14 +1204,46 @@ func (s *PrivacyService) buildExportDocument(ctx context.Context, export *DataEx
 			if len(section.Data) == 0 || !json.Valid(section.Data) {
 				return nil, fmt.Errorf("export %s: section is not valid JSON", provider.Name)
 			}
+			if section.Truncated {
+				markExportSectionTruncated(&doc, provider.Name)
+			}
+			sectionCost := int64(len(provider.Name)+len(section.Data)) + 8
+			if used+sectionCost > limit {
+				markExportSectionTruncated(&doc, provider.Name)
+				continue
+			}
 			doc.Sections[provider.Name] = section.Data
+			used += sectionCost
+			included = append(included, provider.Name)
 		}
 	}
-	raw, err := json.Marshal(doc)
-	if err != nil {
-		return nil, fmt.Errorf("marshal data export: %w", err)
+	for {
+		raw, err := json.Marshal(doc)
+		if err != nil {
+			return nil, fmt.Errorf("marshal data export: %w", err)
+		}
+		if int64(len(raw)) <= limit {
+			return raw, nil
+		}
+		if len(included) == 0 {
+			return nil, fmt.Errorf("export document exceeds its %d-byte budget", limit)
+		}
+		last := len(included) - 1
+		name := included[last]
+		delete(doc.Sections, name)
+		included = included[:last]
+		markExportSectionTruncated(&doc, name)
 	}
-	return raw, nil
+}
+
+func markExportSectionTruncated(doc *ExportDocument, name string) {
+	doc.Truncated = true
+	for _, existing := range doc.TruncatedSections {
+		if existing == name {
+			return
+		}
+	}
+	doc.TruncatedSections = append(doc.TruncatedSections, name)
 }
 
 // HandleEraseJob runs every tenant Eraser, identity's own eraser last: it

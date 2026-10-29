@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,13 +21,14 @@ type fakeStore struct {
 	notifications []Notification
 	preferences   []Preference
 	deleted       bool
+	truncated     bool
 }
 
-func (f *fakeStore) ListNotifications(context.Context, uuid.UUID, uuid.UUID) ([]Notification, error) {
-	return f.notifications, nil
+func (f *fakeStore) ListNotifications(context.Context, uuid.UUID, uuid.UUID, int32) ([]Notification, bool, error) {
+	return f.notifications, f.truncated, nil
 }
-func (f *fakeStore) ListPreferences(context.Context, uuid.UUID, uuid.UUID) ([]Preference, error) {
-	return f.preferences, nil
+func (f *fakeStore) ListPreferences(context.Context, uuid.UUID, uuid.UUID, int32) ([]Preference, bool, error) {
+	return f.preferences, f.truncated, nil
 }
 func (f *fakeStore) DeleteAll(context.Context, uuid.UUID, uuid.UUID) error {
 	f.deleted = true
@@ -62,4 +64,42 @@ func TestEraseDeletesFeedAndPreferences(t *testing.T) {
 	store := &fakeStore{}
 	require.NoError(t, New(store).Erase(context.Background(), testID(1), testID(10)))
 	assert.True(t, store.deleted)
+}
+
+func TestExportMarksStoreTruncation(t *testing.T) {
+	store := &fakeStore{
+		notifications: []Notification{{ID: testID(1), Type: "security.alert", Title: "Hi", Body: "Body", CreatedAt: time.Now()}},
+		truncated:     true,
+	}
+	section, err := New(store).Export(context.Background(), testID(1), testID(10))
+	require.NoError(t, err)
+	var out struct {
+		Budget struct {
+			Truncated bool `json:"truncated"`
+			Returned  int  `json:"returned"`
+		} `json:"budget"`
+	}
+	require.NoError(t, json.Unmarshal(section.Data, &out))
+	assert.True(t, section.Truncated)
+	assert.True(t, out.Budget.Truncated)
+	assert.Equal(t, 1, out.Budget.Returned)
+}
+
+func TestExportStopsAtSectionByteBudget(t *testing.T) {
+	store := &fakeStore{notifications: []Notification{
+		{ID: testID(1), Type: "security.alert", Title: "One", Body: strings.Repeat("a", 200), CreatedAt: time.Now()},
+		{ID: testID(2), Type: "security.alert", Title: "Two", Body: strings.Repeat("b", 200), CreatedAt: time.Now()},
+	}}
+	provider := New(store)
+	provider.byteLimit = 1500
+	section, err := provider.Export(context.Background(), testID(1), testID(10))
+	require.NoError(t, err)
+	var out struct {
+		Notifications []struct {
+			ID string `json:"id"`
+		} `json:"notifications"`
+	}
+	require.NoError(t, json.Unmarshal(section.Data, &out))
+	require.Len(t, out.Notifications, 1)
+	assert.True(t, section.Truncated)
 }

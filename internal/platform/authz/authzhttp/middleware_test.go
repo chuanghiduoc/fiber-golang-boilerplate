@@ -244,6 +244,7 @@ func TestRequireMFA(t *testing.T) {
 		"passkey hardware fresh":   {amr: []string{"hwk"}, verifiedAt: fresh, want: fiber.StatusOK},
 		"passkey software fresh":   {amr: []string{"swk"}, verifiedAt: fresh, want: fiber.StatusOK},
 		"totp older than max age":  {amr: []string{"pwd", "otp"}, verifiedAt: fresh.Add(-13 * time.Hour), want: fiber.StatusForbidden},
+		"totp from the future":     {amr: []string{"pwd", "otp"}, verifiedAt: fresh.Add(time.Hour), want: fiber.StatusForbidden},
 		"totp without a timestamp": {amr: []string{"pwd", "otp"}, want: fiber.StatusForbidden},
 	}
 	for name, tc := range cases {

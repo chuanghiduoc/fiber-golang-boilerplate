@@ -18,8 +18,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// captureEmails records notifications; it implements both core.Mailer (the
-// transactional outbox) and email.Sender (the after-commit fallback).
+// captureEmails records messages enqueued on the transactional outbox.
 type captureEmails struct {
 	mu   sync.Mutex
 	msgs []email.Message
@@ -52,8 +51,8 @@ func (c *captureEmails) count() int {
 
 // notifierFor builds a notifier over the fake tenant settings and the
 // transaction's mail outbox.
-func notifierFor(db *fakes.MemDB, sender email.Sender) *authn.SecurityNotifier {
-	return authn.NewSecurityNotifier(db.Stores().Tenants, sender)
+func notifierFor(db *fakes.MemDB) *authn.SecurityNotifier {
+	return authn.NewSecurityNotifier(db.Stores().Tenants)
 }
 
 func seedNotifiableUser(t *testing.T, db *fakes.MemDB, id uuid.UUID, emailAddr string) *core.Member {
@@ -80,7 +79,7 @@ func TestSecurityNotifications_BuildLocalizedEmails(t *testing.T) {
 	db := fakes.New()
 	mail := &captureEmails{}
 	db.Mail = mail
-	n := notifierFor(db, nil)
+	n := notifierFor(db)
 	ctx := audit.WithRequestMeta(fakes.TenantCtx(), "req-1", "203.0.113.9", "TestBrowser/1.0")
 	at := time.Date(2026, 10, 26, 9, 30, 0, 0, time.UTC)
 
@@ -141,7 +140,7 @@ func TestSecurityNotifications_UsesTenantLocale(t *testing.T) {
 	db.Locale = "vi"
 	mail := &captureEmails{}
 	db.Mail = mail
-	n := notifierFor(db, nil)
+	n := notifierFor(db)
 
 	if err := n.Deliver(fakes.TenantCtx(), core.TxRepos{Mail: mail}, authn.SecurityNotice{
 		Event: authn.SecurityEventPasswordChanged, UserID: fakes.TestID(1), Name: "A", Email: "a@example.com",
@@ -157,28 +156,24 @@ func TestSecurityNotifications_UsesTenantLocale(t *testing.T) {
 	}
 }
 
-// Without a transactional outbox the notifier never sends before the caller
-// commits; it hands back the post-commit function instead.
-func TestSecurityNotifications_AfterCommitFallback(t *testing.T) {
+// A missing transactional outbox is a wiring error. It must fail the change
+// rather than send directly or silently drop a security alert.
+func TestSecurityNotifications_RequireTransactionalOutbox(t *testing.T) {
 	db := fakes.New()
-	sender := &captureEmails{}
-	n := notifierFor(db, sender)
+	n := notifierFor(db)
 
-	var afterCommit func()
-	if err := n.Deliver(fakes.TenantCtx(), core.TxRepos{AfterCommit: func(f func()) { afterCommit = f }}, authn.SecurityNotice{
+	afterCommitCalled := false
+	err := n.Deliver(fakes.TenantCtx(), core.TxRepos{AfterCommit: func(f func()) {
+		afterCommitCalled = true
+		f()
+	}}, authn.SecurityNotice{
 		Event: authn.SecurityEventPasswordChanged, UserID: fakes.TestID(1), Name: "A", Email: "a@example.com",
-	}); err != nil {
-		t.Fatal(err)
+	})
+	if err == nil {
+		t.Fatal("expected a missing outbox to fail closed")
 	}
-	if sender.count() != 0 {
-		t.Fatal("notification was sent before commit")
-	}
-	if afterCommit == nil {
-		t.Fatal("expected an after-commit sender")
-	}
-	afterCommit()
-	if sender.count() != 1 {
-		t.Fatalf("after-commit messages = %d, want 1", sender.count())
+	if afterCommitCalled {
+		t.Fatal("a direct-send fallback must not be registered")
 	}
 }
 
@@ -187,7 +182,7 @@ func TestSecurityNotifications_AfterCommitFallback(t *testing.T) {
 func TestSecurityNotifications_EnqueueFailureAborts(t *testing.T) {
 	db := fakes.New()
 	mail := &captureEmails{fail: context.DeadlineExceeded}
-	n := notifierFor(db, nil)
+	n := notifierFor(db)
 	if err := n.Deliver(fakes.TenantCtx(), core.TxRepos{Mail: mail}, authn.SecurityNotice{
 		Event: authn.SecurityEventPasswordChanged, UserID: fakes.TestID(1), Name: "A", Email: "a@example.com",
 	}); err == nil {
@@ -205,7 +200,7 @@ func TestChangePassword_EnqueuesSecurityNotification(t *testing.T) {
 	seedNotifiableUser(t, db, fakes.TestID(10), "change@example.com")
 	users := authn.NewUserService(authn.UserDeps{
 		Stores: db.Stores(), Tx: fakes.Tx{DB: db}, Cache: cache.NewMemoryCache(),
-		Security: notifierFor(db, nil),
+		Security: notifierFor(db),
 	})
 
 	if err := users.ChangePassword(fakes.TenantCtx(), fakes.TestID(10), authn.ChangePasswordInput{
@@ -246,7 +241,7 @@ func TestResetPassword_EnqueuesSecurityNotification(t *testing.T) {
 	}
 	resets := authn.NewPasswordResetService(authn.ResetDeps{
 		Stores: db.Stores(), Tx: fakes.Tx{DB: db}, Cache: cache.NewMemoryCache(),
-		Security: notifierFor(db, nil),
+		Security: notifierFor(db),
 	})
 
 	ctx := core.WithUserAgent(core.WithClientIP(fakes.TenantCtx(), "198.51.100.7"), "ResetBrowser/2.0")
@@ -279,7 +274,7 @@ func TestEmailChange_NotifiesOldAndNewAddresses(t *testing.T) {
 	seedNotifiableUser(t, db, fakes.TestID(12), "old-address@example.com")
 	users := authn.NewUserService(authn.UserDeps{
 		Stores: db.Stores(), Tx: fakes.Tx{DB: db}, Cache: cache.NewMemoryCache(),
-		Security: notifierFor(db, nil),
+		Security: notifierFor(db),
 	})
 
 	name := "Renamed"
@@ -327,7 +322,7 @@ func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 	h.svc = NewMFAService(MFADeps{
 		Stores: h.db.Stores(), Tx: fakes.Tx{DB: h.db}, Cache: cache.NewMemoryCache(),
 		Sealer: reversibleSealer{}, Sessions: h.sessions, Now: h.clock.now,
-		Security: notifierFor(h.db, nil),
+		Security: notifierFor(h.db),
 	})
 
 	secret, codes := h.enrollAndConfirm(t)
@@ -336,7 +331,7 @@ func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 	}
 
 	h.clock.at = h.clock.at.Add(totp.Period)
-	if _, err := h.svc.RegenerateRecoveryCodes(ctx, fakes.TestID(100), codes[0]); err != nil {
+	if _, err := h.svc.RegenerateRecoveryCodes(ctx, fakes.TestID(100), MFARecoveryChange{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: codes[0]}); err != nil {
 		t.Fatal(err)
 	}
 	if msgs := mail.messages(); len(msgs) != 2 || !strings.Contains(msgs[1].Subject, "recovery codes were regenerated") {
@@ -344,8 +339,9 @@ func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 	}
 
 	h.clock.at = h.clock.at.Add(totp.Period)
+	factorID := h.factorID(t)
 	code, _ := totp.Code(secret, h.clock.at)
-	if err := h.svc.Disable(ctx, fakes.TestID(100), fakes.TestID(1), code); err != nil {
+	if err := h.svc.Disable(ctx, fakes.TestID(100), MFACodeChange{FactorID: factorID, SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: code}); err != nil {
 		t.Fatal(err)
 	}
 	if msgs := mail.messages(); len(msgs) != 3 || !strings.Contains(msgs[2].Subject, "two-factor authentication was disabled") {
@@ -353,7 +349,7 @@ func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 	}
 
 	before := mail.count()
-	if err := h.svc.Disable(ctx, fakes.TestID(100), fakes.TestID(1), code); err == nil {
+	if err := h.svc.Disable(ctx, fakes.TestID(100), MFACodeChange{FactorID: factorID, SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: code}); err == nil {
 		t.Fatal("expected disabling without a factor to fail")
 	}
 	if mail.count() != before {
@@ -366,7 +362,7 @@ func TestMFAChanges_EnqueueSecurityNotifications(t *testing.T) {
 	reset.svc = NewMFAService(MFADeps{
 		Stores: reset.db.Stores(), Tx: fakes.Tx{DB: reset.db}, Cache: cache.NewMemoryCache(),
 		Sealer: reversibleSealer{}, Sessions: reset.sessions, Now: reset.clock.now,
-		Security: notifierFor(reset.db, nil),
+		Security: notifierFor(reset.db),
 	})
 	if err := reset.svc.ResetTOTP(ctx, fakes.TestID(100)); err != nil {
 		t.Fatal(err)

@@ -10,18 +10,21 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 const (
-	cacheTTL      = 5 * time.Second
-	generationTTL = 24 * time.Hour
+	cacheTTL         = 5 * time.Second
+	generationTTL    = 24 * time.Hour
+	stateReadTimeout = 5 * time.Second
 )
 
 // Claims are the access-token claims the validator checks. Tokens minted
@@ -65,7 +68,7 @@ type State struct {
 // generated SQL types. Implementations return apperror.ErrNotFound for an
 // unknown session or a session of another user.
 type StateReader interface {
-	SessionState(ctx context.Context, sessionID, userID uuid.UUID) (State, error)
+	SessionState(ctx context.Context, tenantID, sessionID, userID uuid.UUID) (State, error)
 }
 
 // Store validates a token against its session and returns the current state,
@@ -92,8 +95,9 @@ type snapshot struct {
 }
 
 type store struct {
-	states StateReader
-	cache  cache.Cache
+	states  StateReader
+	cache   cache.Cache
+	flights singleflight.Group
 }
 
 // NewStore creates a session validator. A cache is optional; without one every
@@ -115,31 +119,52 @@ func snapshotKey(userID uuid.UUID, generation, permissionGeneration int64, sessi
 // currentGeneration reads a monotonically increasing counter. A snapshot is
 // stored under the generations it was read at, so a slow request that finishes
 // after an invalidation writes to an obsolete key instead of resurrecting a
-// stale role, permission set, or token version.
-func (s *store) currentGeneration(ctx context.Context, key string) int64 {
+// stale role, permission set, or token version. A missing counter means zero;
+// a failed or corrupt read is returned so the caller can bypass the cache
+// instead of accidentally serving a snapshot stored under generation zero.
+func (s *store) currentGeneration(ctx context.Context, key string) (int64, error) {
 	if s.cache == nil {
-		return 0
+		return 0, nil
 	}
 	data, err := s.cache.Get(ctx, key)
-	if err != nil || data == nil {
-		return 0
+	if err != nil {
+		return 0, err
+	}
+	if data == nil {
+		return 0, nil
 	}
 	n, err := strconv.ParseInt(string(data), 10, 64)
 	if err != nil || n < 0 {
-		return 0
+		return 0, fmt.Errorf("invalid session generation at %q", key)
 	}
-	return n
+	return n, nil
 }
 
 func (s *store) Validate(ctx context.Context, claims Claims) (State, error) {
+	if claims.UserID == uuid.Nil {
+		return State{}, apperror.NewUnauthorized("token is missing subject")
+	}
 	if claims.TenantID == uuid.Nil {
 		return State{}, apperror.NewUnauthorized("token is missing tenant")
 	}
 	if claims.SessionID == uuid.Nil {
 		return State{}, apperror.NewUnauthorized("token is missing session")
 	}
-	generation := s.currentGeneration(ctx, generationKey(claims.UserID))
-	permissionGeneration := s.currentGeneration(ctx, permissionsGenerationKey)
+	generation, err := s.currentGeneration(ctx, generationKey(claims.UserID))
+	if err != nil {
+		slog.Warn("failed to read session generation; bypassing cache",
+			slog.String("user_id", claims.UserID.String()),
+			slog.Any("error", err),
+		)
+		return s.validateUncached(ctx, claims)
+	}
+	permissionGeneration, err := s.currentGeneration(ctx, permissionsGenerationKey)
+	if err != nil {
+		slog.Warn("failed to read permission generation; bypassing cache",
+			slog.Any("error", err),
+		)
+		return s.validateUncached(ctx, claims)
+	}
 	key := snapshotKey(claims.UserID, generation, permissionGeneration, claims.SessionID)
 
 	if s.cache != nil {
@@ -151,27 +176,75 @@ func (s *store) Validate(ctx context.Context, claims Claims) (State, error) {
 		}
 	}
 
-	state, err := s.states.SessionState(ctx, claims.SessionID, claims.UserID)
+	snap, err := s.loadSnapshot(ctx, key, claims)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return State{}, apperror.NewUnauthorized("session is no longer valid")
 		}
 		return State{}, apperror.NewInternal("failed to validate session")
 	}
-
-	snap := toSnapshot(state)
-	if s.cache != nil {
-		if data, err := json.Marshal(snap); err == nil {
-			if err := s.cache.Set(ctx, key, data, cacheTTL); err != nil {
-				slog.Warn("failed to cache session snapshot",
-					slog.String("user_id", claims.UserID.String()),
-					slog.Any("error", err),
-				)
-			}
-		}
-	}
-
 	return stateOf(snap, claims)
+}
+
+// validateUncached reads the authoritative state directly when the cache
+// generations cannot be trusted. It deliberately neither reads nor writes a
+// snapshot: a cache outage must never turn into authorization from stale data.
+func (s *store) validateUncached(ctx context.Context, claims Claims) (State, error) {
+	readCtx, cancel := stateReadContext(ctx)
+	defer cancel()
+	state, err := s.states.SessionState(readCtx, claims.TenantID, claims.SessionID, claims.UserID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return State{}, apperror.NewUnauthorized("session is no longer valid")
+		}
+		return State{}, apperror.NewInternal("failed to validate session")
+	}
+	return stateOf(toSnapshot(state), claims)
+}
+
+// loadSnapshot coalesces a burst of requests for the same session into one
+// reader call. The generation and permission generation are part of key, so a
+// result that finishes after an invalidation is cached under the obsolete key
+// and cannot resurrect a revoked session or stale permissions.
+func (s *store) loadSnapshot(ctx context.Context, key string, claims Claims) (snapshot, error) {
+	value, err, _ := s.flights.Do(key, func() (any, error) {
+		readCtx, cancel := stateReadContext(ctx)
+		defer cancel()
+		state, err := s.states.SessionState(readCtx, claims.TenantID, claims.SessionID, claims.UserID)
+		if err != nil {
+			return nil, err
+		}
+		snap := toSnapshot(state)
+		if s.cache == nil {
+			return snap, nil
+		}
+		data, err := json.Marshal(snap)
+		if err != nil {
+			return snap, nil
+		}
+		if err := s.cache.Set(readCtx, key, data, cacheTTL); err != nil {
+			slog.Warn("failed to cache session snapshot",
+				slog.String("user_id", claims.UserID.String()),
+				slog.Any("error", err),
+			)
+		}
+		return snap, nil
+	})
+	if err != nil {
+		return snapshot{}, err
+	}
+	snap, ok := value.(snapshot)
+	if !ok {
+		return snapshot{}, apperror.NewInternal("failed to validate session")
+	}
+	return snap, nil
+}
+
+// stateReadContext detaches an authorization read from client cancellation so
+// an aborted request cannot interrupt a mutation cache invalidation, while
+// still bounding the database/cache call. WithoutCancel alone has no deadline.
+func stateReadContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), stateReadTimeout)
 }
 
 func toSnapshot(state State) snapshot {
@@ -192,6 +265,10 @@ func stateOf(snap snapshot, claims Claims) (State, error) {
 	if snap.ExpiresAt.IsZero() || !snap.ExpiresAt.After(time.Now()) {
 		return State{}, apperror.NewUnauthorized("session has expired")
 	}
+	// Singleflight waiters receive the same snapshot value. Clone its slices so
+	// one caller cannot mutate the authorization state observed by another.
+	state.Permissions = slices.Clone(snap.Permissions)
+	state.AMR = slices.Clone(snap.AMR)
 	return state, nil
 }
 
@@ -207,7 +284,12 @@ func (s *store) bump(ctx context.Context, key string) error {
 	if s.cache == nil {
 		return nil
 	}
-	if _, err := s.cache.Increment(ctx, key, generationTTL); err != nil {
+	// A client disconnect must not skip a revocation. Detach from the request
+	// cancellation and keep a short deadline so a cache outage cannot hang the
+	// mutation path.
+	invalidationCtx, cancel := stateReadContext(ctx)
+	defer cancel()
+	if _, err := s.cache.Increment(invalidationCtx, key, generationTTL); err != nil {
 		slog.Warn("failed to invalidate session cache", slog.String("key", key), slog.Any("error", err))
 		return err
 	}

@@ -77,6 +77,24 @@ func TestNewValidation(t *testing.T) {
 	}
 }
 
+func TestAppErrorProblemNormalizesFieldPaths(t *testing.T) {
+	err := NewValidation("bad fields", []FieldError{
+		{Path: "body.name", Code: "required"},
+		{Path: "query.limit", Code: "invalid"},
+	})
+	problem := err.Problem("req-1", "/api/v1/x")
+
+	if got := problem.Errors[0].Path; got != "name" {
+		t.Errorf("body field path = %q, want name", got)
+	}
+	if got := problem.Errors[1].Path; got != "query.limit" {
+		t.Errorf("query field path = %q, want query.limit", got)
+	}
+	if err.Errors[0].Path != "body.name" {
+		t.Errorf("Problem mutated the source error: %q", err.Errors[0].Path)
+	}
+}
+
 func TestAppError_Error(t *testing.T) {
 	err := NewBadRequest("test message")
 	if err.Error() != "test message" {

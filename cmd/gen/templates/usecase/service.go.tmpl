@@ -4,6 +4,7 @@ import (
 	"context"
 
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/internal/platform/authz"
 	"{{.M.ModulePath}}/pkg/apperror"
 )
 
@@ -17,18 +18,20 @@ type {{.U.Name}}Result struct{}
 // state and returns only what the caller needs to continue.{{else}} A query reads state
 // and never changes it.{{end}} Declare what it needs as ports in ports.go and
 // take them in New{{.U.Name}}Handler.
-type {{.U.Name}}Handler struct{}
+type {{.U.Name}}Handler struct {
+	authorizer authz.Authorizer
+}
 
 // New{{.U.Name}}Handler returns a {{.U.Name}}Handler.
-func New{{.U.Name}}Handler() *{{.U.Name}}Handler {
-	return &{{.U.Name}}Handler{}
+func New{{.U.Name}}Handler(authorizer authz.Authorizer) *{{.U.Name}}Handler {
+	return &{{.U.Name}}Handler{authorizer: authorizer}
 }
 
 // Handle runs the {{.U.Kind}}. Until its behavior is written it fails with
 // {{.M.Ident}}catalog.CodeNotImplemented (501), so an unfinished use case can
 // never report success.
 func (h *{{.U.Name}}Handler) Handle(ctx context.Context, in {{.U.Name}}Input) ({{.U.Name}}Result, error) {
-	if err := authorize(ctx, {{.M.Ident}}catalog.{{.U.Permission}}); err != nil {
+	if err := authorize(ctx, h.authorizer, {{.M.Ident}}catalog.{{.U.Permission}}); err != nil {
 		return {{.U.Name}}Result{}, err
 	}
 	return {{.U.Name}}Result{}, apperror.NewCode({{.M.Ident}}catalog.CodeNotImplemented, "{{.U.Name}} is not implemented")

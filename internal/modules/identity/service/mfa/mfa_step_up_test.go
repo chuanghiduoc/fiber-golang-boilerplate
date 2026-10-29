@@ -151,6 +151,26 @@ func TestMFAStepUpRejectsInvalidCode(t *testing.T) {
 	}
 }
 
+// A session whose absolute lifetime has passed cannot refresh its AAL2 clock,
+// even if access-token validation raced with the expiry.
+func TestMFAStepUpRejectsExpiredSession(t *testing.T) {
+	h := newMFAHarness(t)
+	_, codes := h.enrollAndConfirm(t)
+	session := h.issueSession(t, []string{core.AMRPassword})
+
+	h.db.Mu.Lock()
+	h.db.Sessions[session.ID].ExpiresAt = time.Now().Add(-time.Second)
+	h.db.Mu.Unlock()
+
+	_, err := h.svc.(MFAStepUpService).StepUp(fakes.TenantCtx(), fakes.TestID(100), session.ID, codes[0])
+	if statusOf(err) != http.StatusUnauthorized {
+		t.Fatalf("expired session error = %v, want 401", err)
+	}
+	if got := h.sessionMFAVerifiedAt(session.ID); got != nil {
+		t.Fatalf("session mfa_verified_at = %v after an expired step-up, want nil", got)
+	}
+}
+
 // Step-up shares the per-user second-factor budget with login verification.
 func TestMFAStepUpSharesTheSecondFactorBudget(t *testing.T) {
 	h := newMFAHarness(t)

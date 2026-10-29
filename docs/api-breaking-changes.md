@@ -26,6 +26,31 @@ git show origin/main:docs/openapi.yaml > /tmp/base-openapi.yaml
 
 ## Entries
 
+### 2026-10-29 — Contract corrections found by the repository audit
+
+- `POST /api/v1/me/mfa/recovery-codes` returns `200` with
+  `{"recoveryCodes": [...]}` (the previous document claimed `201`).
+  Regeneration replaces the existing set, so it is not a resource creation;
+  clients must accept `200`.
+- `POST /api/v1/me/erasure-requests` bounds `currentPassword` to 128
+  characters; longer values fail validation with `422`.
+- The remaining `oasdiff` findings against the previous document are
+  documentation corrections, not runtime changes: JSON patch bodies are
+  documented as objects instead of `string/binary`, path ids declare
+  `format: uuid`, and the streamed export content and `/metrics` responses no
+  longer claim a fixed body schema.
+- `POST /api/v1/files` now requires the multipart `file` member in the
+  documented schema; a request that omits it fails `422` validation instead of
+  reaching the handler.
+- `PATCH /api/v1/api-keys/{apiKeyId}` documents the service's existing bounds
+  (`name` 1-255 characters, `scopes` 1-100 entries); out-of-range values fail
+  `422`.
+- `POST /api/v1/webhooks/inbound/{sourceId}` documents both success statuses:
+  `202` for a new event and `200` with `duplicate: true` for a replay. The
+  runtime already behaved this way.
+- `CreateNotificationResponse.notification` is documented as nullable, matching
+  the response when the recipient disabled in-app notifications.
+
 ### 2026-10-27 — Webhooks converted to the canonical huma route map
 
 - `PUT /api/v1/webhooks/endpoints/{endpointId}` and
@@ -260,7 +285,7 @@ git show origin/main:docs/openapi.yaml > /tmp/base-openapi.yaml
   `password_repeated` and (when the operator enables
   `PASSWORD_BREACH_CHECK=hibp`) `password_breached`; expose them alongside the
   existing password codes. Values are NFKC-normalized before length checks and
-  before bcrypt on both set and verify, so compatibility spellings compare
+  before Argon2id hashing on both set and verify, so compatibility spellings compare
   equal. That changes the hashing input: a hash written by an older build must
   be re-set (there is no deployed database yet). No v2 route is needed: the
   old policy accepted weaker secrets.
@@ -325,8 +350,8 @@ git show origin/main:docs/openapi.yaml > /tmp/base-openapi.yaml
 
 - `POST /api/v1/auth/register`, `POST /api/v1/auth/reset-password`, and
   `PUT /api/v1/users/me/password` now reject passwords shorter than 12
-  characters, longer than 64 characters or 72 bytes, on the bundled
-  top-10k common-password list, or containing the email local part.
+  Unicode code points (runes), longer than 64 Unicode code points (runes), on
+  the bundled top-10k common-password list, or containing the email local part.
   Composition rules (uppercase/lowercase/digit/special) are gone.
 - Existing passwords keep working for sign-in; only a new password is
   validated. Clients should surface the `422 validation_failed` field codes

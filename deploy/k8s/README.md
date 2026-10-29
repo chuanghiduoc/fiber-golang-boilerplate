@@ -24,6 +24,7 @@ flowchart LR
         WPDB["PDB worker minAvailable 1"] -. protects .-> WRK
         WRK["Deployment fiber-boilerplate-worker<br/>APP_ROLE=worker · replicas 2<br/>no Service/Ingress"]
         JOB["Job fiber-boilerplate-migrate<br/>/app/migrate"]
+        CRON["CronJob fiber-boilerplate-migrate-maintenance<br/>/app/migrate, monthly"]
         SEED["Job fiber-boilerplate-seed<br/>/app/seed (optional)"]
         CM[/"ConfigMap<br/>fiber-boilerplate-config"/]
         SEC[/"Secret<br/>fiber-boilerplate-secrets<br/>(mounted as files)"/]
@@ -31,11 +32,11 @@ flowchart LR
         SSEC[/"Secret<br/>fiber-boilerplate-seed-secrets"/]
         NP{{"NetworkPolicy<br/>deny ingress by default"}}
     end
-    CM -. envFrom .-> API & WRK & JOB & SEED
+    CM -. envFrom .-> API & WRK & JOB & CRON & SEED
     SEC -. files .-> API & WRK & SEED
-    MSEC -. files .-> JOB
+    MSEC -. files .-> JOB & CRON
     SSEC -. files .-> SEED
-    API & WRK & JOB & SEED -->|"TCP 5432 (10.0.0.0/8)"| PG[(Managed PostgreSQL 18)]
+    API & WRK & JOB & CRON & SEED -->|"TCP 5432 (10.0.0.0/8)"| PG[(Managed PostgreSQL 18)]
     API & WRK -->|"TCP 6379 (10.0.0.0/8)"| RD[(Managed Redis)]
     API & WRK -->|"TCP 443"| S3[(S3 / SeaweedFS S3 gateway)]
     WRK -->|"TCP 587 STARTTLS"| SMTP[SMTP relay]
@@ -63,7 +64,7 @@ the included extra egress rule.
 | `base/kustomization.yaml` | Reusable app base (includes `../prereqs`) + image transformer; omits the Jobs and Secrets |
 | `prereqs/` | Namespace + ConfigMap kustomization, applied before the migration Job |
 | `migration/job.yaml` | One-shot `/app/migrate` Job + its ServiceAccount; applied separately, before the app |
-| `seed/job.yaml` | One-shot `/app/seed` Job + its ServiceAccount (bootstrap admin); applied separately after the migration |
+| `seed/` | One-shot `/app/seed` Job, its ServiceAccount, and the seed-only ConfigMap with `ADMIN_EMAIL`/`ADMIN_NAME`; applied separately after the migration |
 | `overlays/staging/`, `overlays/production/` | Namespace, HPA, api/worker resource, and Ingress patches + image tag; each has `prereqs/`, `migration/`, and `seed/` sub-overlays |
 | `overlays/components/<env>-config` | Environment ConfigMap patch shared by the app and prereqs builds |
 | `components/image-policy/` | Optional ClusterImagePolicy: require the release.yml keyless signature at admission |
@@ -182,8 +183,9 @@ Jobs live outside every app kustomization.
 | `components/external-secrets/externalsecrets.yaml` | `REPLACE_WITH_*_SECRET_PATH` remote paths and the SecretStore name |
 | `components/keda-worker-scaler/scaledobject.yaml` | Prometheus `serverAddress` and the lag threshold |
 | `overlays/<env>/ingress-patch.yaml` | API host and TLS Secret |
-| `overlays/components/<env>-config/configmap-patch.yaml` | `APP_FRONTEND_URL`, `CORS_ALLOW_ORIGINS`, `DB_HOST`, `SMTP_HOST`, `EMAIL_FROM_ADDRESS`, `STORAGE_S3_BUCKET`, `ADMIN_EMAIL` |
-| `prereqs/configmap.yaml` | shared defaults such as `APP_TRUSTED_PROXIES`, `TENANT_REQUIRE_HEADER=true`, `DB_MIGRATE_USERNAME`, the S3 endpoint and access key ID; keep environment-specific values in the overlay components |
+| `overlays/components/<env>-config/configmap-patch.yaml` | `APP_FRONTEND_URL`, `CORS_ALLOW_ORIGINS`, `DB_HOST`, `SMTP_HOST`, `EMAIL_FROM_ADDRESS`, `STORAGE_S3_BUCKET` |
+| `overlays/<env>/seed/` | `ADMIN_EMAIL` and `ADMIN_NAME` on the seed-only ConfigMap; never put these in the shared app ConfigMap because the API has no `ADMIN_PASSWORD` |
+| `prereqs/configmap.yaml` | shared defaults such as `APP_TRUST_PROXY=false` (overlays enable it with an exact proxy CIDR), `TENANT_REQUIRE_HEADER=true`, `DB_MIGRATE_USERNAME`, the S3 endpoint and access key ID; keep environment-specific values in the overlay components |
 | `base/networkpolicy.yaml` | DB/Redis/OTel CIDRs and SMTP ports/ranges if your services are not in `10.0.0.0/8` or use different ports |
 | overlay `namespace:` values + Namespace rename patches (and the matching `prereqs`/`migration`/`seed` overlays) | only if you rename an environment |
 | `secret.example.yaml` (copied outside the repo) | every `REPLACE_*` value |
@@ -201,7 +203,7 @@ Configuration rules:
 | `CORS_ALLOW_HEADERS` | keep `Idempotency-Key`, `X-Tenant-Slug`, `Accept-Language`, `X-CSRF-Token` (cookie mode) |
 | `CORS_EXPOSE_HEADERS` | keep `Idempotent-Replayed`, `Content-Language`, the version/deprecation headers, the rate-limit headers, and `X-Request-Id` |
 | `TENANT_REQUIRE_HEADER=true` | required in production so header-less writes never fall back to tenant 1 |
-| `APP_TRUSTED_PROXIES` | only the cluster pod/service CIDR containing ingress-nginx. `0.0.0.0/0` lets clients spoof `X-Forwarded-For` |
+| `APP_TRUST_PROXY` / `APP_TRUSTED_PROXIES` | the shared base keeps proxy trust off. Every overlay must enable it with the exact ingress-nginx pod/service CIDR (or the node CIDR for `hostNetwork`). Startup rejects `0.0.0.0/0`, `::/0`, and the broad private aggregates `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and `fc00::/7` (including supernets); replace the `REPLACE_WITH_INGRESS_NGINX_POD_CIDR` placeholder with a narrower CIDR before deploying |
 | `APP_PORT` (8080) | part of the probe, Service, container port, and NetworkPolicy contract. If you change it, update `containerPort`, the `http` named port, the Service port, the Ingress backend, and the NetworkPolicy ingress port |
 | `APP_ROLE` | not in the ConfigMap. The api Deployment sets `api` and the worker sets `worker`; no Kubernetes workload runs `all` |
 | `GOMEMLIMIT` | set from `limits.memory` with a `resourceFieldRef` (`divisor: "1"` yields bytes), so an overlay resource patch adjusts the Go soft limit automatically. Size the limit so the runtime has headroom for non-Go memory; the Go limit is not a hard reservation |
@@ -253,9 +255,11 @@ the pod fail startup instead of silently running with an empty secret.
 | `fiber-boilerplate-seed-secrets` | `ADMIN_PASSWORD` | seed Job only (files at `/var/run/secrets/fiber-boilerplate-seed`) |
 
 Non-secret halves of a credential pair stay in the ConfigMap:
-`STORAGE_S3_ACCESS_KEY`, `SMTP_USERNAME`, `DB_MIGRATE_USERNAME`, and the
-`ADMIN_EMAIL`/`ADMIN_NAME` of the bootstrap admin. For an unauthenticated SMTP
-relay set `SMTP_USERNAME=""` and leave `SMTP_PASSWORD` empty.
+`STORAGE_S3_ACCESS_KEY`, `SMTP_USERNAME`, and `DB_MIGRATE_USERNAME`. The
+bootstrap admin's `ADMIN_EMAIL`/`ADMIN_NAME` live in the seed-only ConfigMap,
+not the shared app ConfigMap: the API requires the email and password as a
+pair, while only the seed Job mounts `ADMIN_PASSWORD`. For an unauthenticated
+SMTP relay set `SMTP_USERNAME=""` and leave `SMTP_PASSWORD` empty.
 
 The schema-owner password is deliberately **not** in
 `fiber-boilerplate-secrets`: API and worker pods cannot read the role that may
@@ -517,6 +521,8 @@ cluster-scoped Namespace object. It grants no create or delete.
 kubectl apply -k deploy/k8s/overlays/staging/prereqs        # as an admin
 kubectl apply -k deploy/k8s/overlays/production/prereqs     # as an admin
 kubectl apply -f deploy/k8s/rbac/namespace-bootstrap-clusterrole.yaml
+# The Role manifest has no fixed namespace; -n selects each target.
+kubectl -n "$NS" apply -f deploy/k8s/rbac/deployer-role.yaml
 
 # EKS: the IAM role mapped by an access entry (or aws-auth).
 kubectl create clusterrolebinding fiber-boilerplate-namespace-bootstrap \
@@ -618,7 +624,9 @@ replicas, 300s cooldown. Patch `serverAddress` and the threshold for your
 environment. A stalled queue exports **no observations** (a missing series), not
 an ever-growing lag, so pair this with an alert on `jobs_dead_total` and on a
 missing increase of `jobs_claimed_total`. Also keep
-`DB_MAX_CONNS × 2 × maxReplicaCount` inside the database connection limit.
+`(API maxReplicas + worker maxReplicas) × 2 × DB_MAX_CONNS` inside the
+database connection limit; enabling this component raises the worker ceiling
+from 2 to 10.
 
 ## Release tags and supply chain
 

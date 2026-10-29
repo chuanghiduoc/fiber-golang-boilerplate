@@ -4,8 +4,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/patch"
 )
 
 type RegisterRequest struct {
@@ -31,9 +29,9 @@ type GoogleExchangeRequest struct {
 
 // ProfilePatch is the RFC 7396 merge patch for the caller's global profile.
 type ProfilePatch struct {
-	Name            patch.Field[string] `json:"name,omitempty"`
-	Email           patch.Field[string] `json:"email,omitempty"`
-	CurrentPassword patch.Field[string] `json:"currentPassword,omitempty"`
+	Name            Optional[string] `json:"name,omitempty"`
+	Email           Optional[string] `json:"email,omitempty"`
+	CurrentPassword Optional[string] `json:"currentPassword,omitempty"`
 }
 
 type ChangePasswordRequest struct {

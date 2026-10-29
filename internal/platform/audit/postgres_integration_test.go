@@ -258,7 +258,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	requestID := fmt.Sprintf("audit-complete-%d", time.Now().UnixNano())
 
 	recorder := NewPostgresRecorder(fx.Scoped())
-	id, err := recorder.RecordID(ctx, Event{
+	intent, err := recorder.RecordID(ctx, Event{
 		ActorType:  ActorTypeAnonymous,
 		Action:     "auth.login",
 		Resource:   "auth",
@@ -268,19 +268,20 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 		StatusCode: 0,
 	})
 	require.NoError(t, err)
-	require.NotEqual(t, uuid.Nil, id)
+	require.NotEqual(t, uuid.Nil, intent.ID)
+	require.False(t, intent.CreatedAt.IsZero())
 
 	var (
 		outcome     string
 		completedAt *time.Time
 	)
 	require.NoError(t, fx.Bypass.QueryRow(ctx,
-		`SELECT outcome, completed_at FROM audit_events WHERE id = $1`, id).
+		`SELECT outcome, completed_at FROM audit_events WHERE id = $1`, intent.ID).
 		Scan(&outcome, &completedAt))
 	assert.Equal(t, OutcomeStarted, outcome)
 	assert.Nil(t, completedAt)
 
-	require.NoError(t, recorder.Complete(ctx, id, Completion{
+	require.NoError(t, recorder.Complete(ctx, intent, Completion{
 		Outcome:    OutcomeSucceeded,
 		StatusCode: 200,
 	}))
@@ -293,7 +294,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	)
 	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT outcome, completed_at, actor_id, actor_type, actor_role, status_code
-		 FROM audit_events WHERE id = $1`, id).
+		 FROM audit_events WHERE id = $1`, intent.ID).
 		Scan(&outcome, &completedAt, &actorID, &actorType, &actorRole, &statusCode))
 	assert.Equal(t, OutcomeSucceeded, outcome)
 	require.NotNil(t, completedAt)
@@ -303,16 +304,16 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	require.NotNil(t, statusCode)
 	assert.Equal(t, int16(200), *statusCode)
 
-	err = recorder.Complete(ctx, id, Completion{Outcome: OutcomeFailed, StatusCode: 500})
+	err = recorder.Complete(ctx, intent, Completion{Outcome: OutcomeFailed, StatusCode: 500})
 	require.ErrorIs(t, err, ErrAlreadyCompleted, "completion must happen at most once")
 
 	_, err = fx.Bypass.Exec(ctx,
-		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, id)
+		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, intent.ID)
 	require.Error(t, err, "completed rows must reject non-completion updates")
 
 	// The actor belongs to the intent: completion keeps it, and an UPDATE that
 	// completes the row as another actor is refused by the trigger.
-	sameActorID, err := recorder.RecordID(ctx, Event{
+	sameActorIntent, err := recorder.RecordID(ctx, Event{
 		ActorID:   testID(42),
 		ActorType: ActorTypeUser,
 		ActorRole: "admin",
@@ -323,12 +324,12 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 		Outcome:   OutcomeStarted,
 	})
 	require.NoError(t, err)
-	require.NoError(t, recorder.Complete(ctx, sameActorID, Completion{
+	require.NoError(t, recorder.Complete(ctx, sameActorIntent, Completion{
 		Outcome:    OutcomeSucceeded,
 		StatusCode: 200,
 	}))
 	require.NoError(t, fx.Bypass.QueryRow(ctx,
-		`SELECT actor_id, actor_type, actor_role FROM audit_events WHERE id = $1`, sameActorID).
+		`SELECT actor_id, actor_type, actor_role FROM audit_events WHERE id = $1`, sameActorIntent.ID).
 		Scan(&actorID, &actorType, &actorRole))
 	require.NotNil(t, actorID)
 	assert.Equal(t, testID(42), *actorID)
@@ -336,7 +337,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	require.NotNil(t, actorRole)
 	assert.Equal(t, "admin", *actorRole)
 
-	swappedID, err := recorder.RecordID(ctx, Event{
+	swappedIntent, err := recorder.RecordID(ctx, Event{
 		ActorID:   testID(42),
 		ActorType: ActorTypeUser,
 		ActorRole: "admin",
@@ -349,7 +350,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	require.NoError(t, err)
 	_, err = fx.Bypass.Exec(ctx, `UPDATE audit_events
 		SET outcome = 'succeeded', completed_at = now(), actor_id = $2
-		WHERE id = $1`, swappedID, testID(43))
+		WHERE id = $1`, swappedIntent.ID, testID(43))
 	require.Error(t, err, "a started row must not be completed with a different actor")
 	assert.Contains(t, err.Error(), "audit completion may only change completion fields")
 
@@ -361,19 +362,20 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 		Source:    SourceService,
 		Outcome:   OutcomeSucceeded,
 	}))
-	var serviceID uuid.UUID
+	var serviceIntent IntentRef
 	require.NoError(t, fx.Bypass.QueryRow(ctx,
-		`SELECT id FROM audit_events WHERE request_id = $1`, requestID+"-service").Scan(&serviceID))
-	err = recorder.Complete(ctx, serviceID, Completion{Outcome: OutcomeFailed, StatusCode: 500})
+		`SELECT id, created_at FROM audit_events WHERE request_id = $1`, requestID+"-service").
+		Scan(&serviceIntent.ID, &serviceIntent.CreatedAt))
+	err = recorder.Complete(ctx, serviceIntent, Completion{Outcome: OutcomeFailed, StatusCode: 500})
 	require.ErrorIs(t, err, ErrAlreadyCompleted)
 
 	_, err = fx.Bypass.Exec(ctx,
-		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, serviceID)
+		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, serviceIntent.ID)
 	require.Error(t, err, "terminal rows must reject updates")
 
 	// Append-only covers removal too: neither DELETE nor TRUNCATE may drop
 	// audit rows outside a reviewed, trigger-disabling maintenance path.
-	_, err = fx.Bypass.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, serviceID)
+	_, err = fx.Bypass.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, serviceIntent.ID)
 	require.ErrorContains(t, err, "append-only", "audit rows must reject DELETE")
 	// Inside a rolled-back transaction so a missing trigger cannot wipe a
 	// shared test database. TRUNCATE runs as the schema owner: the app role is
@@ -385,7 +387,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	require.ErrorContains(t, err, "append-only", "audit_events must reject TRUNCATE")
 	var remaining int64
 	require.NoError(t, fx.Bypass.QueryRow(ctx,
-		`SELECT COUNT(*) FROM audit_events WHERE id IN ($1, $2)`, id, serviceID).Scan(&remaining))
+		`SELECT COUNT(*) FROM audit_events WHERE id IN ($1, $2)`, intent.ID, serviceIntent.ID).Scan(&remaining))
 	assert.Equal(t, int64(2), remaining)
 }
 

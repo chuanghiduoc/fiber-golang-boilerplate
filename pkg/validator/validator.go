@@ -93,6 +93,19 @@ func NormalizePassword(password string) string {
 // runs last so a local failure short-circuits the network call.
 func PasswordWeakness(password string) string {
 	normalized := NormalizePassword(password)
+	if weakness := localPasswordWeakness(normalized); weakness != "" {
+		return weakness
+	}
+	if isBreached(normalized) {
+		return CodePasswordBreached
+	}
+	return ""
+}
+
+// localPasswordWeakness classifies only the checks that need no network.
+// Keeping this separate lets validation report the same reason without
+// repeating the optional breached-password lookup.
+func localPasswordWeakness(normalized string) string {
 	switch {
 	case utf8.RuneCountInString(normalized) < MinPasswordRunes:
 		return CodeWeakPassword
@@ -102,8 +115,6 @@ func PasswordWeakness(password string) string {
 		return CodePasswordRepeated
 	case isCommonPassword(normalized):
 		return CodePasswordCommon
-	case isBreached(normalized):
-		return CodePasswordBreached
 	default:
 		return ""
 	}
@@ -228,6 +239,7 @@ func commonPasswordSet() map[string]struct{} {
 // because the tag validator has no access to the address; registration,
 // password change, and password reset call it where the email is known.
 func PasswordContainsEmailLocalPart(password, email string) bool {
+	email = NormalizePassword(email)
 	at := strings.LastIndexByte(email, '@')
 	if at < 0 {
 		return false
@@ -236,7 +248,7 @@ func PasswordContainsEmailLocalPart(password, email string) bool {
 	if utf8.RuneCountInString(local) < minEmailLocalPartRunes {
 		return false
 	}
-	return strings.Contains(strings.ToLower(password), local)
+	return strings.Contains(strings.ToLower(NormalizePassword(password)), local)
 }
 
 func ValidateStruct(s interface{}) error {
@@ -270,9 +282,13 @@ func ValidateStruct(s interface{}) error {
 func fieldCode(fe validator.FieldError) string {
 	if fe.Tag() == "password" {
 		if value, ok := fe.Value().(string); ok {
-			if weakness := PasswordWeakness(value); weakness != "" {
+			if weakness := localPasswordWeakness(NormalizePassword(value)); weakness != "" {
 				return weakness
 			}
+			// The validator only rejects a locally strong password when the
+			// optional breach check matched. Do not repeat that network call
+			// just to recover the reason.
+			return CodePasswordBreached
 		}
 	}
 	return codeForTag(fe.Tag())

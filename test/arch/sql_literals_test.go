@@ -18,21 +18,32 @@ import (
 // new dynamic call fails until it is converted to a constant or the site is
 // deliberately added here and maxDynamicSQLSites is raised.
 var dynamicSQLAllowlist = map[string]string{
-	"internal/migrate/verify.go:scanRows:Query:1":               "shared schema-verification runner; each caller passes the literal query it verifies",
-	"internal/database/scope.go:begin:Queue:1":                  "Scoped wraps arbitrary sqlc query constants and cannot make the caller's SQL constant",
-	"internal/database/scope.go:Scan:Query:1":                   "scopedRow defers the caller's constant query until Scan so the RLS transaction wraps it",
-	"internal/testutil/pgtest/database.go:Close:Exec:1":         "throwaway per-test schema name is generated at runtime; never used against application data",
-	"internal/testutil/pgtest/database.go:New:Exec:1":           "throwaway per-test schema name is generated at runtime; never used against application data",
-	"internal/testutil/pgtest/postgres.go:OpenAppPool:Exec:1":   "grants a generated test schema identifier to the test app role",
-	"internal/testutil/pgtest/postgres.go:ensureAppRole:Exec:1": "test fixture creates the fixed app role; the identifier is sanitized with pgx.Identifier",
-	"internal/testutil/pgtest/postgres.go:ensureAppRole:Exec:2": "test fixture configures the fixed app role; the identifier is sanitized with pgx.Identifier",
+	"internal/migrate/verify.go:scanRows:Query:1":                          "shared schema-verification runner; each caller passes the literal query it verifies",
+	"internal/database/scope.go:begin:Queue:1":                             "Scoped wraps arbitrary sqlc query constants and cannot make the caller's SQL constant",
+	"internal/database/scope.go:Scan:Query:1":                              "scopedRow defers the caller's constant query until Scan so the RLS transaction wraps it",
+	"internal/testutil/pgtest/database.go:Close:Exec:1":                    "throwaway per-test schema name is generated at runtime; never used against application data",
+	"internal/testutil/pgtest/database.go:New:Exec:1":                      "throwaway per-test schema name is generated at runtime; never used against application data",
+	"internal/testutil/pgtest/postgres.go:OpenAppPool:Exec:1":              "grants a generated test schema identifier to the test app role",
+	"internal/testutil/pgtest/postgres.go:ensureAppRole:Exec:1":            "test fixture creates the fixed app role; the identifier is sanitized with pgx.Identifier",
+	"internal/testutil/pgtest/postgres.go:ensureAppRole:Exec:2":            "test fixture configures the fixed app role; the identifier is sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:auditDefaultPartitionHasRows:QueryRow:1": "partition range check must name the runtime-qualified default partition; identifiers are sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:rebuildAuditDefaultPartition:Exec:1":     "temp backup must copy the runtime-qualified default partition; identifiers are sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:rebuildAuditDefaultPartition:Exec:2":     "drops the runtime-qualified default partition being rebuilt; identifiers are sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:rebuildAuditDefaultPartition:Exec:3":     "recreates the runtime-qualified default partition under the parent; identifiers are sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:rebuildAuditDefaultPartition:Exec:4":     "temporarily clears FORCE RLS on the runtime-qualified parent while restoring rows; restored before commit",
+	"internal/migrate/snapshot.go:rebuildAuditDefaultPartition:Exec:5":     "restores rows through the runtime-qualified parent so tuple routing selects the new partitions; identifiers are sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:rebuildAuditDefaultPartition:Exec:6":     "restores FORCE RLS on the runtime-qualified parent before commit; identifiers are sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:createAuditPartition:Exec:1":             "monthly partition DDL must name the runtime schema, table, and UTC range; identifiers are sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:secureAuditPartition:Exec:1":             "enables RLS on the runtime-qualified monthly partition; identifiers are sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:secureAuditPartition:Exec:2":             "forces RLS on the runtime-qualified monthly partition; identifiers are sanitized with pgx.Identifier",
+	"internal/migrate/snapshot.go:setAuditPartitionForcedRLS:Exec:1":       "toggles FORCE RLS on a runtime-qualified audit partition; identifiers are sanitized with pgx.Identifier",
 }
 
 // maxDynamicSQLSites is the reviewed size of dynamicSQLAllowlist. The list may
 // only shrink, so it must match this number exactly: adding a new dynamic query
 // needs a raised ceiling, and fixing one lowers the list and this number
 // together. Either edit is deliberate and reviewable.
-const maxDynamicSQLSites = 8
+const maxDynamicSQLSites = 19
 
 // TestSQLCallsUseConstantStrings rejects a query whose SQL argument is not a
 // compile-time constant. It type-checks the non-test packages under internal,

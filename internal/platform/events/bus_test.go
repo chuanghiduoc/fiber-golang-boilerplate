@@ -413,6 +413,12 @@ func TestNewEventValidation(t *testing.T) {
 	empty, err := NewEvent("valid.event", 1, nil)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{}`, string(empty.Data))
+	assert.NotNil(t, empty.SubjectUserIDs, "NewEvent must initialize subject metadata")
+
+	empty.SubjectUserIDs = []uuid.UUID{uuid.Nil}
+	require.ErrorIs(t, empty.Validate(), ErrInvalidEvent)
+	empty.SubjectUserIDs = []uuid.UUID{testID(1), testID(1)}
+	require.ErrorIs(t, empty.Validate(), ErrInvalidEvent)
 }
 
 func TestEnvelopeShapeAndDefaults(t *testing.T) {

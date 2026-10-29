@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/url"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -20,6 +22,12 @@ import (
 // QueryExecModes maps DB_QUERY_EXEC_MODE values onto pgx execution modes.
 // config validates the same names. Only modes that describe parameter types
 // are supported (see config.DBConfig.QueryExecMode).
+const (
+	postgresStatementTimeout         = "statement_timeout"
+	postgresLockTimeout              = "lock_timeout"
+	postgresIdleInTransactionTimeout = "idle_in_transaction_session_timeout"
+)
+
 var QueryExecModes = map[string]pgx.QueryExecMode{
 	"cache_statement": pgx.QueryExecModeCacheStatement,
 	"cache_describe":  pgx.QueryExecModeCacheDescribe,
@@ -97,6 +105,7 @@ func NewPool(ctx context.Context, dbCfg config.DBConfig, opts ...PoolOption) (*p
 		return nil, fmt.Errorf("unsupported DB_QUERY_EXEC_MODE %q", dbCfg.QueryExecMode)
 	}
 	poolCfg.ConnConfig.DefaultQueryExecMode = execMode
+	applyRuntimeTimeouts(poolCfg.ConnConfig, dbCfg)
 
 	poolCfg.MaxConns = dbCfg.MaxConns
 	poolCfg.MinConns = dbCfg.MinConns
@@ -124,25 +133,63 @@ func NewPool(ctx context.Context, dbCfg config.DBConfig, opts ...PoolOption) (*p
 	return pool, nil
 }
 
-func RunMigrations(dsn, migrationsPath string) error {
+// applyRuntimeTimeouts sends PostgreSQL's own guardrails as startup parameters
+// on every connection. cmd/migrate builds its DSN separately, so a long
+// migration is not bounded by the API's statement timeout.
+func applyRuntimeTimeouts(conn *pgx.ConnConfig, dbCfg config.DBConfig) {
+	if conn == nil {
+		return
+	}
+	if conn.RuntimeParams == nil {
+		conn.RuntimeParams = make(map[string]string)
+	}
+	setPositiveRuntimeTimeout(conn, postgresStatementTimeout, dbCfg.StatementTimeout)
+	setPositiveRuntimeTimeout(conn, postgresLockTimeout, dbCfg.LockTimeout)
+	setPositiveRuntimeTimeout(conn, postgresIdleInTransactionTimeout, dbCfg.IdleInTransactionSessionTimeout)
+}
+
+func setPositiveRuntimeTimeout(conn *pgx.ConnConfig, key string, value time.Duration) {
+	if value <= 0 {
+		return
+	}
+	millis := value.Milliseconds()
+	if millis < 1 {
+		// PostgreSQL interprets 0 as "disabled". A positive sub-millisecond
+		// budget must round up to the smallest enforceable timeout instead.
+		millis = 1
+	}
+	conn.RuntimeParams[key] = strconv.FormatInt(millis, 10)
+}
+
+// newMigrate builds a golang-migrate instance with the shared DSN and
+// migrations-path validation used by both up and down.
+func newMigrate(dsn, migrationsPath string) (*migrate.Migrate, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return fmt.Errorf("invalid database DSN: %w", err)
+		return nil, fmt.Errorf("invalid database DSN: %w", err)
 	}
 	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
-		return fmt.Errorf("unsupported database scheme %q", u.Scheme)
+		return nil, fmt.Errorf("unsupported database scheme %q", u.Scheme)
 	}
 	u.Scheme = "pgx5"
 
 	absPath, err := filepath.Abs(migrationsPath)
 	if err != nil {
-		return fmt.Errorf("resolve migrations path: %w", err)
+		return nil, fmt.Errorf("resolve migrations path: %w", err)
 	}
 	sourceURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(absPath)}).String()
 
 	m, err := migrate.New(sourceURL, u.String())
 	if err != nil {
-		return fmt.Errorf("failed to create migrate instance: %w", err)
+		return nil, fmt.Errorf("failed to create migrate instance: %w", err)
+	}
+	return m, nil
+}
+
+func RunMigrations(dsn, migrationsPath string) error {
+	m, err := newMigrate(dsn, migrationsPath)
+	if err != nil {
+		return err
 	}
 	defer func() { _, _ = m.Close() }()
 
@@ -150,5 +197,21 @@ func RunMigrations(dsn, migrationsPath string) error {
 		return fmt.Errorf("failed to run migrations: %w", err)
 	}
 
+	return nil
+}
+
+// RunMigrationsDown rolls back every applied migration. It is destructive: the
+// initial down migration drops the whole application schema. Callers must gate
+// it behind an explicit database-name confirmation.
+func RunMigrationsDown(dsn, migrationsPath string) error {
+	m, err := newMigrate(dsn, migrationsPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _, _ = m.Close() }()
+
+	if err := m.Down(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("failed to roll back migrations: %w", err)
+	}
 	return nil
 }

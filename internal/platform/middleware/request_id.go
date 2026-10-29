@@ -34,24 +34,35 @@ func validRequestID(value string) bool {
 // forge or collide correlation IDs in logs, audit rows, and traces.
 func RequestID() fiber.Handler {
 	return func(c fiber.Ctx) error {
-		var requestID string
-		if c.IsProxyTrusted() {
-			// Clone: Fiber header strings are zero-copy views into a pooled
-			// buffer (Immutable=false), but the ID outlives the request in
-			// contexts, async goroutines, and exported span attributes.
-			requestID = strings.Clone(c.Get("X-Request-Id"))
-		}
-		if !validRequestID(requestID) {
-			requestID = uuid.New().String()
-		}
-
-		c.Set("X-Request-Id", requestID)
-
-		// Also set in context.Context for service/repository layer access.
-		ctx := requestctx.WithRequestID(c.Context(), requestID)
-		ctx = requestctx.WithPath(ctx, c.Path())
-		c.SetContext(ctx)
-
+		ensureRequestID(c)
 		return c.Next()
 	}
+}
+
+// ensureRequestID is idempotent so the outermost Recovery can install the ID
+// before CORS and the remaining middleware run, and the RequestID middleware
+// can reuse it instead of minting a second ID.
+func ensureRequestID(c fiber.Ctx) string {
+	if requestID := requestctx.RequestID(c.Context()); validRequestID(requestID) {
+		c.Set("X-Request-Id", requestID)
+		c.SetContext(requestctx.WithPath(c.Context(), c.Path()))
+		return requestID
+	}
+
+	var requestID string
+	if c.IsProxyTrusted() {
+		// Clone: Fiber header strings are zero-copy views into a pooled
+		// buffer (Immutable=false), but the ID outlives the request in
+		// contexts, async goroutines, and exported span attributes.
+		requestID = strings.Clone(c.Get("X-Request-Id"))
+	}
+	if !validRequestID(requestID) {
+		requestID = uuid.New().String()
+	}
+
+	c.Set("X-Request-Id", requestID)
+	ctx := requestctx.WithRequestID(c.Context(), requestID)
+	ctx = requestctx.WithPath(ctx, c.Path())
+	c.SetContext(ctx)
+	return requestID
 }

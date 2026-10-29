@@ -35,6 +35,20 @@ func TestDeliveryWorker_InvalidPayloadIsPermanent(t *testing.T) {
 	}
 }
 
+func TestDeliveryBodyDoesNotExposeSubjectUserIDs(t *testing.T) {
+	body, err := deliveryBody(fixedDelivery("https://example.com/hook", "", 0, 3))
+	if err != nil {
+		t.Fatalf("deliveryBody: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if _, ok := fields["subjectUserIds"]; ok {
+		t.Fatalf("delivery body leaked internal subject metadata: %s", body)
+	}
+}
+
 type fakeWorkerStore struct {
 	delivery   *Delivery
 	claimErr   error
@@ -485,6 +499,35 @@ func TestDeliveryWorker_RecordsAttemptAfterShutdownCancel(t *testing.T) {
 	}
 }
 
+// TestDeliveryWorker_BookkeepingTimeoutStartsAfterSend reproduces a slow
+// receiver exhausting the detached write deadline before the response arrived.
+// The attempt and its outcome must still be recorded with a fresh timeout.
+func TestDeliveryWorker_BookkeepingTimeoutStartsAfterSend(t *testing.T) {
+	codec, ciphertext := testCodec(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(250 * time.Millisecond)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	store := &fakeWorkerStore{
+		delivery:           fixedDelivery(server.URL, ciphertext, 0, 3),
+		snapshotCiphertext: ciphertext,
+		rejectCanceled:     true,
+	}
+	worker, _ := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	worker.bookkeepingTimeout = 100 * time.Millisecond
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: testID(7)})
+
+	if err := worker.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+	if len(store.attempts) != 1 || !store.succeeded {
+		t.Fatalf("slow response outcome was not recorded: attempts=%d succeeded=%v", len(store.attempts), store.succeeded)
+	}
+}
+
 // TestDeliveryWorker_AppliesEndpointTimeout proves the snapshotted endpoint
 // timeout bounds the request even when the client timeout is longer.
 func TestDeliveryWorker_AppliesEndpointTimeout(t *testing.T) {
@@ -579,6 +622,38 @@ func TestDeliveryWorker_ShutdownDuringSecretLookupReleasesAttempt(t *testing.T) 
 		delivery:           fixedDelivery("https://example.com/hook", ciphertext, 2, 3),
 		snapshotCiphertext: ciphertext,
 		signingErr:         errors.New("database is unavailable"),
+	}
+	worker, _ := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: testID(7)})
+
+	err := worker.Handle(ctx, payload)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Handle() error = %v, want context.Canceled so the job is released", err)
+	}
+	if !store.released || len(store.fencedAttempts) != 1 || store.fencedAttempts[0] != 3 {
+		t.Fatalf("claim must be released fenced on attempt 3: released=%v fenced=%v", store.released, store.fencedAttempts)
+	}
+	if store.dead || store.succeeded || store.retryDraft != nil {
+		t.Fatalf("interrupted attempt must not finish the delivery: dead=%v succeeded=%v retry=%+v",
+			store.dead, store.succeeded, store.retryDraft)
+	}
+	if len(store.attempts) != 0 {
+		t.Fatalf("interrupted attempt must not be recorded as a failure: %+v", store.attempts)
+	}
+}
+
+// TestDeliveryWorker_ShutdownDuringSnapshotLookupReleasesAttempt proves a job
+// context canceled while loading the event's snapshot secret does not consume
+// the final attempt or dead-letter the delivery.
+func TestDeliveryWorker_ShutdownDuringSnapshotLookupReleasesAttempt(t *testing.T) {
+	codec, ciphertext := testCodec(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	store := &fakeWorkerStore{
+		delivery:    fixedDelivery("https://example.com/hook", ciphertext, 2, 3),
+		snapshotErr: context.Canceled,
 	}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec

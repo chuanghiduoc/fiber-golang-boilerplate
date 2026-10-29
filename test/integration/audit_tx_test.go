@@ -73,18 +73,18 @@ func (r *toggleRecorder) RecordTx(ctx context.Context, tx pgx.Tx, event audit.Ev
 	return r.inner.RecordTx(ctx, tx, event)
 }
 
-func (r *toggleRecorder) RecordID(ctx context.Context, event audit.Event) (uuid.UUID, error) {
+func (r *toggleRecorder) RecordID(ctx context.Context, event audit.Event) (audit.IntentRef, error) {
 	if r.fail {
-		return uuid.Nil, errAuditDown
+		return audit.IntentRef{}, errAuditDown
 	}
 	return r.inner.RecordID(ctx, event)
 }
 
-func (r *toggleRecorder) Complete(ctx context.Context, id uuid.UUID, completion audit.Completion) error {
+func (r *toggleRecorder) Complete(ctx context.Context, intent audit.IntentRef, completion audit.Completion) error {
 	if r.fail {
 		return errAuditDown
 	}
-	return r.inner.Complete(ctx, id, completion)
+	return r.inner.Complete(ctx, intent, completion)
 }
 
 func setupAuditTxHarness(t *testing.T) *auditTxHarness {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -19,7 +20,7 @@ import (
 )
 
 type completionCall struct {
-	ID         uuid.UUID
+	Intent     audit.IntentRef
 	Completion audit.Completion
 }
 
@@ -35,17 +36,17 @@ func (r *guardRecorder) Record(context.Context, audit.Event) error { return nil 
 
 func (r *guardRecorder) RecordTx(context.Context, pgx.Tx, audit.Event) error { return nil }
 
-func (r *guardRecorder) RecordID(_ context.Context, event audit.Event) (uuid.UUID, error) {
+func (r *guardRecorder) RecordID(_ context.Context, event audit.Event) (audit.IntentRef, error) {
 	r.intents = append(r.intents, event)
 	if r.intentErr != nil {
-		return uuid.Nil, r.intentErr
+		return audit.IntentRef{}, r.intentErr
 	}
 	r.nextID = uuid.New()
-	return r.nextID, nil
+	return audit.IntentRef{ID: r.nextID, CreatedAt: time.Now().UTC()}, nil
 }
 
-func (r *guardRecorder) Complete(_ context.Context, id uuid.UUID, completion audit.Completion) error {
-	r.completions = append(r.completions, completionCall{ID: id, Completion: completion})
+func (r *guardRecorder) Complete(_ context.Context, intent audit.IntentRef, completion audit.Completion) error {
+	r.completions = append(r.completions, completionCall{Intent: intent, Completion: completion})
 	return r.completeErr
 }
 
@@ -164,7 +165,7 @@ func TestGuard_CompletionMapping(t *testing.T) {
 			assert.Equal(t, tt.want, recorder.completions[0].Completion.Outcome)
 			assert.Equal(t, tt.status, recorder.completions[0].Completion.StatusCode)
 			assert.Equal(t, tt.errorCode, recorder.completions[0].Completion.ErrorCode)
-			assert.NotEqual(t, uuid.Nil, recorder.completions[0].ID)
+			assert.NotEqual(t, uuid.Nil, recorder.completions[0].Intent.ID)
 		})
 	}
 }

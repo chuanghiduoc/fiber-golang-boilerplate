@@ -77,7 +77,7 @@ func UserActor(id uuid.UUID) Actor {
 // Event is the versioned envelope delivered to local and durable handlers and,
 // through the webhooks module, to external receivers. TenantID, Actor, and
 // RequestID are populated from the publishing context unless the caller set
-// them explicitly.
+// them explicitly. SubjectUserIDs is producer-supplied privacy metadata.
 type Event struct {
 	ID          uuid.UUID       `json:"id"`
 	Type        string          `json:"type"`
@@ -90,6 +90,10 @@ type Event struct {
 	// is process-internal metadata, not part of the public envelope: webhook
 	// deliveries never carry it.
 	RequestID string `json:"requestId,omitempty"`
+	// SubjectUserIDs names every user whose data the event concerns. It is
+	// internal metadata: durable jobs carry it, but the signed webhook body is
+	// rebuilt without it. An empty slice means the actor is the only subject.
+	SubjectUserIDs []uuid.UUID `json:"subjectUserIds,omitempty"`
 }
 
 // NewEvent builds an event with a fresh UUIDv7 id and timestamp. data may be
@@ -101,11 +105,12 @@ func NewEvent(eventType string, dataVersion int, data any) (Event, error) {
 		return Event{}, err
 	}
 	event := Event{
-		ID:          id,
-		Type:        eventType,
-		DataVersion: dataVersion,
-		OccurredAt:  time.Now().UTC(),
-		Data:        json.RawMessage(`{}`),
+		ID:             id,
+		Type:           eventType,
+		DataVersion:    dataVersion,
+		OccurredAt:     time.Now().UTC(),
+		Data:           json.RawMessage(`{}`),
+		SubjectUserIDs: []uuid.UUID{},
 	}
 	switch value := data.(type) {
 	case nil:
@@ -153,8 +158,25 @@ func (e Event) Validate() error {
 	if err := e.Actor.validate(); err != nil {
 		return err
 	}
+	if err := validateSubjectUserIDs(e.SubjectUserIDs); err != nil {
+		return err
+	}
 	if len(e.Data) > 0 && !json.Valid(e.Data) {
 		return fmt.Errorf("%w: data must be valid JSON", ErrInvalidEvent)
+	}
+	return nil
+}
+
+func validateSubjectUserIDs(ids []uuid.UUID) error {
+	seen := make(map[uuid.UUID]struct{}, len(ids))
+	for _, id := range ids {
+		if id == uuid.Nil {
+			return fmt.Errorf("%w: subject user id must not be nil", ErrInvalidEvent)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return fmt.Errorf("%w: duplicate subject user id %s", ErrInvalidEvent, id)
+		}
+		seen[id] = struct{}{}
 	}
 	return nil
 }

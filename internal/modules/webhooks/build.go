@@ -97,7 +97,7 @@ func Build(infra app.Infra, settings Settings, deps Deps) (*Module, error) {
 		RetryMax:  cfg.RetryMax,
 	})
 	m.retentionDays = int32(cfg.Retention / (24 * time.Hour)) // #nosec G115 -- validated 1..3650 whole days
-	m.privacy = webhooksprivacy.New(webhookrepo.NewPrivacyStore(infra.DB))
+	m.privacy = webhooksprivacy.New(webhookrepo.NewPrivacyStore(infra.DB, infra.Tx))
 	m.tenantPurger = webhookrepo.NewTenantPurger(infra.DB)
 	return m, nil
 }

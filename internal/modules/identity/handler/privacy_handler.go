@@ -14,6 +14,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 // PrivacyService is the privacy surface the handlers use.
@@ -22,20 +23,26 @@ type PrivacyService interface {
 	ListExports(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]core.DataExport, bool, error)
 	GetExport(ctx context.Context, userID, id uuid.UUID) (*core.DataExport, error)
 	DownloadExport(ctx context.Context, userID, id uuid.UUID) (*core.DataExport, io.ReadCloser, error)
-	RequestSelfErasure(ctx context.Context, userID uuid.UUID, password string) error
+	RequestSelfErasure(ctx context.Context, userID uuid.UUID, password string, sessionID uuid.UUID) error
 	RequestAdminErasure(ctx context.Context, userID uuid.UUID) error
 	ListErasureRequests(ctx context.Context, userID uuid.UUID, limit int, startingAfter string) ([]core.ErasureRequest, bool, error)
 	GetErasureRequest(ctx context.Context, userID, id uuid.UUID) (*core.ErasureRequest, error)
+	GetMemberErasureRequest(ctx context.Context, userID, requestID uuid.UUID) (*core.ErasureRequest, error)
 }
 
 // PrivacyHandler serves the caller's data exports and erasure requests.
 type PrivacyHandler struct {
 	service PrivacyService
+	keyring *token.Keyring
 }
 
 func NewPrivacyHandler(service PrivacyService) *PrivacyHandler {
 	return &PrivacyHandler{service: service}
 }
+
+// SetJWTKeyring installs the keyring used to recover the caller's session id.
+// A passwordless account re-authenticates an erasure with a recent session.
+func (h *PrivacyHandler) SetJWTKeyring(keyring *token.Keyring) { h.keyring = keyring }
 
 func toDataExportResponse(export *core.DataExport) dto.DataExportResponse {
 	resp := dto.DataExportResponse{
@@ -66,7 +73,7 @@ func toErasureResponse(request *core.ErasureRequest) dto.ErasureRequestResponse 
 }
 
 type listExportsInput struct {
-	Limit         int    `query:"limit" minimum:"1" maximum:"100" default:"20"`
+	Limit         int    `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string `query:"startingAfter"`
 }
 
@@ -77,7 +84,8 @@ type exportInput struct {
 }
 
 type requestErasureInput struct {
-	Body dto.ErasureRequest
+	Authorization string `header:"Authorization"`
+	Body          dto.ErasureRequest
 }
 
 type erasureInput struct {
@@ -86,6 +94,11 @@ type erasureInput struct {
 
 type memberErasureInput struct {
 	MemberID string `path:"memberId" format:"uuid"`
+}
+
+type memberErasureRequestInput struct {
+	MemberID  string `path:"memberId" format:"uuid"`
+	RequestID string `path:"requestId" format:"uuid"`
 }
 
 // CreateExport queues a JSON export of the caller's data in the request
@@ -137,16 +150,11 @@ func (h *PrivacyHandler) DownloadExport(ctx context.Context, input *exportInput)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = reader.Close() }()
-	payload, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, apperror.Internal(err, "failed to read data export")
-	}
 	return &exportOutput{
 		ContentType:        "application/json",
 		ContentDisposition: httpx.ContentDispositionAttachment("data-export-" + export.ID.String() + ".json"),
 		CacheControl:       "private, no-store",
-		Body:               payload,
+		Body:               streamExport(reader, export.ID),
 	}, nil
 }
 
@@ -156,7 +164,8 @@ func (h *PrivacyHandler) EraseMe(ctx context.Context, input *requestErasureInput
 		return nil, apperror.NewCode(apperror.CodePermissionDenied, "API keys cannot erase an account")
 	}
 	userID := actorID(ctx)
-	if err := h.service.RequestSelfErasure(ctx, userID, input.Body.CurrentPassword); err != nil {
+	sessionID := sessionIDFromBearer(h.keyring, input.Authorization)
+	if err := h.service.RequestSelfErasure(ctx, userID, input.Body.CurrentPassword, sessionID); err != nil {
 		return nil, err
 	}
 	location := "/api/v1/me/erasure-requests/" + userID.String()
@@ -188,6 +197,25 @@ func (h *PrivacyHandler) EraseUser(ctx context.Context, input *memberErasureInpu
 		Status:      "queued",
 		RequestedAt: time.Now().UTC(),
 	}), nil
+}
+
+// GetMemberErasureRequest returns the tenant-scoped status resource created by
+// EraseUser. The caller must hold admin:users:delete; tenant resolution and RLS
+// keep another tenant's member invisible.
+func (h *PrivacyHandler) GetMemberErasureRequest(ctx context.Context, input *memberErasureRequestInput) (*httpapi.Output[dto.ErasureRequestResponse], error) {
+	memberID, err := parseUUID(input.MemberID, "memberId")
+	if err != nil {
+		return nil, err
+	}
+	requestID, err := parseUUID(input.RequestID, "requestId")
+	if err != nil {
+		return nil, err
+	}
+	request, err := h.service.GetMemberErasureRequest(ctx, memberID, requestID)
+	if err != nil {
+		return nil, err
+	}
+	return &httpapi.Output[dto.ErasureRequestResponse]{Body: toErasureResponse(request)}, nil
 }
 
 // ListErasureRequests lists the caller's erasure requests in the request

@@ -2,8 +2,11 @@ package repository_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -49,6 +52,73 @@ func TestTenantPurgerDeletesFileBlobsThenRowsInBoundedBatches(t *testing.T) {
 	assert.Len(t, store.deleted, int(tenancycontracts.PurgeBatchSize))
 	assert.Equal(t, 2, queryCalls, "the drained page is followed by an empty select")
 	assert.Equal(t, 1, db.execCalls)
+}
+
+func TestTenantPurgerDoesNotDeleteRowsWhenABlobDeleteFails(t *testing.T) {
+	tenantID := testID(7)
+	db := &purgeDB{}
+	db.queryFn = func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+		return &purgeRows{rows: [][]any{{testID(1), fmt.Sprintf("%s/1/1.bin", tenantID)}}}, nil
+	}
+	db.execFn = func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+		t.Fatal("row delete must not run after a blob failure")
+		return pgconn.CommandTag{}, nil
+	}
+	store := &purgeBlobStore{err: errors.New("object store unavailable")}
+
+	err := filesrepo.NewTenantPurger(db, store).PurgeTenant(context.Background(), tenantID)
+	require.Error(t, err)
+	assert.Zero(t, db.execCalls)
+}
+
+func TestTenantPurgerBoundsConcurrentBlobDeletes(t *testing.T) {
+	tenantID := testID(7)
+	db := &purgeDB{}
+	queryCalls := 0
+	db.queryFn = func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+		queryCalls++
+		if queryCalls > 1 {
+			return &purgeRows{}, nil
+		}
+		rows := make([][]any, tenancycontracts.PurgeBatchSize)
+		for i := range rows {
+			rows[i] = []any{testID(i + 1), fmt.Sprintf("%s/1/%d.bin", tenantID, i+1)}
+		}
+		return &purgeRows{rows: rows}, nil
+	}
+	db.execFn = func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+		return pgconn.NewCommandTag("DELETE 500"), nil
+	}
+	store := &blockedBlobStore{
+		started: make(chan string, int(tenancycontracts.PurgeBatchSize)),
+		release: make(chan struct{}),
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- filesrepo.NewTenantPurger(db, store).PurgeTenant(context.Background(), tenantID)
+	}()
+
+	for i := 0; i < int(tenantPurgeTestConcurrency); i++ {
+		select {
+		case <-store.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("blob deletes did not start")
+		}
+	}
+	select {
+	case <-store.started:
+		t.Fatal("more than the configured number of blob deletes started concurrently")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(store.release)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("purge did not finish after releasing blob deletes")
+	}
 }
 
 // purgeDB is the minimal filesqlc.DBTX double this test needs; the shared
@@ -120,10 +190,39 @@ func (r *purgeRows) Close() {}
 
 type purgeBlobStore struct {
 	storage.Storage // unused methods fail loudly if called
+	err             error
+	mu              sync.Mutex
 	deleted         []string
 }
 
 func (s *purgeBlobStore) Delete(_ context.Context, path string) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.deleted = append(s.deleted, path)
 	return nil
+}
+
+const tenantPurgeTestConcurrency = 4
+
+type blockedBlobStore struct {
+	storage.Storage
+	started chan string
+	release chan struct{}
+}
+
+func (s *blockedBlobStore) Delete(ctx context.Context, path string) error {
+	select {
+	case s.started <- path:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

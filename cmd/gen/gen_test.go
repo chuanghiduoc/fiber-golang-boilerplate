@@ -304,8 +304,23 @@ func TestGenerateEverySliceAndVerify(t *testing.T) {
 	if integ := files["internal/modules/billing/invoice_integration_test.go"]; !strings.Contains(integ, "Sessions: integrationSessions{}") {
 		t.Error("generated integration test must wire a session store so authz has the caller's permissions")
 	}
-	if migration := files["migrations/20261025010204_billing_create_invoices.up.sql"]; !strings.Contains(migration, "id UUID PRIMARY KEY DEFAULT uuidv7()") {
-		t.Error("resource migration must use a UUIDv7 primary key")
+	migration := files["migrations/20261025010204_billing_create_invoices.up.sql"]
+	for _, want := range []string{
+		"id UUID NOT NULL DEFAULT uuidv7()",
+		"CONSTRAINT pk_billing_invoices PRIMARY KEY (id)",
+		"name TEXT NOT NULL",
+		"CONSTRAINT fk_billing_invoices_tenant FOREIGN KEY (tenant_id)",
+		"CONSTRAINT chk_billing_invoices_name",
+		"CHECK (btrim(name) <> '' AND length(name) <= 255)",
+	} {
+		if !strings.Contains(migration, want) {
+			t.Errorf("resource migration is missing %q:\n%s", want, migration)
+		}
+	}
+	for _, unwanted := range []string{"CREATE TABLE IF NOT EXISTS", "CREATE INDEX IF NOT EXISTS", "VARCHAR"} {
+		if strings.Contains(migration, unwanted) {
+			t.Errorf("resource migration must fail fast and follow schema conventions; found %q:\n%s", unwanted, migration)
+		}
 	}
 	if !strings.Contains(files["internal/modules/billing/service/ports.go"], `"example.com/app/pkg/pagination"`) {
 		t.Error("ports.go must import pagination for the resource port")
@@ -326,7 +341,6 @@ func TestGenerateEverySliceAndVerify(t *testing.T) {
 	if strings.Contains(build, "NewInvoiceRepository(infra.Pool)") {
 		t.Error("resource repository must use infra.DB (RLS-scoped), not the raw pool")
 	}
-	migration := files["migrations/20261025010204_billing_create_invoices.up.sql"]
 	for _, want := range []string{
 		"ENABLE ROW LEVEL SECURITY",
 		"FORCE ROW LEVEL SECURITY",
@@ -341,12 +355,18 @@ func TestGenerateEverySliceAndVerify(t *testing.T) {
 		t.Error("resource queries must include a bounded tenant purge query")
 	}
 	if purge := files["internal/modules/billing/repository/invoice_purge.go"]; !strings.Contains(purge, "PurgeTenant") ||
-		!strings.Contains(purge, "tenancycontracts.PurgeBatchSize") {
-		t.Error("resource repository must include a bounded Tenancy Purger")
+		!strings.Contains(purge, "tenancycontracts.PurgeBatchSize") ||
+		!strings.Contains(purge, "tenancycontracts.CheckPurgeBudget(ctx)") {
+		t.Error("resource repository must include a budget-aware bounded Tenancy Purger")
 	}
 	if module := files["internal/modules/billing/tenant_purge.go"]; !strings.Contains(module, "TenantPurgers") ||
-		!strings.Contains(module, "tenancycontracts.Provider") {
-		t.Error("module must expose its composite tenant purger")
+		!strings.Contains(module, "tenancycontracts.Provider") ||
+		!strings.Contains(module, "tenancycontracts.CheckPurgeBudget(ctx)") {
+		t.Error("module must expose a budget-aware composite tenant purger")
+	}
+	if service := files["internal/modules/billing/service/invoice.go"]; strings.Contains(service, "row %d escaped") ||
+		!strings.Contains(service, "row %s escaped") {
+		t.Error("generated service must format UUID ids as text")
 	}
 	if bootstrapSrc := files[bootstrapFile]; !strings.Contains(bootstrapSrc, "\t\tbillingModule,\n") {
 		t.Errorf("bootstrap must register the billing module's purgers:\n%s", bootstrapSrc)
@@ -365,7 +385,7 @@ func TestGenerateEverySliceAndVerify(t *testing.T) {
 		!strings.Contains(dto, "Name *string") {
 		t.Error("dto must expose pointer-field partial update input")
 	}
-	if integration := files["internal/modules/billing/invoice_integration_test.go"]; !strings.Contains(integration, "testutil.Scoped(pool)") ||
+	if integration := files["internal/modules/billing/invoice_integration_test.go"]; !strings.Contains(integration, "fx.Scoped()") ||
 		!strings.Contains(integration, "DB: db") ||
 		!strings.Contains(integration, "NewInvoiceTenantPurger(db).PurgeTenant") {
 		t.Error("integration test must exercise the RLS app pool and the generated tenant purger, not the bypass pool")
@@ -395,7 +415,7 @@ func TestFailedVerificationRollsBackEveryWrite(t *testing.T) {
 	before := tree(t, g)
 
 	g.run = func(_ context.Context, name string, args ...string) error {
-		if name == "sqlc" {
+		if name == "go" && len(args) >= 2 && args[0] == "tool" && args[1] == "sqlc" {
 			// The regenerated directory changes before the later failure.
 			if err := g.repo.WriteFile(filepath.FromSlash("internal/modules/billing/sqlc/invoice.sql.go"), []byte("package sqlc\n"), 0o600); err != nil {
 				return err

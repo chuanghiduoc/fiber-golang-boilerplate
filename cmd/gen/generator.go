@@ -345,7 +345,7 @@ func verifySteps(module string, sqlc bool) []step {
 	pkgs := "./internal/modules/" + module + "/..."
 	var steps []step
 	if sqlc {
-		steps = append(steps, step{"sqlc", []string{"generate", "-f", "internal/modules/" + module + "/sqlc.yaml"}})
+		steps = append(steps, step{"go", []string{"tool", "sqlc", "generate", "-f", "internal/modules/" + module + "/sqlc.yaml"}})
 	}
 	return append(steps,
 		step{"go", []string{"build", "./..."}},

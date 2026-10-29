@@ -104,8 +104,8 @@ func TestEffectiveScopes_CurrentRoleBoundsKey(t *testing.T) {
 		t.Fatalf("effective scopes = %v, want both scopes for admin", got)
 	}
 
-	if got := effectiveScopes(identitycontracts.Principal{}, scopes, testAuthorizer()); len(got) != 2 {
-		t.Fatalf("effective scopes without a principal = %v, want scopes unchanged", got)
+	if got := effectiveScopes(identitycontracts.Principal{}, scopes, testAuthorizer()); len(got) != 0 {
+		t.Fatalf("effective scopes without a principal = %v, want no scopes (fail closed)", got)
 	}
 }
 

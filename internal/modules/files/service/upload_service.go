@@ -9,6 +9,7 @@ import (
 	"mime"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -23,7 +24,11 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage/scan"
 )
 
-const maxOriginalNameRunes = 255
+const (
+	maxOriginalNameRunes = 255
+	// storageCleanupTimeout bounds detached cleanup calls after the request is done.
+	storageCleanupTimeout = 30 * time.Second
+)
 
 var mimeExtensions = map[string]string{
 	"image/jpeg":      ".jpg",
@@ -114,7 +119,7 @@ func (s *uploadService) Upload(ctx context.Context, userID uuid.UUID, filename s
 		if createErr != nil {
 			return createErr
 		}
-		if pubErr := publishEvent(ctx, tx.Events, filescontracts.EventFileUploaded, filescontracts.FileUploadedVersion, tenantID, fileUploaded(created)); pubErr != nil {
+		if pubErr := publishEvent(ctx, tx.Events, filescontracts.EventFileUploaded, filescontracts.FileUploadedVersion, tenantID, []uuid.UUID{created.UserID}, fileUploaded(created)); pubErr != nil {
 			return pubErr
 		}
 		file = created
@@ -170,9 +175,12 @@ func (s *uploadService) scanStored(ctx context.Context, storagePath string, size
 }
 
 // removeBlob deletes a stored blob whose upload was rejected. The request
-// context may already be canceled, so cleanup uses a detached context.
+// context may already be canceled, so cleanup uses a detached context, but it
+// still needs a deadline: a stuck storage provider must not pin the request.
 func (s *uploadService) removeBlob(ctx context.Context, storagePath, reason string) {
-	if err := s.storage.Delete(context.WithoutCancel(ctx), storagePath); err != nil {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storageCleanupTimeout)
+	defer cancel()
+	if err := s.storage.Delete(cleanupCtx, storagePath); err != nil {
 		slog.Error(reason, slog.String("path", storagePath), slog.Any("error", err))
 	}
 }
@@ -185,12 +193,12 @@ func (s *uploadService) precheckQuota(ctx context.Context, repo FileRepository, 
 	if !s.quotasEnabled() {
 		return nil
 	}
-	tenantBytes, userBytes, err := repo.StorageUsage(ctx, userID)
+	usage, err := repo.StorageUsage(ctx, userID, s.quotaScope())
 	if err != nil {
 		slog.Error("failed to check storage quota before upload", slog.Any("error", err))
 		return apperror.Internal(err, "failed to check storage quota")
 	}
-	if s.quotaExceeded(tenantBytes, userBytes, size) {
+	if s.quotaExceeded(usage, size) {
 		return apperror.NewCode(filescatalog.CodeFileQuotaExceeded, "storage quota exceeded")
 	}
 	return nil
@@ -200,29 +208,34 @@ func (s *uploadService) quotasEnabled() bool {
 	return s.opts.TenantQuotaBytes > 0 || s.opts.UserQuotaBytes > 0
 }
 
-func (s *uploadService) quotaExceeded(tenantBytes, userBytes, size int64) bool {
-	tenantExceeded := s.opts.TenantQuotaBytes > 0 && tenantBytes+size > s.opts.TenantQuotaBytes
-	userExceeded := s.opts.UserQuotaBytes > 0 && userBytes+size > s.opts.UserQuotaBytes
+func (s *uploadService) quotaScope() QuotaScope {
+	return QuotaScope{
+		Tenant: s.opts.TenantQuotaBytes > 0,
+		User:   s.opts.UserQuotaBytes > 0,
+	}
+}
+
+func (s *uploadService) quotaExceeded(usage QuotaUsage, size int64) bool {
+	tenantExceeded := s.opts.TenantQuotaBytes > 0 && usage.TenantBytes+size > s.opts.TenantQuotaBytes
+	userExceeded := s.opts.UserQuotaBytes > 0 && usage.UserBytes+size > s.opts.UserQuotaBytes
 	return tenantExceeded || userExceeded
 }
 
 // checkQuota refuses an upload that would push the tenant or the user over
-// its configured byte quota. The per-tenant advisory lock is taken first and
-// held until the transaction ends, so concurrent uploads serialize: the second
-// one sees the first one's row and cannot also pass. Trashed rows count
-// because their blobs are still stored.
+// its configured byte quota. A user quota locks only that user's counter row;
+// a tenant quota takes a tenant advisory lock and sums the per-user counters.
+// The lock is held until the transaction ends, so concurrent uploads serialize
+// exactly as far as the configured quota requires. Trashed rows count because
+// their blobs are still stored.
 func (s *uploadService) checkQuota(ctx context.Context, repo FileRepository, userID uuid.UUID, size int64) error {
 	if !s.quotasEnabled() {
 		return nil
 	}
-	if err := repo.LockQuota(ctx); err != nil {
-		return err
-	}
-	tenantBytes, userBytes, err := repo.StorageUsage(ctx, userID)
+	usage, err := repo.LockStorageUsage(ctx, userID, s.quotaScope())
 	if err != nil {
 		return err
 	}
-	if !s.quotaExceeded(tenantBytes, userBytes, size) {
+	if !s.quotaExceeded(usage, size) {
 		return nil
 	}
 	return apperror.NewCode(filescatalog.CodeFileQuotaExceeded, "storage quota exceeded")
@@ -422,7 +435,7 @@ func (s *uploadService) Delete(ctx context.Context, id, userID uuid.UUID) error 
 		if delErr != nil {
 			return delErr
 		}
-		return publishEvent(ctx, tx.Events, filescontracts.EventFileDeleted, filescontracts.FileDeletedVersion, deleted.TenantID, fileDeleted(deleted))
+		return publishEvent(ctx, tx.Events, filescontracts.EventFileDeleted, filescontracts.FileDeletedVersion, deleted.TenantID, []uuid.UUID{deleted.UserID}, fileDeleted(deleted))
 	})
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -476,7 +489,7 @@ func (s *uploadService) Restore(ctx context.Context, id, userID uuid.UUID) (*Fil
 		if restoreErr != nil {
 			return restoreErr
 		}
-		if pubErr := publishEvent(ctx, tx.Events, filescontracts.EventFileRestored, filescontracts.FileRestoredVersion, row.TenantID, fileRestored(row)); pubErr != nil {
+		if pubErr := publishEvent(ctx, tx.Events, filescontracts.EventFileRestored, filescontracts.FileRestoredVersion, row.TenantID, []uuid.UUID{row.UserID}, fileRestored(row)); pubErr != nil {
 			return pubErr
 		}
 		restored = row

@@ -76,6 +76,27 @@ func (r *PasskeyRepository) ListByUser(ctx context.Context, userID uuid.UUID) ([
 	return out, nil
 }
 
+func (r *PasskeyRepository) ListByUserLimited(ctx context.Context, userID uuid.UUID, limit int32) ([]core.Passkey, bool, error) {
+	if limit <= 0 {
+		return []core.Passkey{}, false, nil
+	}
+	rows, err := r.q.ListPasskeysByUserLimited(ctx, identitysqlc.ListPasskeysByUserLimitedParams{
+		UserID: userID, RowLimit: limit + 1,
+	})
+	if err != nil {
+		return nil, false, wrapErr(err)
+	}
+	truncated := len(rows) > int(limit)
+	if truncated {
+		rows = rows[:limit]
+	}
+	out := make([]core.Passkey, len(rows))
+	for i, row := range rows {
+		out[i] = *toPasskey(row)
+	}
+	return out, truncated, nil
+}
+
 func (r *PasskeyRepository) GetByCredentialID(ctx context.Context, credentialID []byte) (*core.Passkey, error) {
 	row, err := r.q.GetPasskeyByCredentialID(ctx, credentialID)
 	if err != nil {

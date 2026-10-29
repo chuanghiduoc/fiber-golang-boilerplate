@@ -539,3 +539,69 @@ func TestMemoryCacheConcurrentSetNXHasOneWinner(t *testing.T) {
 		t.Fatalf("SetNX winners = %d, want exactly 1", winners)
 	}
 }
+
+func TestMemoryCacheCopiesStoredValues(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	source := []byte("original")
+	if err := mc.Set(ctx, "value", source, time.Minute); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	source[0] = 'X'
+	got, err := mc.Get(ctx, "value")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got) != "original" {
+		t.Fatalf("stored value = %q, want original", got)
+	}
+
+	got[0] = 'Y'
+	again, err := mc.Get(ctx, "value")
+	if err != nil {
+		t.Fatalf("second Get: %v", err)
+	}
+	if string(again) != "original" {
+		t.Fatalf("cached value after caller mutation = %q, want original", again)
+	}
+
+	lock := []byte("owner")
+	stored, err := mc.SetNX(ctx, "lock", lock, time.Minute)
+	if err != nil || !stored {
+		t.Fatalf("SetNX = %v, %v; want true, nil", stored, err)
+	}
+	lock[0] = 'Z'
+	owner, err := mc.Get(ctx, "lock")
+	if err != nil {
+		t.Fatalf("Get(lock): %v", err)
+	}
+	if string(owner) != "owner" {
+		t.Fatalf("lock value = %q, want owner", owner)
+	}
+}
+
+func TestMemoryCacheIncrementOverflowFails(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	const maxInt64 = "9223372036854775807"
+	if err := mc.Set(ctx, "counter", []byte(maxInt64), time.Minute); err != nil {
+		t.Fatalf("Set(counter): %v", err)
+	}
+	if _, err := mc.Increment(ctx, "counter", time.Minute); err == nil {
+		t.Fatal("Increment at MaxInt64 returned nil error, want overflow error")
+	}
+	got, err := mc.Get(ctx, "counter")
+	if err != nil {
+		t.Fatalf("Get(counter): %v", err)
+	}
+	if string(got) != maxInt64 {
+		t.Fatalf("counter after failed increment = %q, want %s", got, maxInt64)
+	}
+	if value, ok, err := mc.IncrementBelow(ctx, "counter", time.Minute, 9223372036854775807); err != nil || ok || value != 9223372036854775807 {
+		t.Fatalf("IncrementBelow at MaxInt64 = %d, %v, %v; want MaxInt64, false, nil", value, ok, err)
+	}
+}

@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"bytes"
 	"io"
 	"strings"
 
@@ -129,8 +130,10 @@ func bufferChunkedBody(c fiber.Ctx, limit int) error {
 	if len(body) > limit {
 		return apperror.NewPayloadTooLarge("request body too large")
 	}
-	c.Request().SetBody(body)
-	c.Request().Header.SetContentLength(len(body))
+	// humafiber reads Request().BodyStream() when StreamRequestBody is on, so
+	// the buffered bytes must be put back as a stream. SetBody clears the
+	// stream, which makes Huma see an empty body and reject the request.
+	c.Request().SetBodyStream(bytes.NewReader(body), len(body))
 	return nil
 }
 

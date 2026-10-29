@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -15,7 +16,11 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
 
-const googleUserInfoURL = "https://www.googleapis.com/oauth2/v2/userinfo"
+const (
+	googleUserInfoURL      = "https://www.googleapis.com/oauth2/v2/userinfo"
+	maxGoogleUserInfoBytes = 64 << 10
+	googleHTTPTimeout      = 10 * time.Second
+)
 
 // Errors that describe a usable token whose user info cannot be trusted. They
 // are sentinels so the HTTP adapter can answer with a client-facing problem
@@ -44,6 +49,9 @@ type GoogleOAuth struct {
 	// userInfoURL is Google's userinfo endpoint; a field so tests can point
 	// it at a local server.
 	userInfoURL string
+	// httpTimeout bounds the token exchange plus the userinfo request even when
+	// the caller's context has no deadline. Zero uses googleHTTPTimeout.
+	httpTimeout time.Duration
 }
 
 func NewGoogleOAuth(cfg config.OAuthConfig) *GoogleOAuth {
@@ -57,6 +65,7 @@ func NewGoogleOAuth(cfg config.OAuthConfig) *GoogleOAuth {
 		},
 		frontendURL: cfg.FrontendURL,
 		userInfoURL: googleUserInfoURL,
+		httpTimeout: googleHTTPTimeout,
 	}
 }
 
@@ -128,13 +137,24 @@ func (e *UpstreamError) Error() string {
 }
 
 func (g *GoogleOAuth) Exchange(ctx context.Context, code, codeVerifier string) (*GoogleUserInfo, error) {
+	timeout := g.httpTimeout
+	if timeout <= 0 {
+		timeout = googleHTTPTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	token, err := g.cfg.Exchange(ctx, code, oauth2.VerifierOption(codeVerifier))
 	if err != nil {
 		return nil, fmt.Errorf("failed to exchange code: %w", err)
 	}
 
 	client := g.cfg.Client(ctx, token)
-	resp, err := client.Get(g.userInfoURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.userInfoURL, http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("build user info request: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user info: %w", err)
 	}
@@ -147,8 +167,16 @@ func (g *GoogleOAuth) Exchange(ctx context.Context, code, codeVerifier string) (
 		return nil, &UpstreamError{Op: "userinfo", StatusCode: resp.StatusCode}
 	}
 
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGoogleUserInfoBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read user info: %w", err)
+	}
+	if len(body) > maxGoogleUserInfoBytes {
+		return nil, fmt.Errorf("google userinfo response exceeds %d bytes", maxGoogleUserInfoBytes)
+	}
+
 	var info GoogleUserInfo
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+	if err := json.Unmarshal(body, &info); err != nil {
 		return nil, fmt.Errorf("failed to decode user info: %w", err)
 	}
 

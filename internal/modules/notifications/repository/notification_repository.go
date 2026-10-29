@@ -25,6 +25,11 @@ type NotificationRepository struct {
 
 var _ notificationservice.NotificationRepository = (*NotificationRepository)(nil)
 
+// markAllReadBatchSize bounds rows locked and updated by one statement. The
+// service still marks every unread row, but gives concurrent readers/writers a
+// chance between batches instead of holding one large row set for the request.
+const markAllReadBatchSize int32 = 500
+
 // NewNotificationRepository binds the repository to db: a pool for standalone
 // reads and writes, or a pgx.Tx inside Transactor.InTx.
 func NewNotificationRepository(db notificationsqlc.DBTX) *NotificationRepository {
@@ -149,10 +154,21 @@ func (r *NotificationRepository) MarkAllRead(ctx context.Context, userID uuid.UU
 	if err != nil {
 		return 0, err
 	}
-	return r.q.MarkAllNotificationsRead(ctx, notificationsqlc.MarkAllNotificationsReadParams{
-		TenantID: tenantID,
-		UserID:   userID,
-	})
+	var updated int64
+	for {
+		batch, err := r.q.MarkAllNotificationsRead(ctx, notificationsqlc.MarkAllNotificationsReadParams{
+			TenantID:  tenantID,
+			UserID:    userID,
+			BatchSize: markAllReadBatchSize,
+		})
+		if err != nil {
+			return updated, err
+		}
+		updated += batch
+		if batch < int64(markAllReadBatchSize) {
+			return updated, nil
+		}
+	}
 }
 
 func (r *NotificationRepository) GetPreference(ctx context.Context, userID uuid.UUID, notificationType, channel string) (*notificationservice.Preference, error) {

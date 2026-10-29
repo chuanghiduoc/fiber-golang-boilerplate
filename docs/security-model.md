@@ -26,7 +26,7 @@ cross-tenant reference is rejected by the schema as well as by queries. See
 
 | Principal | Reaches |
 |---|---|
-| Anonymous | Health/readiness/metrics endpoints and the documented public routes (`/auth/*`), still resolved to a tenant by `X-Tenant-Slug` or the validated `?tenant=` fallback. |
+| Anonymous | Health/readiness/metrics endpoints (no tenant resolution) and the documented public routes. The tenant comes from `X-Tenant-Slug` or, only on `/api/v1/auth/google`, `/api/v1/auth/password-resets/complete`, and `/api/v1/auth/email-verifications/complete`, the validated `?tenant=` fallback; the Google callback uses signed state and the public webhook receiver uses its source row. |
 | Tenant member | Only the request tenant's rows: the tenant comes from the JWT claim (after `X-Tenant-Slug` resolution and conflict checks) or from the API key, never from a request body. |
 | Platform administrator | Named platform routes (`platform:tenants:*`, `platform:features:write`, `platform:users:mfa_reset`); these are the only cross-tenant HTTP capabilities. |
 | Background worker / scheduler / seeder | `authz.SystemContext`; job handlers restore the job's `tenant_id`, and named global jobs mark a bypass context. |
@@ -66,8 +66,9 @@ exists; `test/arch` and the migration verifier keep that check from drifting.
 A query that forgot its `tenant_id` predicate still cannot read or write
 another tenant's rows, and a `RETURNING` row from another tenant cannot leak.
 The global tables (`users`, `user_passwords`, `user_identities`,
-`password_reset_tokens`, `email_verification_tokens`, `tenants`,
-`permissions`, `feature_flags`, `scheduler_*`) are reached
+`password_reset_tokens`, `email_verification_tokens`, `mfa_factors`,
+`mfa_recovery_codes`, `webauthn_credentials`, `platform_role_assignments`,
+`tenants`, `permissions`, `feature_flags`, `scheduler_*`) are reached
 through the caller's membership or are deliberately process-wide. Every other
 table with a `tenant_id` — including `tenant_settings`, `roles`,
 `memberships`, and each module's rows — is policed as above.
@@ -129,7 +130,7 @@ query fragment a code-review-visible event rather than a silent possibility.
   not a tenant-wide fairness guarantee.
 - **RLS is not a substitute for authorization.** It limits row visibility, not
   which columns or operations a member may use; permissions and
-  object-level `authz.Authorize` policies do that.
+  object-level checks through the injected `authz.Authorizer` do that.
 - **Audit and backups are process-wide.** `audit_events` rows are
   tenant-tagged but are read by platform tooling; backups and replicas contain
   every tenant's rows. Ban markers are keyed, but other retained data (for
@@ -141,8 +142,8 @@ query fragment a code-review-visible event rather than a silent possibility.
 ## Credential storage
 
 Passwords are Argon2id PHC strings (`$argon2id$v=19$m=19456,t=2,p=1$...`,
-OWASP Password Storage), normalized with NFKC and capped at 64 characters, with
-no bcrypt byte ceiling. Verification is constant-time; a successful sign-in
+OWASP Password Storage), normalized with NFKC and capped at 64 Unicode code
+points (runes), with no bcrypt byte ceiling. Verification is constant-time; a successful sign-in
 rehashes a hash written under older cost parameters (conditional on the hash
 that verified, so a concurrent password change wins), and unknown-email logins
 spend one comparison against a dummy hash with the same parameters. Ten MFA
@@ -156,9 +157,9 @@ Every secret is configuration, not a database value. `<NAME>_FILE` is accepted
 for the secret settings listed in
 [Operations](operations.md#11-configuration-reference); setting both forms is
 an error. Every application key is base64-encoded 32 random bytes
-(`openssl rand -base64 32`), validated after decoding, and each active key must
-be distinct (one key per purpose, NIST SP 800-57; no `JWT_SECRET` fallback).
-Production startup rejects the published sample keys.
+(`openssl rand -base64 32`), validated after decoding; there are no built-in
+sample keys. Each active key must be distinct (one key per purpose, NIST
+SP 800-57; no `JWT_SECRET` fallback).
 
 | Secret | Use | Rotation |
 |---|---|---|

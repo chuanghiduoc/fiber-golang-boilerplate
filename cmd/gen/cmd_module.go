@@ -30,7 +30,6 @@ var moduleFiles = []struct{ template, path string }{
 	{"module/repository_health.go.tmpl", "repository/health.go"},
 	{"module/handler_health.go.tmpl", "handler/health.go"},
 	{"module/handler_health_test.go.tmpl", "handler/health_test.go"},
-	{"module/handler_main_test.go.tmpl", "handler/main_test.go"},
 	{"module/dto.go.tmpl", "dto/dto.go"},
 	{"module/health.sql.tmpl", "queries/health.sql"},
 }

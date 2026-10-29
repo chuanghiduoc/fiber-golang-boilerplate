@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,8 @@ type fakePrivacyRepo struct {
 	anonymized        []uuid.UUID
 	deleted           []uuid.UUID
 	anonymizeNotFound bool
+	listCursorCalls   int
+	listCursorLimits  []int32
 	// invitationAnonymizations records each (user, replacement) call the
 	// identity eraser and finalizer make.
 	invitationAnonymizations []string
@@ -68,18 +71,31 @@ func (r *fakePrivacyRepo) Get(_ context.Context, userID, id uuid.UUID) (*core.Da
 	return &c, nil
 }
 
-func (r *fakePrivacyRepo) ListForUser(_ context.Context, userID uuid.UUID) ([]core.DataExport, error) {
+func (r *fakePrivacyRepo) ListCursor(_ context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]core.DataExport, error) {
+	r.listCursorCalls++
+	r.listCursorLimits = append(r.listCursorLimits, cur.Limit)
 	var out []core.DataExport
 	for _, e := range r.exports {
-		if e.UserID == userID {
-			out = append(out, *e)
+		if e.UserID != userID {
+			continue
 		}
+		if cur.HasCursor {
+			if e.CreatedAt.After(cur.CreatedAt) || (e.CreatedAt.Equal(cur.CreatedAt) && e.ID.String() >= cur.ID.String()) {
+				continue
+			}
+		}
+		out = append(out, *e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID.String() > out[j].ID.String()
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if cur.Limit > 0 && len(out) > int(cur.Limit) {
+		out = out[:cur.Limit]
 	}
 	return out, nil
-}
-
-func (r *fakePrivacyRepo) ListCursor(context.Context, uuid.UUID, pagination.DBCursor) ([]core.DataExport, error) {
-	return nil, nil
 }
 
 func (r *fakePrivacyRepo) MarkRunning(_ context.Context, userID, id uuid.UUID) (bool, error) {
@@ -110,17 +126,15 @@ func (r *fakePrivacyRepo) MarkFailed(_ context.Context, userID, id uuid.UUID) er
 	return nil
 }
 
-func (r *fakePrivacyRepo) ExpireForUser(_ context.Context, userID uuid.UUID) ([]core.DataExport, error) {
-	var out []core.DataExport
+func (r *fakePrivacyRepo) ExpireForUser(_ context.Context, userID uuid.UUID) error {
 	for _, e := range r.exports {
 		if e.UserID == userID && e.Status != core.DataExportExpired {
 			e.Status = core.DataExportExpired
 			now := time.Now()
 			e.ExpiresAt = &now
-			out = append(out, *e)
 		}
 	}
-	return out, nil
+	return nil
 }
 
 func (r *fakePrivacyRepo) DeleteForUser(_ context.Context, userID uuid.UUID) error {
@@ -140,8 +154,11 @@ func (r *fakePrivacyRepo) Delete(_ context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (r *fakePrivacyRepo) ListSessions(context.Context, uuid.UUID) ([]core.Session, error) {
-	return r.sessions, nil
+func (r *fakePrivacyRepo) ListSessions(_ context.Context, _ uuid.UUID, limit int32) ([]core.Session, bool, error) {
+	if limit > 0 && len(r.sessions) > int(limit) {
+		return r.sessions[:limit], true, nil
+	}
+	return r.sessions, false, nil
 }
 
 func (r *fakePrivacyRepo) AnonymizeUser(_ context.Context, userID uuid.UUID, _ string) (*core.User, error) {
@@ -282,6 +299,32 @@ func TestIdentityExportListsPasskeysWithoutKeyMaterial(t *testing.T) {
 	assert.NotContains(t, lowered, "credentialid")
 }
 
+func TestIdentityExportMarksAuditTruncation(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, _ := privacyTestStores(repo)
+	svc := NewPrivacyService(PrivacyDeps{
+		Stores: stores,
+		AuditEvents: fakeUserEvents{
+			events:    []audit.UserEvent{{Action: "user.login"}},
+			truncated: true,
+		},
+	})
+	section, err := svc.Export(fakes.TenantCtx(), tenant.DefaultID, fakes.TestID(10))
+	require.NoError(t, err)
+	var out struct {
+		AuditEventsTruncated bool `json:"auditEventsTruncated"`
+		Truncated            bool `json:"truncated"`
+		Budget               struct {
+			Truncated bool `json:"truncated"`
+		} `json:"budget"`
+	}
+	require.NoError(t, json.Unmarshal(section.Data, &out))
+	assert.True(t, section.Truncated)
+	assert.True(t, out.AuditEventsTruncated)
+	assert.True(t, out.Truncated)
+	assert.True(t, out.Budget.Truncated)
+}
+
 func TestCleanupUserDeletesPasskeys(t *testing.T) {
 	repo := newFakePrivacyRepo()
 	stores, db := privacyTestStores(repo)
@@ -369,7 +412,7 @@ func TestExportJobSkipsAnErasedExport(t *testing.T) {
 	e, _ := repo.Create(fakes.TenantCtx(), fakes.TestID(10))
 	svc, _, notifier, _, _ := newPrivacyTestService(t, repo, privacycontracts.NewRegistry())
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
-	_, err := repo.ExpireForUser(ctx, fakes.TestID(10))
+	err := repo.ExpireForUser(ctx, fakes.TestID(10))
 	require.NoError(t, err)
 
 	require.NoError(t, svc.HandleExportJob(ctx, mustJSON(ExportJob{ExportID: e.ID, UserID: fakes.TestID(10)})))
@@ -377,6 +420,60 @@ func TestExportJobSkipsAnErasedExport(t *testing.T) {
 	assert.Equal(t, core.DataExportExpired, got.Status)
 	assert.Empty(t, got.StoragePath)
 	assert.Empty(t, notifier.got)
+}
+
+func TestBuildExportDocumentEnforcesTotalByteBudget(t *testing.T) {
+	registry := privacycontracts.NewRegistry()
+	registry.Register(privacycontracts.Provider{
+		Name:     "files",
+		Exporter: fakeExporter{privacycontracts.Section{Name: "files", Data: json.RawMessage(`"` + strings.Repeat("f", 512) + `"`)}},
+		Eraser:   fakeExporter{},
+	})
+	registry.Register(privacycontracts.Provider{
+		Name:     "notifications",
+		Exporter: fakeExporter{privacycontracts.Section{Name: "notifications", Data: json.RawMessage(`"` + strings.Repeat("n", 512) + `"`)}},
+		Eraser:   fakeExporter{},
+	})
+	svc := NewPrivacyService(PrivacyDeps{Registry: registry})
+
+	raw, err := svc.buildExportDocumentWithLimit(context.Background(), &core.DataExport{
+		UserID: fakes.TestID(10), TenantID: tenant.DefaultID,
+	}, 900)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(raw), 900)
+
+	var doc ExportDocument
+	require.NoError(t, json.Unmarshal(raw, &doc))
+	assert.True(t, doc.Truncated)
+	assert.Len(t, doc.Sections, 1)
+	assert.Contains(t, doc.Sections, "files")
+	assert.Contains(t, doc.TruncatedSections, "notifications")
+}
+
+func TestEraseExportsDeletesEveryCursorPage(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	const total = 205
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < total; i++ {
+		id := fakes.TestID(uint64(1000 + i))
+		repo.exports[id] = &core.DataExport{
+			ID: id, TenantID: tenant.DefaultID, UserID: fakes.TestID(10),
+			Status: core.DataExportReady, StoragePath: fmt.Sprintf("exports/%d.json", i),
+			CreatedAt: base.Add(time.Duration(i) * time.Second),
+		}
+	}
+	store := &recordingDeleteStorage{}
+	svc := NewPrivacyService(PrivacyDeps{
+		Stores: core.Stores{Privacy: repo}, Storage: store,
+	})
+
+	require.NoError(t, svc.eraseExports(fakes.TenantCtx(), fakes.TestID(10)))
+	assert.Empty(t, repo.exports)
+	assert.Len(t, store.deleted, total)
+	assert.GreaterOrEqual(t, repo.listCursorCalls, 3)
+	for _, limit := range repo.listCursorLimits {
+		assert.Equal(t, int32(exportPurgeBatchSize+1), limit)
+	}
 }
 
 func TestIdentityExportIncludesProfileMembershipAndSessions(t *testing.T) {
@@ -458,6 +555,30 @@ func TestRequestAdminErasureRejectsACrossTenantID(t *testing.T) {
 	require.ErrorAs(t, err, &appErr)
 	assert.Equal(t, 404, resolvedStatus(appErr))
 	assert.Empty(t, jobsQueue.jobs)
+}
+
+// A second admin request for a member already reserved for erasure is a
+// replay: it must not move the request time or enqueue another erase job.
+func TestRequestAdminErasureReplaysWithoutASecondJob(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
+	ctx := adminCallerCtx(db)
+	key := [2]uuid.UUID{tenant.DefaultID, fakes.TestID(10)}
+
+	require.NoError(t, svc.RequestAdminErasure(ctx, fakes.TestID(10)))
+	require.Len(t, jobsQueue.jobs, 1)
+	reservedAt := db.Memberships[key].ErasureRequestedAt
+	require.NotNil(t, reservedAt)
+
+	require.NoError(t, svc.RequestAdminErasure(ctx, fakes.TestID(10)))
+	assert.Len(t, jobsQueue.jobs, 1, "a replay must not enqueue a second erase job")
+	assert.Equal(t, *reservedAt, *db.Memberships[key].ErasureRequestedAt,
+		"a replay must not move the erasure request time")
+	require.Len(t, tx.audits, 2)
+	assert.Equal(t, "admin.user.erasure_replayed", tx.audits[1].Action)
 }
 
 func TestRequestAdminErasureRejectsARemovedMember(t *testing.T) {
@@ -690,7 +811,7 @@ func TestErasureJobIsIdempotentAndDeletesExports(t *testing.T) {
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	// The erasure request pre-expires exports; the eraser must still delete
 	// the already-expired document's blob.
-	_, err = repo.ExpireForUser(ctx, fakes.TestID(10))
+	err = repo.ExpireForUser(ctx, fakes.TestID(10))
 	require.NoError(t, err)
 	require.NoError(t, svc.HandleEraseJob(ctx, mustJSON(EraseJob{UserID: fakes.TestID(10)})))
 	require.NoError(t, svc.HandleEraseJob(ctx, mustJSON(EraseJob{UserID: fakes.TestID(10)})))
@@ -852,6 +973,23 @@ func (failingPutStorage) List(context.Context, string) ([]storage.Object, error)
 	return nil, nil
 }
 func (failingPutStorage) URL(string) string { return "" }
+
+type recordingDeleteStorage struct{ deleted []string }
+
+func (s *recordingDeleteStorage) Put(context.Context, string, io.Reader, int64, string) error {
+	return nil
+}
+func (s *recordingDeleteStorage) Get(context.Context, string) (io.ReadCloser, error) {
+	return nil, storage.ErrNotFound
+}
+func (s *recordingDeleteStorage) Delete(_ context.Context, path string) error {
+	s.deleted = append(s.deleted, path)
+	return nil
+}
+func (s *recordingDeleteStorage) List(context.Context, string) ([]storage.Object, error) {
+	return nil, nil
+}
+func (s *recordingDeleteStorage) URL(string) string { return "" }
 
 type panickingExporter struct{}
 

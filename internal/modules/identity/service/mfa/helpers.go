@@ -41,6 +41,9 @@ func currentPasswordIncorrect() error { return authn.CurrentPasswordIncorrect() 
 func cleanupOtherSessions(ctx context.Context, sessions SessionRepository, userID, keepID uuid.UUID, why RevokeReason) {
 	authn.CleanupOtherSessions(ctx, sessions, userID, keepID, why)
 }
+func revokeOtherSessions(ctx context.Context, sessions SessionRepository, userID, keepID uuid.UUID, why RevokeReason) error {
+	return authn.RevokeOtherSessions(ctx, sessions, userID, keepID, why)
+}
 
 func checkAudit(err error) error      { return core.CheckAudit(err) }
 func auditWriteError(err error) error { return core.AuditWriteError(err) }
@@ -52,5 +55,5 @@ func hashToken(token string) []byte { return core.HashToken(token) }
 var _ = []any{
 	verifyPassword, reserveMFAAttempt, clearLoginAttempts, accountNotActive, cleanupStaleSessions,
 	loginLockoutUnavailable, reserveReauthAttempt, clearReauthAttempts, clearMFAAttempts,
-	currentPasswordIncorrect, cleanupOtherSessions, checkAudit, auditWriteError, userEvent, hashToken,
+	currentPasswordIncorrect, cleanupOtherSessions, revokeOtherSessions, checkAudit, auditWriteError, userEvent, hashToken,
 }

@@ -13,18 +13,18 @@ type fakeHealthChecker struct{ err error }
 func (f fakeHealthChecker) Ping(context.Context) error { return f.err }
 
 func TestHealthCheck(t *testing.T) {
-	if err := NewHealthService(fakeHealthChecker{}).Check(adminContext(testTenant)); err != nil {
+	if err := NewHealthService(fakeHealthChecker{}, testAuthorizer()).Check(adminContext(testTenant)); err != nil {
 		t.Fatalf("Check = %v, want nil", err)
 	}
 
 	down := errors.New("connection refused")
-	if err := NewHealthService(fakeHealthChecker{err: down}).Check(adminContext(testTenant)); !errors.Is(err, down) {
+	if err := NewHealthService(fakeHealthChecker{err: down}, testAuthorizer()).Check(adminContext(testTenant)); !errors.Is(err, down) {
 		t.Fatalf("Check = %v, want the wrapped ping error", err)
 	}
 }
 
 func TestHealthCheckFailsClosed(t *testing.T) {
-	svc := NewHealthService(fakeHealthChecker{})
+	svc := NewHealthService(fakeHealthChecker{}, testAuthorizer())
 	for name, ctx := range map[string]context.Context{
 		"no subject":         context.Background(),
 		"missing permission": userContext(testTenant),

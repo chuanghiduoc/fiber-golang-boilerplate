@@ -222,13 +222,12 @@ func (q *Queries) DeleteUserSessions(ctx context.Context, userID uuid.UUID) erro
 	return err
 }
 
-const expireDataExportsForUser = `-- name: ExpireDataExportsForUser :many
+const expireDataExportsForUser = `-- name: ExpireDataExportsForUser :exec
 UPDATE data_exports
 SET status = 'expired', expires_at = COALESCE(expires_at, NOW()), updated_at = NOW()
 WHERE tenant_id = $1::uuid
   AND user_id = $2::uuid
   AND status <> 'expired'
-RETURNING id, tenant_id, user_id, status, storage_path, expires_at, created_at, updated_at
 `
 
 type ExpireDataExportsForUserParams struct {
@@ -236,33 +235,9 @@ type ExpireDataExportsForUserParams struct {
 	UserID   uuid.UUID `json:"user_id"`
 }
 
-func (q *Queries) ExpireDataExportsForUser(ctx context.Context, arg ExpireDataExportsForUserParams) ([]DataExport, error) {
-	rows, err := q.db.Query(ctx, expireDataExportsForUser, arg.TenantID, arg.UserID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []DataExport{}
-	for rows.Next() {
-		var i DataExport
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.UserID,
-			&i.Status,
-			&i.StoragePath,
-			&i.ExpiresAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+func (q *Queries) ExpireDataExportsForUser(ctx context.Context, arg ExpireDataExportsForUserParams) error {
+	_, err := q.db.Exec(ctx, expireDataExportsForUser, arg.TenantID, arg.UserID)
+	return err
 }
 
 const getDataExport = `-- name: GetDataExport :one
@@ -319,46 +294,6 @@ func (q *Queries) ListDataExportsCursor(ctx context.Context, arg ListDataExports
 		arg.CursorID,
 		arg.RowLimit,
 	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []DataExport{}
-	for rows.Next() {
-		var i DataExport
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.UserID,
-			&i.Status,
-			&i.StoragePath,
-			&i.ExpiresAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listDataExportsForUser = `-- name: ListDataExportsForUser :many
-SELECT id, tenant_id, user_id, status, storage_path, expires_at, created_at, updated_at FROM data_exports
-WHERE tenant_id = $1::uuid AND user_id = $2::uuid
-ORDER BY id
-`
-
-type ListDataExportsForUserParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	UserID   uuid.UUID `json:"user_id"`
-}
-
-func (q *Queries) ListDataExportsForUser(ctx context.Context, arg ListDataExportsForUserParams) ([]DataExport, error) {
-	rows, err := q.db.Query(ctx, listDataExportsForUser, arg.TenantID, arg.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -470,7 +405,13 @@ SELECT provider, subject, created_at
 FROM user_identities
 WHERE user_id = $1
 ORDER BY provider, created_at, subject
+LIMIT $2::int
 `
+
+type ListUserExternalIdentitiesParams struct {
+	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
+}
 
 type ListUserExternalIdentitiesRow struct {
 	Provider  string             `json:"provider"`
@@ -480,8 +421,8 @@ type ListUserExternalIdentitiesRow struct {
 
 // Export: linked external accounts, without any token material (none is
 // stored). The subject identifies the account at the provider.
-func (q *Queries) ListUserExternalIdentities(ctx context.Context, userID uuid.UUID) ([]ListUserExternalIdentitiesRow, error) {
-	rows, err := q.db.Query(ctx, listUserExternalIdentities, userID)
+func (q *Queries) ListUserExternalIdentities(ctx context.Context, arg ListUserExternalIdentitiesParams) ([]ListUserExternalIdentitiesRow, error) {
+	rows, err := q.db.Query(ctx, listUserExternalIdentities, arg.UserID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -508,12 +449,14 @@ JOIN roles r ON r.id = i.role_id
 WHERE i.tenant_id = $1::uuid
   AND (i.accepted_by = $2::uuid OR i.email_normalized = $3::text)
 ORDER BY i.created_at DESC, i.id DESC
+LIMIT $4::int
 `
 
 type ListUserInvitationsReceivedParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
 	Email    string    `json:"email"`
+	RowLimit int32     `json:"row_limit"`
 }
 
 type ListUserInvitationsReceivedRow struct {
@@ -530,7 +473,12 @@ type ListUserInvitationsReceivedRow struct {
 // Export: invitations addressed to the user's current address or accepted by
 // the user in this tenant.
 func (q *Queries) ListUserInvitationsReceived(ctx context.Context, arg ListUserInvitationsReceivedParams) ([]ListUserInvitationsReceivedRow, error) {
-	rows, err := q.db.Query(ctx, listUserInvitationsReceived, arg.TenantID, arg.UserID, arg.Email)
+	rows, err := q.db.Query(ctx, listUserInvitationsReceived,
+		arg.TenantID,
+		arg.UserID,
+		arg.Email,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -565,11 +513,13 @@ FROM invitations i
 JOIN roles r ON r.id = i.role_id
 WHERE i.tenant_id = $1::uuid AND i.invited_by = $2::uuid
 ORDER BY i.created_at DESC, i.id DESC
+LIMIT $3::int
 `
 
 type ListUserInvitationsSentParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
 }
 
 type ListUserInvitationsSentRow struct {
@@ -585,7 +535,7 @@ type ListUserInvitationsSentRow struct {
 
 // Export: invitations the user created in this tenant.
 func (q *Queries) ListUserInvitationsSent(ctx context.Context, arg ListUserInvitationsSentParams) ([]ListUserInvitationsSentRow, error) {
-	rows, err := q.db.Query(ctx, listUserInvitationsSent, arg.TenantID, arg.UserID)
+	rows, err := q.db.Query(ctx, listUserInvitationsSent, arg.TenantID, arg.UserID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -617,15 +567,17 @@ const listUserSessionsForPrivacy = `-- name: ListUserSessionsForPrivacy :many
 SELECT id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
 WHERE tenant_id = $1::uuid AND user_id = $2::uuid
 ORDER BY created_at DESC, id DESC
+LIMIT $3::int
 `
 
 type ListUserSessionsForPrivacyParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
 }
 
 func (q *Queries) ListUserSessionsForPrivacy(ctx context.Context, arg ListUserSessionsForPrivacyParams) ([]Session, error) {
-	rows, err := q.db.Query(ctx, listUserSessionsForPrivacy, arg.TenantID, arg.UserID)
+	rows, err := q.db.Query(ctx, listUserSessionsForPrivacy, arg.TenantID, arg.UserID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}

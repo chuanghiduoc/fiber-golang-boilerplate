@@ -67,7 +67,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | `cmd/api` | Infra setup, catalog registration, worker lifecycle, graceful shutdown |
 | `cmd/migrate` | The only DDL entrypoint |
 | `cmd/seed` | Standalone seeder: creates the admin as tenant `owner` and grants `platform_admin` (schema must already exist) |
-| `config` | Env parsing, one file per concern (`app.go`, `auth.go`, `database.go`, `webhook.go`, ...); `Config.Validate` runs the section validators in a fixed order and reports the first error |
+| `config` | Env parsing, one file per concern (`app.go`, `auth.go`, `database.go`, `webhook.go`, ...); `Config.Validate` runs the section validators in a fixed order and joins every violation |
 | `internal/app` | Fiber app, global middleware, infra routes, module registry + provider hooks, `app.Infra` (shared config in `Infra.Platform`: App, JWT, Tenant), system-context job registrar |
 | `internal/bootstrap` | The single ordered module list + contract cross-wiring (used by `cmd/api` and `test/arch`) |
 | `internal/contracts/<provider>` | Stdlib-only contracts grouped by providing module: `identity` (admin, principal reader, notification recipient), `files` (admin), `notifications` (notifier), `privacy` (exporter/eraser registry), `webhooks` (event/dispatcher) |
@@ -116,7 +116,7 @@ sequenceDiagram
     participant DB as Repository / sqlc / PostgreSQL
 
     C->>G: HTTP request
-    Note over G: Recovery, CORS, security headers,<br/>RequestID, i18n, tracing, metrics, logger,<br/>Recovery, body limit (JSON cap; multipart only on the upload route), audit fallback, timeout
+    Note over G: Recovery, RequestID, security headers,<br/>CORS, i18n, tracing, metrics, logger,<br/>Recovery, timeout, body limit (JSON cap; multipart only on the upload route), audit fallback
     G->>T: resolve X-Tenant-Slug, ?tenant= (browser auth paths) or default
     Note over T: unknown/suspended tenant: 404
     T->>A: route limiter, then per-IP auth limiter + ApiKey/JWT
@@ -133,17 +133,18 @@ sequenceDiagram
 
 | Stage | Mounted on | Notes |
 |---|---|---|
-| Global middleware | every route, in the order shown | `i18n.Middleware` runs right after request ID so every response, errors included, carries the negotiated locale. `audithttp.Middleware` is a fallback and skips routes guarded by `audithttp.Guard`. |
+| Global middleware | every route, in the order shown | `i18n.Middleware` runs before tracing, metrics, and logging so every response, errors included, carries the negotiated locale. `audithttp.Middleware` is a fallback and skips routes guarded by `audithttp.Guard`. |
 | `httpapi` | every operation | Registers the huma operation, its OpenAPI security requirement, and the exact policy chain. |
 | `tenanthttp.Middleware` | `/api/v1` operations | Resolves the tenant per operation. Probes (`/healthz`, `/readyz`, `/metrics`) stay outside tenant resolution. |
 | `deps.Authenticate()` | module group or route | Per-IP `auth` limiter first, then `apikeyhttp.Authenticate` wrapping `JWTAuth`. |
-| Route chain | each operation | `rate limit → authenticate → authz → MFA → Idempotency → audithttp.Guard → handler`. Idempotency replays short-circuit before the guard, so replays are never re-audited. |
+| Route chain | each operation | `rate limit → tenant → authenticate → authz → MFA → Idempotency → audithttp.Guard → handler`. Idempotency replays short-circuit before the guard, so replays are never re-audited. |
 
 ### Tenant and credential resolution
 
 - `tenanthttp.Middleware` validates `[a-z0-9-]{1,63}` and resolves the slug: header;
-  validated `?tenant=` fallback only on `/auth/google`, `/auth/reset-password`,
-  and `/auth/verify-email`; otherwise `TENANT_DEFAULT_SLUG`
+  validated `?tenant=` fallback only on `/api/v1/auth/google`,
+  `/api/v1/auth/password-resets/complete`, and
+  `/api/v1/auth/email-verifications/complete`; otherwise `TENANT_DEFAULT_SLUG`
   (`TENANT_REQUIRE_HEADER=true` disables the default). It stores the tenant id
   and slug in the request context (`tenant.IDFromContext`/`SlugFromContext`).
 - The Google OAuth callback is exempt so require-header mode cannot reject it
@@ -161,8 +162,8 @@ sequenceDiagram
   principal, and installs the same context values plus an `authz.Subject` limited to
   the key's scopes intersected with the owner's current permissions. See
   [API Design](api-design.md#authentication-and-authorization).
-- The public webhook receiver (`POST /webhooks/inbound/:id`) mounts auth per
-  route instead of on the group, so it bypasses JWT and tenant-header
+- The public webhook receiver (`POST /api/v1/webhooks/inbound/{sourceId}`)
+  mounts auth per route instead of on the group, so it bypasses JWT and tenant-header
   selection. The source row supplies the tenant; the source HMAC authenticates
   the caller.
 
@@ -276,7 +277,7 @@ guarantees (and non-guarantees) are in
 | Feature flags | Targets are tenant-owned (`tenant.IDFromContext(ctx)`); a composite FK keeps user targets in their tenant. Definitions, defaults, and kill switches are process-wide. See [Feature Flags](feature-flags.md). |
 | Jobs, events, audit | Enqueue writes `jobs.tenant_id` from the context; the worker restores it with `tenant.WithID`. Event metadata carries tenant/request/actor; audit rows record the request tenant. Retention and metrics stay global. |
 | Scheduler | One global leader. Each schedule chooses a tenant in its spec; the job stores it. `scheduler_leases`/`scheduler_runs` have no tenant column. |
-| OAuth | The tenant is bound into the signed `state` and the state cookie (which also holds the PKCE verifier); the callback rejects unknown/suspended tenants instead of trusting `X-Tenant-Slug`. The callback redirects with a single-use 60-second code, redeemed through `POST /auth/google/exchange`. |
+| OAuth | The tenant is bound into the signed `state` and the state cookie (which also holds the PKCE verifier); the callback rejects unknown/suspended tenants instead of trusting `X-Tenant-Slug`. The callback redirects with a single-use 60-second code, redeemed through `POST /api/v1/auth/google/exchanges`. |
 | Sessions | Tokens without a positive `tenant_id` or `sid` claim are rejected. The session validator loads the token's session and compares its tenant, the membership role and status, the user status and token version, the tenant status, and the session's absolute expiry (`SESSION_MAX_LIFETIME`), so a revocation, ban, role change, suspension, or expired session takes effect within the 5-second session-cache TTL. The same snapshot carries `mfa_verified_at` (set by an `otp`/`rc`/`hwk`/`swk` sign-in or `POST /me/mfa/step-up`), which `authzhttp.RequireMFA` compares with `MFA_MAX_AGE` (default `12h`); a platform permission instead uses `RequirePasskeyMFA`, which only accepts `hwk`/`swk`. |
 | Idempotency | Cache keys include tenant ID/slug, method, path, and caller, so a replayed `201` cannot cross tenants. |
 | Logout | Revokes the refresh token's session by possession, so it works even without the header. A reused refresh token revokes its whole session. |
@@ -315,8 +316,8 @@ signed in, and MFA disable — which removes the factor and so cannot weaken
 the caller's already-passed second factor — keeps the caller's session and
 records only the other sessions' revocation in that same follow-up statement.
 Only a genuinely cross-tenant mutation, deleting a global account and its
-memberships in every tenant, still keeps one bypass transaction. Per-tenant
-limits remain future work.
+memberships in every tenant, still keeps one bypass transaction. Other
+per-tenant resource limits remain future work.
 
 ## Authorization
 
@@ -324,11 +325,11 @@ limits remain future work.
   `authzhttp.Require(authz.Permission...)` (every route; enforced by `test/arch`).
   API-key subjects use their explicit scopes; JWT subjects carry the session's
   effective permission set (membership roles plus platform assignments).
-- Services add object-level checks with `authz.Authorize`: an RBAC pre-check,
+- Services add object-level checks with the injected `authz.Authorizer.Authorize`: an RBAC pre-check,
   then a deny-overrides `PolicySet` over a `Resource` that fails closed when
   empty. `TenantPolicy` allows only the subject's tenant (or a `CrossTenant`
   platform subject); `OwnerPolicy` only the owner.
-- `authz.Authorize` is the single service-level path and fails closed: a
+- `authz.Authorizer.Authorize` is the single service-level path and fails closed: a
   subject is evaluated against permission + policies; a context marked with
   `authz.SystemContext` (job handlers via `internal/app`'s registrar wrapper,
   the admin seeder) is allowed when it carries no subject; anything else is
@@ -375,7 +376,10 @@ keeps the repository's tenant scoping.
   delivery row with its first `webhook.delivery` job. Deliveries snapshot URL,
   max attempts, timeout, and sealed secret. Retries schedule new jobs
   (honoring `Retry-After`) and every attempt is kept. Requests follow Standard
-  Webhooks; receivers deduplicate on `webhook-id`.
+  Webhooks; receivers deduplicate on `webhook-id`. `webhook_events` also stores
+  `subject_user_ids`, the union of the actor and producer-supplied subjects,
+  for privacy export/erasure; it is internal metadata and is not signed or
+  sent.
 - **Inbound webhooks.** The tenant comes from the source row; the Standard
   Webhooks HMAC covers `<webhook-id>.<webhook-timestamp>.<raw-body>`;
   deduplication is unique per `(tenant, source, external_event_id)`. See

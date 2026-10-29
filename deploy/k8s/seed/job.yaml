@@ -59,9 +59,11 @@ spec:
           envFrom:
             - configMapRef:
                 name: fiber-boilerplate-config
+            - configMapRef:
+                name: fiber-boilerplate-seed-config
           env:
             # ADMIN_EMAIL / ADMIN_NAME are not secrets and come from the
-            # per-environment ConfigMap. The password is a mounted file.
+            # seed-only ConfigMap. The password is a mounted file.
             - name: DB_PASSWORD_FILE
               value: /var/run/secrets/fiber-boilerplate/DB_PASSWORD
             - name: DB_BYPASS_PASSWORD_FILE

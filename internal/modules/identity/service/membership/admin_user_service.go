@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/google/uuid"
@@ -102,10 +103,20 @@ func (s *adminUserService) GetMember(ctx context.Context, id uuid.UUID) (*Member
 // one transaction. The last-owner guard, rank checks, and session revocation
 // are shared with the single-purpose admin mutations.
 func (s *adminUserService) UpdateMember(ctx context.Context, id uuid.UUID, update MemberUpdate) (*Member, error) {
+	if err := authorizeMemberUpdate(ctx, update); err != nil {
+		return nil, err
+	}
 	var member *Member
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		current, err := loadMemberForAdminMutation(ctx, tx.Memberships, id)
 		if err != nil {
+			return err
+		}
+		// Roles and status share the same hierarchy rule: changing either
+		// requires strictly higher rank. The role path checks this later in
+		// replaceMemberRolesTx, but a status-only patch never reaches it, so
+		// enforce it once here before any write (including the ETag CAS).
+		if err := EnsureCanManageMember(ctx, tx.Stores, id); err != nil {
 			return err
 		}
 		// The conditional UPDATE is the compare-and-swap: two writers that
@@ -148,6 +159,34 @@ func (s *adminUserService) UpdateMember(ctx context.Context, id uuid.UUID, updat
 	}
 	invalidateSessions(ctx, s.sessionCache, id)
 	return member, nil
+}
+
+// authorizeMemberUpdate enforces the capability for every field present in
+// the merge patch. The route accepts AnyOf(role, ban, delete), but a role
+// manager must not be able to suspend/remove a member and a ban manager must
+// not be able to change roles. Removal additionally requires the dedicated
+// delete grant.
+func authorizeMemberUpdate(ctx context.Context, update MemberUpdate) error {
+	// The handler rejects a null or empty roleIds, so a non-empty slice is the
+	// service-level representation of a present role field.
+	if len(update.RoleKeys) > 0 {
+		if err := requirePermission(ctx, authz.PermissionAdminUsersRole); err != nil {
+			return err
+		}
+	}
+	if update.Status == nil {
+		return nil
+	}
+	switch MembershipStatus(strings.TrimSpace(*update.Status)) {
+	case MembershipStatusActive, MembershipStatusSuspended:
+		return requirePermission(ctx, authz.PermissionAdminUsersBan)
+	case MembershipStatusRemoved:
+		return requirePermission(ctx, authz.PermissionAdminUsersDelete)
+	default:
+		// applyMemberStatus returns the validation error after all permissions
+		// for the other fields have also had a chance to fail closed.
+		return nil
+	}
 }
 
 func loadMemberForAdminMutation(ctx context.Context, memberships MembershipRepository, id uuid.UUID) (*Member, error) {

@@ -19,7 +19,6 @@ import (
 	"{{.M.ModulePath}}/internal/platform/i18n"
 	"{{.M.ModulePath}}/internal/platform/tenant"
 	"{{.M.ModulePath}}/internal/testutil/sessiontest"
-	"{{.M.ModulePath}}/pkg/apperror"
 	"{{.M.ModulePath}}/pkg/token"
 )
 
@@ -27,10 +26,10 @@ const testJWTSecret = "{{.M.Name}}-module-test-secret"
 
 func testConfig() *config.Config {
 	return &config.Config{
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 12 * time.Second},
 		JWT:       config.JWTConfig{Secret: testJWTSecret},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 600, NormalWindow: 60, RelaxedMax: 600, RelaxedWindow: 60},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: time.Minute, NormalMax: 600, NormalWindow: time.Minute, RelaxedMax: 600, RelaxedWindow: time.Minute},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
 }
@@ -38,9 +37,13 @@ func testConfig() *config.Config {
 // testApp builds the full middleware stack around a module built with deps.
 func testApp(t *testing.T, infra app.Infra, deps app.Deps) *fiber.App {
 	t.Helper()
-	m, _, err := Build(infra, Settings{})
+	infra.Catalogs = app.NewCatalogs()
+	m, err := Build(infra, Settings{}, Deps{})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
+	}
+	if err := infra.Catalogs.Register(m); err != nil {
+		t.Fatalf("Register: %v", err)
 	}
 	if deps.Cache == nil {
 		deps.Cache = cache.NewMemoryCache()
@@ -48,6 +51,7 @@ func testApp(t *testing.T, infra app.Infra, deps app.Deps) *fiber.App {
 	if deps.Sessions == nil {
 		deps.Sessions = sessiontest.AllowAll()
 	}
+	deps.Catalogs = infra.Catalogs
 	application := app.New(testConfig(), deps)
 	application.Register(m)
 	return application.Fiber()
@@ -96,7 +100,7 @@ func do(t *testing.T, fiberApp *fiber.App, method, target, authorization, body s
 }
 
 func TestCatalogRegistersAndLocalizes(t *testing.T) {
-	m, _, err := Build(app.Infra{}, Settings{})
+	m, err := Build(app.Infra{}, Settings{}, Deps{})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}

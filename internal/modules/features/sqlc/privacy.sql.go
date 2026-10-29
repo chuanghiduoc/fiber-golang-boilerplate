@@ -36,17 +36,19 @@ SELECT id, flag_key, tenant_id, user_id, enabled, created_at, updated_at FROM fe
 WHERE tenant_id = $1::uuid
   AND user_id = $2::uuid
 ORDER BY id
+LIMIT $3::int
 `
 
 type ListFeatureFlagTargetsForPrivacyParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
 }
 
 // Privacy export/erasure for per-user feature-flag targets only. Tenant-wide
 // targets (user_id IS NULL) and flag definitions stay.
 func (q *Queries) ListFeatureFlagTargetsForPrivacy(ctx context.Context, arg ListFeatureFlagTargetsForPrivacyParams) ([]FeatureFlagTarget, error) {
-	rows, err := q.db.Query(ctx, listFeatureFlagTargetsForPrivacy, arg.TenantID, arg.UserID)
+	rows, err := q.db.Query(ctx, listFeatureFlagTargetsForPrivacy, arg.TenantID, arg.UserID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}

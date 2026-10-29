@@ -24,20 +24,53 @@ func CheckIfMatchValue(ifMatch, currentETag string) error {
 	current := quoteETag(currentETag)
 	for _, candidate := range splitETags(raw) {
 		candidate = strings.TrimSpace(candidate)
-		if candidate == "*" {
-			return nil
+		if candidate == "" {
+			continue
 		}
-		if candidate == current {
+		if candidate == "*" {
+			// A wildcard requires an existing representation with a validator.
+			// An empty current ETag is not a valid target to match.
+			if current != "" {
+				return nil
+			}
+			continue
+		}
+		if current != "" && candidate == current {
 			return nil
 		}
 	}
 	return apperror.NewPreconditionFailed("the resource has changed since it was read; refresh and retry")
 }
 
-// splitETags splits a list while tolerating a comma inside an opaque quoted tag
-// far enough for our generated validators (which never contain commas).
+// splitETags splits an If-Match list without breaking a comma inside an opaque
+// quoted tag. Backslash escapes inside the quoted string are respected.
 func splitETags(value string) []string {
-	return strings.Split(value, ",")
+	var parts []string
+	start := 0
+	quoted := false
+	escaped := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if quoted {
+			switch {
+			case escaped:
+				escaped = false
+			case ch == '\\':
+				escaped = true
+			case ch == '"':
+				quoted = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			quoted = true
+		case ',':
+			parts = append(parts, value[start:i])
+			start = i + 1
+		}
+	}
+	return append(parts, value[start:])
 }
 
 // quoteETag normalizes an opaque version into a strong entity-tag.
@@ -46,6 +79,5 @@ func quoteETag(value string) string {
 	if value == "" {
 		return ""
 	}
-	value = strings.TrimPrefix(value, "W/")
 	return `"` + strings.Trim(value, `"`) + `"`
 }

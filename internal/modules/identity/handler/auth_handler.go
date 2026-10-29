@@ -178,15 +178,18 @@ type EmailVerification interface {
 // MFA is the second-factor surface the auth and MFA handlers use.
 // *mfa.MFAService implements it.
 type MFA interface {
-	EnrollTOTP(ctx context.Context, userID, sessionID uuid.UUID, currentPassword string) (*core.MFAEnrollment, error)
-	ConfirmTOTP(ctx context.Context, userID, sessionID uuid.UUID, currentPassword, code string) (*core.MFAConfirmResult, error)
-	Disable(ctx context.Context, userID, sessionID uuid.UUID, code string) error
-	RegenerateRecoveryCodes(ctx context.Context, userID uuid.UUID, code string) ([]string, error)
+	EnrollTOTP(ctx context.Context, userID uuid.UUID, proof core.ReauthProof) (*core.MFAEnrollment, error)
+	ConfirmTOTP(ctx context.Context, userID uuid.UUID, change core.MFACodeChange) (*core.MFAConfirmResult, error)
+	Disable(ctx context.Context, userID uuid.UUID, change core.MFACodeChange) error
+	RegenerateRecoveryCodes(ctx context.Context, userID uuid.UUID, change core.MFARecoveryChange) ([]string, error)
 	ResetTOTP(ctx context.Context, userID uuid.UUID) error
 	Status(ctx context.Context, userID uuid.UUID) (*core.MFAStatus, error)
+	GetTOTP(ctx context.Context, userID, factorID uuid.UUID) (*core.MFAFactorStatus, error)
 	Required(ctx context.Context, userID uuid.UUID) (bool, error)
 	BeginChallenge(ctx context.Context, userID uuid.UUID, method string) (string, error)
 	Verify(ctx context.Context, challenge, code string) (*core.MFALogin, error)
+	// SetAdmission installs the rule Verify applies before issuing tokens.
+	SetAdmission(admit authn.Admission)
 }
 
 // SessionIssuer is the session service surface the auth handlers use.
@@ -267,6 +270,17 @@ func (h *AuthHandler) emailVerificationRequired(ctx context.Context, member *cor
 	}
 	return flags.Enabled(ctx, identitycatalog.KeyEmailVerification,
 		features.Subject{TenantID: member.Membership.TenantID, UserID: member.User.ID})
+}
+
+// Admission is the sign-in rule every credential path applies before it mints
+// tokens: password login, session refresh, Google sign-in, passkey login, and
+// MFA factor completion. Keeping one function means a new path cannot silently
+// skip the email-verification requirement.
+func (h *AuthHandler) Admission(ctx context.Context, member *core.Member) error {
+	if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
+		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
+	}
+	return nil
 }
 
 // NewAuthHandler wires the auth handlers.
@@ -382,8 +396,8 @@ func (h *AuthHandler) Login(ctx context.Context, input *loginInput) (*loginOutpu
 	if member.Membership.TenantID != tenant.IDFromContext(ctx) {
 		return nil, apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
 	}
-	if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
-		return nil, apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
+	if err := h.Admission(ctx, member); err != nil {
+		return nil, err
 	}
 
 	auditActor(ctx, member.User.ID)
@@ -433,12 +447,7 @@ func (h *AuthHandler) Refresh(ctx context.Context, input *refreshInput) (*loginO
 	if err != nil {
 		return nil, err
 	}
-	result, err := h.sessions.Refresh(ctx, token, func(ctx context.Context, member *core.Member) error {
-		if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
-			return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
-		}
-		return nil
-	})
+	result, err := h.sessions.Refresh(ctx, token, h.Admission)
 	if err != nil {
 		return nil, err
 	}
@@ -796,8 +805,5 @@ func (h *AuthHandler) admitGoogleUser(ctx context.Context, tenantID uuid.UUID, m
 		return apperror.NewUnauthorized("account is not active")
 	}
 	auditActor(ctx, member.User.ID)
-	if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
-		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
-	}
-	return nil
+	return h.Admission(ctx, member)
 }

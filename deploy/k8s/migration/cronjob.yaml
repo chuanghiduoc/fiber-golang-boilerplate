@@ -1,0 +1,87 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fiber-boilerplate-migrate-maintenance
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: migrate
+spec:
+  # Re-runs the idempotent migration path on the first day of every month so
+  # audit_events always has a partition for the current and the next UTC month,
+  # even when no deploy happened for a while. golang-migrate is advisory-locked
+  # and cmd/migrate only creates partitions that are missing, so a run that has
+  # nothing to do is cheap. Without this the default partition collects rows
+  # and the next deploy has to rebuild it.
+  schedule: "23 2 1 * *"
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 900
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: fiber-boilerplate
+            app.kubernetes.io/part-of: fiber-boilerplate
+            app.kubernetes.io/component: migrate
+        spec:
+          restartPolicy: Never
+          serviceAccountName: fiber-boilerplate-migrate
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          terminationGracePeriodSeconds: 30
+          # Private GHCR package? Create ghcr-pull (see README.md) and uncomment.
+          # imagePullSecrets:
+          #   - name: ghcr-pull
+          securityContext:
+            # distroless/static:nonroot runs as UID/GID 65532.
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: migrate
+              image: ghcr.io/OWNER/REPO:latest
+              imagePullPolicy: Always
+              command: ["/app/migrate"]
+              envFrom:
+                - configMapRef:
+                    name: fiber-boilerplate-config
+              env:
+                # The only workload besides the one-shot Job that mounts the
+                # schema-owner password, and only as a file.
+                - name: DB_MIGRATE_PASSWORD_FILE
+                  value: /var/run/secrets/fiber-boilerplate-migrate/DB_MIGRATE_PASSWORD
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 65532
+                runAsGroup: 65532
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: secrets
+                  mountPath: /var/run/secrets/fiber-boilerplate-migrate
+                  readOnly: true
+          volumes:
+            - name: secrets
+              secret:
+                secretName: fiber-boilerplate-migrate-secrets
+                defaultMode: 0440

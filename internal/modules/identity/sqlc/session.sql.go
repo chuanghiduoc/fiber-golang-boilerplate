@@ -21,7 +21,8 @@ SELECT
         SELECT 1 FROM refresh_tokens n
         WHERE n.tenant_id = r.tenant_id
           AND n.session_id = r.session_id
-          AND n.id > r.id
+          AND n.created_at >= r.created_at
+          AND n.id <> r.id
     ) AS rotated
 FROM refresh_tokens r
 JOIN sessions s ON s.tenant_id = r.tenant_id AND s.id = r.session_id
@@ -45,6 +46,9 @@ type ClassifyRefreshTokenRotationRow struct {
 // live (not revoked, not expired) and a newer token was already rotated into
 // the same session. Reading the token and the session together leaves no
 // check-then-act gap between the grace decision and the reuse revocation.
+// "Newer" is compared by created_at, not id: uuidv7 ids minted inside the same
+// millisecond are ordered by their random tail, so id ordering can point at
+// the older token and revoke a session for a benign concurrent refresh.
 func (q *Queries) ClassifyRefreshTokenRotation(ctx context.Context, arg ClassifyRefreshTokenRotationParams) (ClassifyRefreshTokenRotationRow, error) {
 	row := q.db.QueryRow(ctx, classifyRefreshTokenRotation, arg.UsedAfter, arg.TokenHash, arg.TenantID)
 	var i ClassifyRefreshTokenRotationRow
@@ -219,12 +223,13 @@ FROM sessions s
 JOIN memberships m ON m.tenant_id = s.tenant_id AND m.user_id = s.user_id
 JOIN users u ON u.id = s.user_id
 JOIN tenants t ON t.id = s.tenant_id
-WHERE s.id = $1 AND s.user_id = $2
+WHERE s.id = $1 AND s.user_id = $2 AND s.tenant_id = $3
 `
 
 type GetSessionStateParams struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
+	ID       uuid.UUID `json:"id"`
+	UserID   uuid.UUID `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type GetSessionStateRow struct {
@@ -247,7 +252,7 @@ type GetSessionStateRow struct {
 // roles plus platform assignments), the user's token version and status, and
 // the tenant's status. role_keys is ordered owner, admin, member.
 func (q *Queries) GetSessionState(ctx context.Context, arg GetSessionStateParams) (GetSessionStateRow, error) {
-	row := q.db.QueryRow(ctx, getSessionState, arg.ID, arg.UserID)
+	row := q.db.QueryRow(ctx, getSessionState, arg.ID, arg.UserID, arg.TenantID)
 	var i GetSessionStateRow
 	err := row.Scan(
 		&i.TenantID,
@@ -329,7 +334,7 @@ const markSessionMFAVerified = `-- name: MarkSessionMFAVerified :one
 UPDATE sessions
 SET mfa_verified_at = NOW(), updated_at = NOW()
 WHERE tenant_id = $1 AND user_id = $2 AND id = $3
-  AND revoked_at IS NULL
+  AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING mfa_verified_at
 `
 
@@ -354,7 +359,7 @@ UPDATE sessions
 SET mfa_verified_at = NOW(), updated_at = NOW(),
     amr = ARRAY(SELECT DISTINCT unnest(amr || $1::text))
 WHERE tenant_id = $2 AND user_id = $3 AND id = $4
-  AND revoked_at IS NULL
+  AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING mfa_verified_at
 `
 
@@ -420,7 +425,7 @@ const restampSession = `-- name: RestampSession :one
 UPDATE sessions
 SET token_version = $1, amr = $2, last_used_at = NOW()
 WHERE tenant_id = $3 AND user_id = $4 AND id = $5
-  AND revoked_at IS NULL
+  AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at, last_used_at, revoked_at, revoked_reason, created_at, updated_at
 `
 
@@ -597,10 +602,11 @@ func (q *Queries) RevokeTenantUserSessions(ctx context.Context, arg RevokeTenant
 	return err
 }
 
-const touchSession = `-- name: TouchSession :exec
+const touchSession = `-- name: TouchSession :execrows
 UPDATE sessions
 SET last_used_at = NOW(), user_agent = $1, ip = $2
 WHERE tenant_id = $3 AND id = $4
+  AND revoked_at IS NULL AND expires_at > NOW()
 `
 
 type TouchSessionParams struct {
@@ -610,12 +616,20 @@ type TouchSessionParams struct {
 	ID        uuid.UUID   `json:"id"`
 }
 
-func (q *Queries) TouchSession(ctx context.Context, arg TouchSessionParams) error {
-	_, err := q.db.Exec(ctx, touchSession,
+// A refresh rotation may only touch a session that is still live at
+// statement time. The service loads the session before opening the
+// transaction; this predicate closes the check-then-act gap where a
+// concurrent logout, ban, or absolute expiry lands between that read and the
+// rotation commit.
+func (q *Queries) TouchSession(ctx context.Context, arg TouchSessionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, touchSession,
 		arg.UserAgent,
 		arg.Ip,
 		arg.TenantID,
 		arg.ID,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

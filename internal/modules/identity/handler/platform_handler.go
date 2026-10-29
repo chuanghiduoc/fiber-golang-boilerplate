@@ -32,7 +32,7 @@ func NewPlatformHandler(tenants TenantAdmin) *PlatformHandler {
 }
 
 type listTenantsInput struct {
-	Limit         int    `query:"limit" minimum:"1" maximum:"100" default:"20"`
+	Limit         int    `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string `query:"startingAfter"`
 }
 
@@ -45,9 +45,9 @@ type tenantInput struct {
 }
 
 type updateTenantInput struct {
-	TenantID string `path:"tenantId" format:"uuid"`
-	IfMatch  string `header:"If-Match"`
-	RawBody  []byte `rawBody:"application/merge-patch+json" contentType:"application/merge-patch+json" required:"true"`
+	TenantID string          `path:"tenantId" format:"uuid"`
+	IfMatch  string          `header:"If-Match"`
+	Body     dto.TenantPatch `contentType:"application/merge-patch+json" required:"true"`
 }
 
 // ListTenants returns every tenant in any lifecycle state.
@@ -113,9 +113,12 @@ func (h *PlatformHandler) UpdateTenant(ctx context.Context, input *updateTenantI
 	if err := checkETag(input.IfMatch, found.UpdatedAt); err != nil {
 		return nil, err
 	}
-	var req dto.TenantPatch
-	if err := decodeMergePatch(input.RawBody, &req); err != nil {
-		return nil, err
+	req := input.Body
+	if !req.Name.Present && !req.Status.Present {
+		return &httpapi.ETagOutput[dto.TenantResponse]{
+			ETag: etagHeader(found.UpdatedAt),
+			Body: toTenantResponse(found),
+		}, nil
 	}
 	update := core.TenantUpdate{}
 	if input.IfMatch != "" {

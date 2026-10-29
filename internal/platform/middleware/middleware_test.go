@@ -509,6 +509,19 @@ func TestRecovery_PanicRecovered(t *testing.T) {
 	if result["code"] != "system.internal" {
 		t.Errorf("code = %v, want internal_error", result["code"])
 	}
+	requestID := resp.Header.Get("X-Request-Id")
+	if requestID == "" {
+		t.Error("X-Request-Id should be set even for a panic before RequestID runs")
+	}
+	if got := result["requestId"]; got != requestID {
+		t.Errorf("body requestId = %v, want header %q", got, requestID)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "application/problem+json" {
+		t.Errorf("content-type = %q, want application/problem+json", got)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
 }
 
 func TestRecovery_NormalPassthrough(t *testing.T) {
@@ -524,6 +537,40 @@ func TestRecovery_NormalPassthrough(t *testing.T) {
 	}
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestRecovery_PanicAfterPartialWriteReplacesBody(t *testing.T) {
+	app := newTestApp()
+	app.Get("/partial", Recovery("test"), func(c fiber.Ctx) error {
+		c.Status(fiber.StatusCreated)
+		if err := c.SendString("partial success"); err != nil {
+			return err
+		}
+		panic("after partial write")
+	})
+
+	req, _ := http.NewRequest("GET", "/partial", http.NoBody)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if json.Valid(body) == false {
+		t.Fatalf("body is not JSON: %q", body)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if result["code"] != "system.internal" {
+		t.Fatalf("code = %v, want system.internal", result["code"])
+	}
+	if got := string(body); got != "" && got[0] != '{' {
+		t.Fatalf("response body starts with %q, want a problem document", got[:1])
 	}
 }
 
@@ -642,7 +689,7 @@ func TestNewLimiter(t *testing.T) {
 
 func TestTimeout_SetsContext(t *testing.T) {
 	app := newTestApp()
-	app.Get("/test", Timeout(5*time.Second), func(c fiber.Ctx) error {
+	app.Get("/test", Timeout(5*time.Second, nil), func(c fiber.Ctx) error {
 		deadline, ok := c.Context().Deadline()
 		if !ok {
 			t.Error("expected deadline to be set")
@@ -660,6 +707,63 @@ func TestTimeout_SetsContext(t *testing.T) {
 	}
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestTimeout_EnforcesDeadlineWhenHandlerIgnoresContext(t *testing.T) {
+	app := newTestApp()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	app.Get("/slow", Timeout(50*time.Millisecond, nil), func(c fiber.Ctx) error {
+		<-release
+		return c.SendString("late")
+	})
+
+	req, _ := http.NewRequest("GET", "/slow", http.NoBody)
+	start := time.Now()
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("timeout response took %s, want a prompt deadline", elapsed)
+	}
+	if resp.StatusCode != fiber.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504", resp.StatusCode)
+	}
+	if got := resp.Header.Get(fiber.HeaderContentType); !strings.HasPrefix(got, "application/problem+json") {
+		t.Errorf("content type = %q, want application/problem+json", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var problem apperror.ProblemDetails
+	if err := json.Unmarshal(body, &problem); err != nil {
+		t.Fatalf("decode timeout problem: %v; body = %s", err, body)
+	}
+	if problem.Code != string(apperror.CodeSystemTimeout) || problem.Status != fiber.StatusGatewayTimeout {
+		t.Errorf("problem = code %q status %d, want %q and 504", problem.Code, problem.Status, apperror.CodeSystemTimeout)
+	}
+}
+
+func TestTimeout_HandlerObservingDeadlineGetsProblemResponse(t *testing.T) {
+	app := newTestApp()
+	app.Get("/slow", Timeout(50*time.Millisecond, nil), func(c fiber.Ctx) error {
+		<-c.Context().Done()
+		return c.Context().Err()
+	})
+
+	req, _ := http.NewRequest("GET", "/slow", http.NoBody)
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusGatewayTimeout {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 504; body = %s", resp.StatusCode, body)
 	}
 }
 

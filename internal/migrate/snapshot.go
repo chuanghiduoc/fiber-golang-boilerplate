@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -26,56 +28,284 @@ const DefaultSnapshotPath = "migrations/schema.snapshot.sql"
 // seed. It is a real tenant, not a fallback.
 const defaultTenantSlug = "default"
 
-// ensureAuditPartitionsSQL creates the current and next UTC month partitions
-// for the audit trail. It is idempotent and runs after every migration, so a
-// long-lived deployment keeps writing into a matching partition. The dynamic
-// identifiers live inside the DO block, so the statement this process sends is
-// a compile-time constant. Retention is a reviewed maintenance path: detach an
-// old partition (ALTER TABLE ... DETACH PARTITION), then drop it; audit rows
-// are never DELETE'd.
-const ensureAuditPartitionsSQL = `
-DO $$
-DECLARE
-    target_schema TEXT := current_schema();
-    offset_month INTEGER;
-    partition_name TEXT;
-    range_start DATE;
-    range_end DATE;
-BEGIN
-    IF target_schema IS NULL THEN
-        RAISE EXCEPTION 'cannot create audit partitions: current_schema() is NULL';
-    END IF;
-    FOR offset_month IN 0..1 LOOP
-        range_start := (date_trunc('month', now() AT TIME ZONE 'utc')
-            + make_interval(months => offset_month))::date;
-        range_end := (range_start + make_interval(months => 1))::date;
-        partition_name := 'audit_events_' || to_char(range_start, 'YYYYMM');
-        EXECUTE format(
-            'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.audit_events FOR VALUES FROM (%L) TO (%L)',
-            target_schema, partition_name, target_schema, range_start, range_end);
-        -- A direct read of a partition skips the parent's policy, so every
-        -- partition carries the same tenant isolation.
-        EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', target_schema, partition_name);
-        EXECUTE format('ALTER TABLE %I.%I FORCE ROW LEVEL SECURITY', target_schema, partition_name);
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_policies
-            WHERE schemaname = target_schema AND tablename = partition_name AND policyname = 'tenant_isolation'
-        ) THEN
-            EXECUTE format('CREATE POLICY tenant_isolation ON %I.%I USING (app_tenant_visible(tenant_id)) WITH CHECK (app_tenant_visible(tenant_id))',
-                target_schema, partition_name);
-        END IF;
-    END LOOP;
-END;
-$$`
+// auditPartition is one monthly range of the audit_events partitioned table.
+type auditPartition struct {
+	name  string
+	start time.Time
+	end   time.Time
+}
 
-// ensureAuditPartitions creates this month's and next month's audit_events
+// auditPartitionsAt returns the current and next UTC month. Creating the next
+// month ahead of time keeps writes at the boundary out of the default
+// partition.
+func auditPartitionsAt(now time.Time) []auditPartition {
+	now = now.UTC()
+	month := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	return []auditPartition{
+		newAuditPartition(month),
+		newAuditPartition(month.AddDate(0, 1, 0)),
+	}
+}
+
+func newAuditPartition(start time.Time) auditPartition {
+	return auditPartition{
+		name:  "audit_events_" + start.Format("200601"),
+		start: start,
+		end:   start.AddDate(0, 1, 0),
+	}
+}
+
+// EnsureAuditPartitions creates this month's and next month's audit_events
 // partitions. A failure is fatal: without the next month's partition, writes
 // at the month boundary would land in the default partition instead.
+//
+// The whole operation is transactional and serialized with an advisory lock so
+// concurrent deploy jobs cannot race. If a downtime skipped a month, the
+// default partition can already contain rows for the range a new partition
+// needs. PostgreSQL refuses to create that partition while those rows remain,
+// so the default is rebuilt: detach it, keep its rows in a temp table, create
+// the monthly partitions and a fresh default, then copy the rows back through
+// the parent so each lands in the right partition. Retention remains a
+// reviewed maintenance path: detach an old partition, then drop it; audit rows
+// are never DELETE'd.
 func EnsureAuditPartitions(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, ensureAuditPartitionsSQL); err != nil {
-		return fmt.Errorf("ensure audit_events partitions: %w", err)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("ensure audit_events partitions: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('migrate.audit_partitions', 0))`); err != nil {
+		return fmt.Errorf("ensure audit_events partitions: lock: %w", err)
+	}
+
+	var schema string
+	if err := tx.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		return fmt.Errorf("ensure audit_events partitions: current schema: %w", err)
+	}
+	if schema == "" {
+		return errors.New("ensure audit_events partitions: current_schema() is NULL")
+	}
+
+	if err := ensureAuditPartitionsInTx(ctx, tx, schema, auditPartitionsAt(time.Now().UTC())); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("ensure audit_events partitions: commit: %w", err)
 	}
 	return nil
+}
+
+func ensureAuditPartitionsInTx(ctx context.Context, tx pgx.Tx, schema string, partitions []auditPartition) error {
+	conflict, err := auditDefaultPartitionHasRows(ctx, tx, schema, partitions)
+	if err != nil {
+		return err
+	}
+	if conflict {
+		return rebuildAuditDefaultPartition(ctx, tx, schema, partitions)
+	}
+	for _, partition := range partitions {
+		if err := createAuditPartition(ctx, tx, schema, partition); err != nil {
+			return err
+		}
+	}
+	return secureAuditPartition(ctx, tx, schema, "audit_events_default")
+}
+
+// auditDefaultPartitionHasRows reports whether a missing monthly partition's
+// range already has rows in the default partition. FORCE RLS is cleared for
+// the check because the migration role owns the table and must see every
+// tenant's rows; the transaction restores it before commit.
+func auditDefaultPartitionHasRows(ctx context.Context, tx pgx.Tx, schema string, partitions []auditPartition) (bool, error) {
+	if err := setAuditPartitionForcedRLS(ctx, tx, schema, "audit_events_default", false); err != nil {
+		return false, err
+	}
+	for _, partition := range partitions {
+		exists, err := auditPartitionExists(ctx, tx, schema, partition.name)
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			continue
+		}
+		var hasRows bool
+		query := fmt.Sprintf(
+			`SELECT EXISTS (SELECT 1 FROM %s WHERE created_at >= $1 AND created_at < $2)`,
+			qualifiedAuditTable(schema, "audit_events_default"),
+		)
+		if err := tx.QueryRow(ctx, query, partition.start, partition.end).Scan(&hasRows); err != nil {
+			return false, fmt.Errorf("check audit_events_default for %s: %w", partition.name, err)
+		}
+		if hasRows {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// rebuildAuditDefaultPartition moves the default partition's rows aside while
+// the missing monthly partitions are created. The old partition is dropped as
+// a standalone table, so its index names do not collide with the new default's
+// indexes. Rows are copied back through the parent, which routes them to the
+// monthly partitions or the fresh default.
+func rebuildAuditDefaultPartition(ctx context.Context, tx pgx.Tx, schema string, partitions []auditPartition) error {
+	parent := qualifiedAuditTable(schema, "audit_events")
+	defaultPartition := qualifiedAuditTable(schema, "audit_events_default")
+
+	if err := setAuditPartitionForcedRLS(ctx, tx, schema, "audit_events_default", false); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(
+		`CREATE TEMP TABLE audit_events_default_backup ON COMMIT DROP AS SELECT * FROM %s`,
+		defaultPartition,
+	)); err != nil {
+		return fmt.Errorf("back up audit_events_default: %w", err)
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TABLE %s`, defaultPartition)); err != nil {
+		return fmt.Errorf("drop audit_events_default: %w", err)
+	}
+	for _, partition := range partitions {
+		if err := createAuditPartition(ctx, tx, schema, partition); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s PARTITION OF %s DEFAULT`, defaultPartition, parent)); err != nil {
+		return fmt.Errorf("recreate audit_events_default: %w", err)
+	}
+	if err := secureAuditPartition(ctx, tx, schema, "audit_events_default"); err != nil {
+		return err
+	}
+
+	// Copying through the parent exercises its FORCE RLS policy. The migration
+	// role owns it, so clearing FORCE (only inside this transaction) lets every
+	// tenant's rows be restored. Tuple routing may also check the destination
+	// partition's policy, so clear FORCE on every possible target, not just the
+	// parent, and restore it afterwards.
+	targets := append([]auditPartition(nil), partitions...)
+	for _, partition := range targets {
+		if err := setAuditPartitionForcedRLS(ctx, tx, schema, partition.name, false); err != nil {
+			return err
+		}
+	}
+	if err := setAuditPartitionForcedRLS(ctx, tx, schema, "audit_events_default", false); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s NO FORCE ROW LEVEL SECURITY`, parent)); err != nil {
+		return fmt.Errorf("open audit_events for default-partition restore: %w", err)
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s SELECT * FROM audit_events_default_backup`, parent)); err != nil {
+		return fmt.Errorf("restore audit_events_default rows: %w", err)
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s FORCE ROW LEVEL SECURITY`, parent)); err != nil {
+		return fmt.Errorf("restore audit_events row-level security: %w", err)
+	}
+	for _, partition := range targets {
+		if err := secureAuditPartition(ctx, tx, schema, partition.name); err != nil {
+			return err
+		}
+	}
+	if err := secureAuditPartition(ctx, tx, schema, "audit_events_default"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createAuditPartition(ctx context.Context, tx pgx.Tx, schema string, partition auditPartition) error {
+	parent := qualifiedAuditTable(schema, "audit_events")
+	target := qualifiedAuditTable(schema, partition.name)
+	statement := fmt.Sprintf(
+		`CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')`,
+		target,
+		parent,
+		partition.start.Format("2006-01-02"),
+		partition.end.Format("2006-01-02"),
+	)
+	if _, err := tx.Exec(ctx, statement); err != nil {
+		return fmt.Errorf("create audit partition %s: %w", partition.name, err)
+	}
+	attached, err := auditPartitionAttached(ctx, tx, schema, partition.name)
+	if err != nil {
+		return err
+	}
+	if !attached {
+		return fmt.Errorf("audit partition %s exists but is not attached to audit_events", partition.name)
+	}
+	return secureAuditPartition(ctx, tx, schema, partition.name)
+}
+
+func secureAuditPartition(ctx context.Context, tx pgx.Tx, schema, table string) error {
+	target := qualifiedAuditTable(schema, table)
+	for _, statement := range []string{
+		fmt.Sprintf(`ALTER TABLE %s ENABLE ROW LEVEL SECURITY`, target),
+		fmt.Sprintf(`ALTER TABLE %s FORCE ROW LEVEL SECURITY`, target),
+	} {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return fmt.Errorf("secure audit partition %s: %w", table, err)
+		}
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM pg_policies
+		WHERE schemaname = $1 AND tablename = $2 AND policyname = 'tenant_isolation'
+	)`, schema, table).Scan(&exists); err != nil {
+		return fmt.Errorf("inspect audit partition policy %s: %w", table, err)
+	}
+	if exists {
+		return nil
+	}
+	statement := fmt.Sprintf(
+		`CREATE POLICY tenant_isolation ON %s USING (app_tenant_visible(tenant_id)) WITH CHECK (app_tenant_visible(tenant_id))`,
+		target,
+	)
+	if _, err := tx.Exec(ctx, statement); err != nil {
+		return fmt.Errorf("create audit partition policy %s: %w", table, err)
+	}
+	return nil
+}
+
+func setAuditPartitionForcedRLS(ctx context.Context, tx pgx.Tx, schema, table string, forced bool) error {
+	action := "NO FORCE"
+	if forced {
+		action = "FORCE"
+	}
+	statement := fmt.Sprintf(`ALTER TABLE %s %s ROW LEVEL SECURITY`, qualifiedAuditTable(schema, table), action)
+	if _, err := tx.Exec(ctx, statement); err != nil {
+		return fmt.Errorf("set audit partition RLS %s: %w", table, err)
+	}
+	return nil
+}
+
+func auditPartitionExists(ctx context.Context, tx pgx.Tx, schema, table string) (bool, error) {
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2
+	)`, schema, table).Scan(&exists); err != nil {
+		return false, fmt.Errorf("inspect audit partition %s: %w", table, err)
+	}
+	return exists, nil
+}
+
+func auditPartitionAttached(ctx context.Context, tx pgx.Tx, schema, table string) (bool, error) {
+	var attached bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1
+		FROM pg_inherits i
+		JOIN pg_class child ON child.oid = i.inhrelid
+		JOIN pg_class parent ON parent.oid = i.inhparent
+		JOIN pg_namespace n ON n.oid = child.relnamespace
+		JOIN pg_namespace pn ON pn.oid = parent.relnamespace
+		WHERE n.nspname = $1 AND child.relname = $2
+		  AND pn.nspname = $1 AND parent.relname = 'audit_events'
+	)`, schema, table).Scan(&attached); err != nil {
+		return false, fmt.Errorf("inspect audit partition attachment %s: %w", table, err)
+	}
+	return attached, nil
+}
+
+func qualifiedAuditTable(schema, table string) string {
+	return pgx.Identifier{schema, table}.Sanitize()
 }
 
 // snapshotEntry is one normalized catalog object.
@@ -265,9 +495,45 @@ func WriteSchemaSnapshot(ctx context.Context, pool *pgxpool.Pool, schema, path s
 		}
 		fmt.Fprintf(&out, "%s\t%s\t%s\n", entry.Kind, entry.Name, encoded)
 	}
-	if err := os.WriteFile(path, []byte(out.String()), 0o600); err != nil {
+	if err := writeSnapshotFile(path, []byte(out.String())); err != nil {
 		return fmt.Errorf("write schema snapshot %s: %w", path, err)
 	}
+	return nil
+}
+
+// writeSnapshotFile replaces the snapshot atomically so an interrupted
+// regeneration cannot leave a truncated file that the migration guard reads as
+// schema drift. The temporary file must share the destination directory for
+// rename to be atomic on the same filesystem.
+func writeSnapshotFile(path string, content []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	removeTmp = false
 	return nil
 }
 
@@ -292,7 +558,11 @@ func readSchemaSnapshot(path string) (map[string]snapshotEntry, error) {
 			return nil, fmt.Errorf("schema snapshot %s:%d has an invalid definition: %w", path, number+1, err)
 		}
 		entry := snapshotEntry{Kind: fields[0], Name: fields[1], Definition: definition}
-		entries[entry.Kind+"\x00"+entry.Name] = entry
+		key := entry.Kind + "\x00" + entry.Name
+		if _, exists := entries[key]; exists {
+			return nil, fmt.Errorf("schema snapshot %s:%d duplicates %s %s", path, number+1, entry.Kind, entry.Name)
+		}
+		entries[key] = entry
 	}
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("schema snapshot %s is empty", path)

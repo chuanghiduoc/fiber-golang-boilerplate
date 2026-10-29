@@ -120,12 +120,13 @@ func (m *Module) RegisterRoutes(api *httpapi.API, deps app.Deps) {
 	}, m.upload.GetFile)
 
 	httpapi.Register(api, httpapi.Op{
-		Method:      http.MethodGet,
-		Path:        collectionPath + "/{fileId}/content",
-		OperationID: "getFileContent",
-		Tags:        []string{"files"},
-		Summary:     "Download file content",
-		Description: "Streams the stored bytes as an attachment. Responses are never cached.",
+		Method:              http.MethodGet,
+		Path:                collectionPath + "/{fileId}/content",
+		OperationID:         "getFileContent",
+		Tags:                []string{"files"},
+		Summary:             "Download file content",
+		Description:         "Streams the stored bytes as an attachment. Responses are never cached.",
+		ResponseContentType: "application/octet-stream",
 	}, httpapi.Policy{
 		Permission: filescatalog.PermissionFilesRead,
 		RateLimit:  httpapi.RateLimitRelaxed,

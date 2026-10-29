@@ -202,24 +202,41 @@ func countHit(c fiber.Ctx, counter cache.Cache, prefix, bucket string, maxReques
 // would fit, holding the counters constant. It models the current window's
 // count becoming the next window's previous count, so Retry-After points at
 // real capacity instead of merely the next boundary.
+//
+// The predicate is monotonic: within one window it only gets easier as the
+// previous count decays, and crossing into the next window replaces a decaying
+// previous count with the (smaller-or-equal) current count. Binary search keeps
+// the cost logarithmic even when an operator configures a long window.
 func admissionDelay(previous, current, limit, elapsed, window int64) int64 {
-	for delay := int64(1); delay <= 2*window; delay++ {
-		offset := (elapsed + delay) / window
-		at := (elapsed + delay) % window
-		prev, cur := previous, current
-		switch offset {
-		case 0:
-			// Still in the current window.
-		case 1:
-			prev, cur = current, 0
-		default:
-			prev, cur = 0, 0
-		}
-		if prev*(window-at)/window+cur+1 <= limit {
-			return delay
+	low, high := int64(1), 2*window
+	if !admissionAllowed(previous, current, limit, elapsed, window, high) {
+		return window
+	}
+	for low < high {
+		mid := low + (high-low)/2
+		if admissionAllowed(previous, current, limit, elapsed, window, mid) {
+			high = mid
+		} else {
+			low = mid + 1
 		}
 	}
-	return window
+	return low
+}
+
+// admissionAllowed reports whether a request arriving delay seconds after the
+// current window start would fit. It mirrors the sliding-window approximation
+// used by countHit.
+func admissionAllowed(previous, current, limit, elapsed, window, delay int64) bool {
+	offset := elapsed + delay
+	switch {
+	case offset < window:
+		return previous*(window-offset)/window+current < limit
+	case offset < 2*window:
+		at := offset - window
+		return current*(window-at)/window < limit
+	default:
+		return true
+	}
 }
 
 func rateLimitCacheFailure(c fiber.Ctx, prefix string, err error) {

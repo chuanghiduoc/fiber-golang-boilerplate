@@ -18,12 +18,16 @@ import (
 )
 
 type fakePrivacyFiles struct {
-	files   []File
-	deleted []uuid.UUID
+	files         []File
+	deleted       []uuid.UUID
+	pageTruncated bool
 }
 
-func (f *fakePrivacyFiles) ListForUser(context.Context, uuid.UUID, uuid.UUID) ([]File, error) {
-	return f.files, nil
+func (f *fakePrivacyFiles) ListForUserLimited(_ context.Context, _, _ uuid.UUID, limit int32) ([]File, bool, error) {
+	if limit >= 0 && len(f.files) > int(limit) {
+		return f.files[:limit], true, nil
+	}
+	return f.files, f.pageTruncated, nil
 }
 
 func (f *fakePrivacyFiles) HardDelete(_ context.Context, _, _, id uuid.UUID) error {
@@ -96,6 +100,16 @@ func (failingDeleteStorage) List(context.Context, string) ([]storage.Object, err
 }
 func (failingDeleteStorage) URL(string) string { return "" }
 
+type countingGetStorage struct {
+	storage.Storage
+	gets map[string]int
+}
+
+func (s *countingGetStorage) Get(ctx context.Context, path string) (io.ReadCloser, error) {
+	s.gets[path]++
+	return s.Storage.Get(ctx, path)
+}
+
 func mustDecode(t *testing.T, s string) []byte {
 	t.Helper()
 	b, err := base64.StdEncoding.DecodeString(s)
@@ -130,4 +144,65 @@ func TestFilesExporterOmitsContentPastTheInlineBudget(t *testing.T) {
 	assert.Equal(t, "12345", string(mustDecode(t, out.Files[0].Content)))
 	assert.True(t, out.Files[1].Omitted, "5+3 bytes exceed the 6-byte budget")
 	assert.Equal(t, "9", string(mustDecode(t, out.Files[2].Content)), "a later file that still fits is embedded")
+}
+
+func TestFilesExporterSkipsStorageAfterBlobBudgetIsExhausted(t *testing.T) {
+	store, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+	ctx := context.Background()
+	counter := &countingGetStorage{Storage: store, gets: map[string]int{}}
+	repo := &fakePrivacyFiles{}
+	for i, body := range []string{"12345", "a", "b"} {
+		path := fmt.Sprintf("1/10/%d.txt", i)
+		require.NoError(t, store.Put(ctx, path, strings.NewReader(body), int64(len(body)), "text/plain"))
+		repo.files = append(repo.files, File{ID: testID(i + 1), TenantID: testID(1), UserID: testID(10), StoragePath: path})
+	}
+	exporter := NewPrivacyExporter(repo, counter)
+	exporter.inlineLimit = 5
+
+	section, err := exporter.Export(ctx, testID(1), testID(10))
+	require.NoError(t, err)
+	var out struct {
+		Files []struct {
+			Omitted bool `json:"contentOmitted"`
+		} `json:"files"`
+		Budget struct {
+			Truncated bool `json:"truncated"`
+		} `json:"budget"`
+	}
+	require.NoError(t, json.Unmarshal(section.Data, &out))
+	require.Len(t, out.Files, 3)
+	assert.True(t, out.Files[1].Omitted)
+	assert.True(t, out.Files[2].Omitted)
+	assert.True(t, out.Budget.Truncated)
+	assert.True(t, section.Truncated)
+	assert.Equal(t, 1, counter.gets["1/10/0.txt"])
+	assert.Zero(t, counter.gets["1/10/1.txt"])
+	assert.Zero(t, counter.gets["1/10/2.txt"])
+}
+func TestFilesExporterSkipsKnownOversizedBlob(t *testing.T) {
+	store, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+	ctx := context.Background()
+	path := "1/10/oversized.txt"
+	require.NoError(t, store.Put(ctx, path, strings.NewReader("123456"), 6, "text/plain"))
+	repo := &fakePrivacyFiles{files: []File{{
+		ID: testID(1), TenantID: testID(1), UserID: testID(10), StoragePath: path, Size: 6,
+	}}}
+	counter := &countingGetStorage{Storage: store, gets: map[string]int{}}
+	exporter := NewPrivacyExporter(repo, counter)
+	exporter.inlineLimit = 5
+
+	section, err := exporter.Export(ctx, testID(1), testID(10))
+	require.NoError(t, err)
+	var out struct {
+		Files []struct {
+			Omitted bool `json:"contentOmitted"`
+		} `json:"files"`
+	}
+	require.NoError(t, json.Unmarshal(section.Data, &out))
+	require.Len(t, out.Files, 1)
+	assert.True(t, out.Files[0].Omitted)
+	assert.Zero(t, counter.gets[path])
+	assert.True(t, section.Truncated)
 }

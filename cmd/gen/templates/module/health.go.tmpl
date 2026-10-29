@@ -5,21 +5,23 @@ import (
 	"fmt"
 
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/internal/platform/authz"
 )
 
 // HealthService checks the module's dependencies.
 type HealthService struct {
-	checker HealthChecker
+	checker    HealthChecker
+	authorizer authz.Authorizer
 }
 
 // NewHealthService returns a HealthService over checker.
-func NewHealthService(checker HealthChecker) *HealthService {
-	return &HealthService{checker: checker}
+func NewHealthService(checker HealthChecker, authorizer authz.Authorizer) *HealthService {
+	return &HealthService{checker: checker, authorizer: authorizer}
 }
 
 // Check returns nil when the module's database answers.
 func (s *HealthService) Check(ctx context.Context) error {
-	if err := authorize(ctx, {{.M.Ident}}catalog.PermissionRead); err != nil {
+	if err := authorize(ctx, s.authorizer, {{.M.Ident}}catalog.PermissionRead); err != nil {
 		return err
 	}
 	if err := s.checker.Ping(ctx); err != nil {

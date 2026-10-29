@@ -21,8 +21,16 @@ type fakeStore struct {
 	deleted bool
 }
 
-func (f *fakeStore) List(context.Context, uuid.UUID, uuid.UUID) ([]Target, error) {
-	return f.targets, nil
+func (f *fakeStore) List(_ context.Context, _, _ uuid.UUID, limit int32) ([]Target, bool, error) {
+	if limit <= 0 {
+		return []Target{}, false, nil
+	}
+	truncated := len(f.targets) > int(limit)
+	targets := f.targets
+	if truncated {
+		targets = targets[:limit]
+	}
+	return targets, truncated, nil
 }
 func (f *fakeStore) DeleteAll(context.Context, uuid.UUID, uuid.UUID) error {
 	f.deleted = true
@@ -50,4 +58,25 @@ func TestEraseDeletesOnlyUserTargets(t *testing.T) {
 	store := &fakeStore{}
 	require.NoError(t, New(store).Erase(context.Background(), testID(1), testID(10)))
 	assert.True(t, store.deleted)
+}
+
+func TestExportHonoursRowLimit(t *testing.T) {
+	targets := make([]Target, 3)
+	for i := range targets {
+		targets[i] = Target{FlagKey: "flag", CreatedAt: time.Now()}
+	}
+	provider := New(&fakeStore{targets: targets})
+	provider.rowLimit = 2
+	section, err := provider.Export(context.Background(), testID(1), testID(10))
+	require.NoError(t, err)
+	var out struct {
+		FeatureTargets []json.RawMessage `json:"featureTargets"`
+		Budget         struct {
+			Truncated bool `json:"truncated"`
+		} `json:"budget"`
+	}
+	require.NoError(t, json.Unmarshal(section.Data, &out))
+	assert.Len(t, out.FeatureTargets, 2)
+	assert.True(t, section.Truncated)
+	assert.True(t, out.Budget.Truncated)
 }

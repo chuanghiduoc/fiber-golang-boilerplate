@@ -38,7 +38,7 @@ services:
       OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
       OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-1.0}
       TRACING_INSTRUMENT_DB: ${TRACING_INSTRUMENT_DB:-true}
-      TRACING_SHUTDOWN_TIMEOUT: ${TRACING_SHUTDOWN_TIMEOUT:-10}
+      TRACING_SHUTDOWN_TIMEOUT: ${TRACING_SHUTDOWN_TIMEOUT:-10s}
       METRICS_OTLP_ENABLED: ${METRICS_OTLP_ENABLED:-false}
       CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-*}"
       JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
@@ -62,7 +62,9 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (openssl rand -base64 32)}
       DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY (openssl rand -base64 32)}
       WEBHOOK_SECRET_ENCRYPTION_KEY: ${WEBHOOK_SECRET_ENCRYPTION_KEY:?set WEBHOOK_SECRET_ENCRYPTION_KEY (openssl rand -base64 32)}
-      OAUTH_STATE_KEY: ${OAUTH_STATE_KEY:?set OAUTH_STATE_KEY (openssl rand -base64 32)}
+      # Optional unless GOOGLE_CLIENT_ID is set; config validation enforces it
+      # when OAuth is enabled.
+      OAUTH_STATE_KEY: ${OAUTH_STATE_KEY:-}
       STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
       STORAGE_LOCAL_PATH: ${STORAGE_LOCAL_PATH:-./uploads}
       STORAGE_MAX_FILE_SIZE: ${STORAGE_MAX_FILE_SIZE:-10485760}
@@ -70,7 +72,9 @@ services:
       STORAGE_S3_REGION: ${STORAGE_S3_REGION:-us-east-1}
       STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-uploads}
       STORAGE_S3_ACCESS_KEY: ${STORAGE_S3_ACCESS_KEY:-seaweedadmin}
-      STORAGE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:?set STORAGE_S3_SECRET_KEY}
+      # Optional unless STORAGE_DRIVER is s3/seaweedfs; config validation
+      # enforces it when the S3 backend is selected.
+      STORAGE_S3_SECRET_KEY: ${STORAGE_S3_SECRET_KEY:-}
       STORAGE_S3_USE_SSL: ${STORAGE_S3_USE_SSL:-false}
       CACHE_DRIVER: ${CACHE_DRIVER:-memory}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
@@ -130,11 +134,12 @@ services:
   # One-shot admin seed, after the schema exists. Account creation is never part
   # of API startup, so ADMIN_* reach this service only, not the app container.
   # cmd/seed creates a missing admin and never re-promotes existing accounts, so
-  # re-running it is safe. The app does not wait for it: `docker compose up app`
-  # starts the API without seeding. ADMIN_EMAIL/ADMIN_PASSWORD have no default
-  # here: set them in .env (see .env.example) to seed; unset, the seed exits
-  # with an error and the API keeps running.
+  # re-running it is safe. The service is opt-in (profile "seed"): run
+  # `docker compose --profile seed run --rm seed` after setting
+  # ADMIN_EMAIL/ADMIN_PASSWORD. A plain `docker compose up` starts only the API
+  # stack and never seeds implicitly.
   seed:
+    profiles: ["seed"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -266,7 +271,7 @@ services:
       - "127.0.0.1:8333:8333"
     environment:
       AWS_ACCESS_KEY_ID: ${STORAGE_S3_ACCESS_KEY:-seaweedadmin}
-      AWS_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_KEY:?set STORAGE_S3_SECRET_KEY}
+      AWS_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_KEY:-}
     command: server -s3 -dir=/data
     volumes:
       - seaweedfs_data:/data

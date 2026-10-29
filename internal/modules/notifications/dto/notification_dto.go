@@ -96,3 +96,18 @@ type CreateNotificationResponse struct {
 	Notification *NotificationResponse `json:"notification"`
 	EmailQueued  bool                  `json:"emailQueued"`
 }
+
+// TransformSchema documents notification as the object or an explicit null.
+// Huma does not support nullable object refs through the field tag, so the
+// wrapper emits an anyOf without making the NotificationResponse component
+// itself nullable.
+func (CreateNotificationResponse) TransformSchema(_ huma.Registry, s *huma.Schema) *huma.Schema {
+	notification := s.Properties["notification"]
+	if notification == nil {
+		return s
+	}
+	s.Properties["notification"] = &huma.Schema{
+		AnyOf: []*huma.Schema{notification, {Type: "null"}},
+	}
+	return s
+}

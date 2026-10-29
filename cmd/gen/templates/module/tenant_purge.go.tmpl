@@ -20,8 +20,11 @@ type tenantPurger struct {
 // PurgeTenant implements tenancy.Purger.
 func (p tenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	for _, purger := range p.purgers {
+		if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+			return err
+		}
 		if err := purger.PurgeTenant(ctx, tenantID); err != nil {
-			return fmt.Errorf("{{.M.Name}}: purge tenant %d: %w", tenantID, err)
+			return fmt.Errorf("{{.M.Name}}: purge tenant %s: %w", tenantID, err)
 		}
 	}
 	return nil

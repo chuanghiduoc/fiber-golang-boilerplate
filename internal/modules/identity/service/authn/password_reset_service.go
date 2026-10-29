@@ -105,9 +105,15 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req ForgotPas
 
 	// Rate limit before the lookup, for every address. Increment is atomic and
 	// sets the TTL on the first request. Returning the same generic success
-	// response for known/unknown/limited addresses avoids an enumeration oracle.
+	// response for known/unknown/limited addresses avoids an enumeration oracle;
+	// a cache failure is a generic 503 for every address instead of skipping the
+	// limit.
 	if s.Cache != nil {
-		if n, err := s.Cache.Increment(ctx, emailKey("password_reset:", emailAddr), time.Minute); err == nil && n > 1 {
+		limited, err := emailThrottleExceeded(ctx, s.Cache, "password_reset:", emailAddr)
+		if err != nil {
+			return err
+		}
+		if limited {
 			return nil
 		}
 	}
@@ -230,6 +236,19 @@ func replaceResetToken(ctx context.Context, resets PasswordResetRepository, user
 
 func (s *passwordResetService) ResetPassword(ctx context.Context, req ResetPasswordInput) error {
 	tokenHash := hashToken(req.Token)
+
+	// The public service can be called without the HTTP handler's policy
+	// check. Resolve a live token's address and enforce the same email/password
+	// rule here before spending Argon2id CPU or consuming the token.
+	address, err := s.EmailForResetToken(ctx, req.Token)
+	if err != nil {
+		return err
+	}
+	if address != "" {
+		if err := ValidatePasswordForEmail(req.Password, address, "password"); err != nil {
+			return err
+		}
+	}
 
 	// Validate the token with a cheap read before spending Argon2id CPU, and
 	// hash outside the transaction so the cost-12 hash never holds a pooled

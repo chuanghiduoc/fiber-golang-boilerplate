@@ -84,10 +84,10 @@ func TestMFABudgetExhaustionAuditedOnce(t *testing.T) {
 func TestMFADisableAndRegenerateFailuresAreAudited(t *testing.T) {
 	for name, call := range map[string]func(h *mfaHarness, ctx context.Context) error{
 		"disable": func(h *mfaHarness, ctx context.Context) error {
-			return h.svc.Disable(ctx, fakes.TestID(100), fakes.TestID(1), "not-a-real-code")
+			return h.svc.Disable(ctx, fakes.TestID(100), MFACodeChange{FactorID: h.factorID(t), SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: "not-a-real-code"})
 		},
 		"regenerate": func(h *mfaHarness, ctx context.Context) error {
-			_, err := h.svc.RegenerateRecoveryCodes(ctx, fakes.TestID(100), "not-a-real-code")
+			_, err := h.svc.RegenerateRecoveryCodes(ctx, fakes.TestID(100), MFARecoveryChange{SessionID: fakes.TestID(1), CurrentPassword: testMFAPassword, Code: "not-a-real-code"})
 			return err
 		},
 	} {

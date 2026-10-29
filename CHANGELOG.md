@@ -23,6 +23,13 @@ until the first release, and legacy access tokens must be re-issued.
   changes are UTC-timestamped migrations (#120).
 - The API, worker, and seed connect as a non-superuser role without
   `BYPASSRLS`; `cmd/migrate` uses the owner role via `DB_MIGRATE_*` (#120).
+- `APP_TRUSTED_PROXIES` rejects wildcard and broad private aggregates
+  (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`); deployments
+  must list the actual ingress pod/service CIDR (or node `/32` for
+  `hostNetwork`), otherwise startup fails.
+- The Kubernetes seed Job owns `ADMIN_EMAIL`/`ADMIN_NAME` in a seed-only
+  ConfigMap. The shared app ConfigMap no longer carries `ADMIN_*`, because the
+  API has no `ADMIN_PASSWORD` and would refuse to start.
 
 ### Added
 - Tenant-scoped RBAC with role management and platform tenant administration

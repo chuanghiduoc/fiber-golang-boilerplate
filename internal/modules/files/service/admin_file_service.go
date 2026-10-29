@@ -144,7 +144,7 @@ func (s *adminFileService) commitAdminMutation(ctx context.Context, m adminFileM
 		if auditErr := tx.Audit.RecordTx(ctx, event); auditErr != nil {
 			return filesAuditWriteError(auditErr)
 		}
-		if pubErr := publishEvent(ctx, tx.Events, m.eventType, m.dataVersion, file.TenantID, m.eventData(file)); pubErr != nil {
+		if pubErr := publishEvent(ctx, tx.Events, m.eventType, m.dataVersion, file.TenantID, []uuid.UUID{file.UserID}, m.eventData(file)); pubErr != nil {
 			return apperror.Internal(pubErr, "failed to publish file event")
 		}
 		changed = file

@@ -115,7 +115,9 @@ func (m *MemoryCache) Get(_ context.Context, key string) ([]byte, error) {
 		return nil, nil
 	}
 	m.touchLocked(e)
-	return e.data, nil
+	// Match the Redis driver: callers receive their own copy and cannot mutate
+	// the cached value (or a value shared with another request).
+	return bytes.Clone(e.data), nil
 }
 
 func (m *MemoryCache) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
@@ -201,8 +203,14 @@ func (m *MemoryCache) Increment(_ context.Context, key string, ttl time.Duration
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	value, _, err := m.incrementLocked(key, ttl, math.MaxInt64)
-	return value, err
+	value, ok, err := m.incrementLocked(key, ttl, math.MaxInt64)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, fmt.Errorf("cache: increment overflow at %q", key)
+	}
+	return value, nil
 }
 
 // IncrementBelow increments only while the resulting value stays at or below
@@ -300,7 +308,7 @@ func (m *MemoryCache) storeLocked(key string, value []byte, expiresAt time.Time,
 		e = &entry{key: key}
 		m.items[key] = e
 	}
-	e.data = value
+	e.data = bytes.Clone(value)
 	e.expiresAt = expiresAt
 	e.version = m.nextVersion
 	if evictable {

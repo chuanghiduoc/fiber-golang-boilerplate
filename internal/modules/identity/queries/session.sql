@@ -91,7 +91,7 @@ WHERE s.user_id = @user_id AND u.id = s.user_id
 UPDATE sessions
 SET token_version = @token_version, amr = @amr, last_used_at = NOW()
 WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
-  AND revoked_at IS NULL
+  AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING *;
 
 -- name: DeleteSessionRefreshTokens :exec
@@ -114,10 +114,16 @@ WHERE r.token_hash = @token_hash
   AND s.revoked_at IS NULL
 RETURNING s.user_id;
 
--- name: TouchSession :exec
+-- name: TouchSession :execrows
+-- A refresh rotation may only touch a session that is still live at
+-- statement time. The service loads the session before opening the
+-- transaction; this predicate closes the check-then-act gap where a
+-- concurrent logout, ban, or absolute expiry lands between that read and the
+-- rotation commit.
 UPDATE sessions
 SET last_used_at = NOW(), user_agent = @user_agent, ip = @ip
-WHERE tenant_id = @tenant_id AND id = @id;
+WHERE tenant_id = @tenant_id AND id = @id
+  AND revoked_at IS NULL AND expires_at > NOW();
 
 -- name: MarkSessionMFAVerified :one
 -- Step-up: record a fresh second-factor proof on the session that performed
@@ -126,7 +132,7 @@ WHERE tenant_id = @tenant_id AND id = @id;
 UPDATE sessions
 SET mfa_verified_at = NOW(), updated_at = NOW()
 WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
-  AND revoked_at IS NULL
+  AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING mfa_verified_at;
 
 -- name: MarkSessionMFAVerifiedWithMethod :one
@@ -138,7 +144,7 @@ UPDATE sessions
 SET mfa_verified_at = NOW(), updated_at = NOW(),
     amr = ARRAY(SELECT DISTINCT unnest(amr || @method::text))
 WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
-  AND revoked_at IS NULL
+  AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING mfa_verified_at;
 
 
@@ -188,7 +194,7 @@ FROM sessions s
 JOIN memberships m ON m.tenant_id = s.tenant_id AND m.user_id = s.user_id
 JOIN users u ON u.id = s.user_id
 JOIN tenants t ON t.id = s.tenant_id
-WHERE s.id = $1 AND s.user_id = $2;
+WHERE s.id = $1 AND s.user_id = $2 AND s.tenant_id = $3;
 
 -- name: PurgeStaleSessions :execrows
 -- Maintenance purge across every tenant: sessions revoked longer ago than
@@ -216,6 +222,9 @@ WHERE t.id = batch.id;
 -- live (not revoked, not expired) and a newer token was already rotated into
 -- the same session. Reading the token and the session together leaves no
 -- check-then-act gap between the grace decision and the reuse revocation.
+-- "Newer" is compared by created_at, not id: uuidv7 ids minted inside the same
+-- millisecond are ordered by their random tail, so id ordering can point at
+-- the older token and revoke a session for a benign concurrent refresh.
 SELECT
     (s.revoked_at IS NULL AND s.expires_at > NOW()) AS session_live,
     (r.used_at IS NOT NULL AND r.used_at > @used_after::timestamptz) AS recent,
@@ -223,7 +232,8 @@ SELECT
         SELECT 1 FROM refresh_tokens n
         WHERE n.tenant_id = r.tenant_id
           AND n.session_id = r.session_id
-          AND n.id > r.id
+          AND n.created_at >= r.created_at
+          AND n.id <> r.id
     ) AS rotated
 FROM refresh_tokens r
 JOIN sessions s ON s.tenant_id = r.tenant_id AND s.id = r.session_id

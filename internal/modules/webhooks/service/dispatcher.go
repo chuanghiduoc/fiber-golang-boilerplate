@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -78,6 +79,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, event events.Event) (int, err
 			DataVersion:    int32(event.DataVersion), // #nosec G115 -- validated 1..math.MaxInt32
 			ActorType:      event.Actor.Type,
 			ActorID:        event.Actor.ID,
+			SubjectUserIDs: subjectUserIDsFor(event),
 			EventCreatedAt: event.OccurredAt,
 			URL:            endpoint.URL,
 			Payload:        event.Data,
@@ -100,6 +102,66 @@ func (d *Dispatcher) Dispatch(ctx context.Context, event events.Event) (int, err
 		)
 	}
 	return created, nil
+}
+
+// subjectUserIDsFor merges the authenticated user actor, the producer's
+// explicit subjects, and the user-id keys shipped by the current event
+// contracts. The payload fallback also preserves attribution for events that
+// were already queued when this metadata was introduced. Duplicates are
+// removed so the persisted array stays canonical.
+func subjectUserIDsFor(event events.Event) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(event.SubjectUserIDs)+1)
+	seen := make(map[uuid.UUID]struct{}, cap(ids))
+	add := func(id uuid.UUID) {
+		if id == uuid.Nil {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for _, id := range event.SubjectUserIDs {
+		add(id)
+	}
+	for _, id := range payloadSubjectUserIDs(event.Data) {
+		add(id)
+	}
+	if event.Actor.Type == events.ActorUser {
+		if id, err := uuid.Parse(event.Actor.ID); err == nil {
+			add(id)
+		}
+	}
+	return ids
+}
+
+// payloadSubjectUserIDs reads the top-level user-id fields used by the events
+// shipped before subject_user_ids existed. Nested payloads are covered by the
+// producer setting SubjectUserIDs explicitly.
+func payloadSubjectUserIDs(data json.RawMessage) []uuid.UUID {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil
+	}
+	keys := [...]string{
+		"userId", "ownerId", "accountId", "memberId", "subjectId", "targetUserId",
+	}
+	ids := make([]uuid.UUID, 0, len(keys))
+	for _, key := range keys {
+		raw, ok := payload[key]
+		if !ok {
+			continue
+		}
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			continue
+		}
+		if id, err := uuid.Parse(value); err == nil && id != uuid.Nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // validateDispatchEvent checks what the bus cannot: a webhook event must

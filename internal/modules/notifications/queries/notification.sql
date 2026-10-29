@@ -51,12 +51,22 @@ WHERE id = @id::uuid
   AND user_id = @user_id::uuid
 RETURNING *;
 
+-- Bounded so one request cannot lock an arbitrarily large unread set. The
+-- repository repeats the statement until a short batch is returned.
 -- name: MarkAllNotificationsRead :execrows
-UPDATE notifications
+WITH batch AS (
+    SELECT id
+    FROM notifications
+    WHERE tenant_id = @tenant_id::uuid
+      AND user_id = @user_id::uuid
+      AND read_at IS NULL
+    ORDER BY created_at, id
+    LIMIT @batch_size::int
+)
+UPDATE notifications AS n
 SET read_at = NOW()
-WHERE tenant_id = @tenant_id::uuid
-  AND user_id = @user_id::uuid
-  AND read_at IS NULL;
+FROM batch
+WHERE n.id = batch.id;
 
 -- name: GetNotificationPreference :one
 SELECT * FROM notification_preferences

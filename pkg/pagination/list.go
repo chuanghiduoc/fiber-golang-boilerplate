@@ -10,7 +10,7 @@ package pagination
 type List[T any] struct {
 	Object     string `json:"object" doc:"Always \"list\"."`
 	URL        string `json:"url" doc:"Collection path this page was read from."`
-	Data       []T    `json:"data" doc:"Page items."`
+	Data       []T    `json:"data" nullable:"false" doc:"Page items; empty is [] and never null."`
 	HasMore    bool   `json:"hasMore" doc:"Whether another page exists."`
 	NextCursor string `json:"nextCursor,omitempty" doc:"Opaque cursor for the next page; present when hasMore is true."`
 }

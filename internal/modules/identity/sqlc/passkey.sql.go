@@ -193,6 +193,53 @@ func (q *Queries) ListPasskeysByUser(ctx context.Context, userID uuid.UUID) ([]W
 	return items, nil
 }
 
+const listPasskeysByUserLimited = `-- name: ListPasskeysByUserLimited :many
+SELECT id, user_id, credential_id, public_key, sign_count, aaguid, transports, backup_eligible, backup_state, name, created_at, last_used_at, updated_at FROM webauthn_credentials
+WHERE user_id = $1
+ORDER BY created_at DESC, id DESC
+LIMIT $2::int
+`
+
+type ListPasskeysByUserLimitedParams struct {
+	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
+}
+
+// Export: one bounded page of passkey metadata, newest first.
+func (q *Queries) ListPasskeysByUserLimited(ctx context.Context, arg ListPasskeysByUserLimitedParams) ([]WebauthnCredential, error) {
+	rows, err := q.db.Query(ctx, listPasskeysByUserLimited, arg.UserID, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WebauthnCredential{}
+	for rows.Next() {
+		var i WebauthnCredential
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.CredentialID,
+			&i.PublicKey,
+			&i.SignCount,
+			&i.Aaguid,
+			&i.Transports,
+			&i.BackupEligible,
+			&i.BackupState,
+			&i.Name,
+			&i.CreatedAt,
+			&i.LastUsedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updatePasskeyAfterAssertion = `-- name: UpdatePasskeyAfterAssertion :execrows
 UPDATE webauthn_credentials
 SET sign_count = $1,

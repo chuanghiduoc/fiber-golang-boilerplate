@@ -11,7 +11,7 @@ import (
 func TestMigrationGuardCoversTenantFoundation(t *testing.T) {
 	for _, table := range []string{
 		"tenants", "memberships", "invitations", "sessions", "refresh_tokens",
-		"files", "jobs", "audit_events",
+		"files", "files_storage_usage", "jobs", "audit_events",
 	} {
 		if table == "tenants" {
 			continue
@@ -27,6 +27,23 @@ func TestMigrationGuardCoversTenantFoundation(t *testing.T) {
 	}
 	if !slices.Contains(requiredTriggers["invitations"], "trigger_invitations_role_scope") {
 		t.Error("invitation role scope trigger must be verified")
+	}
+	if !slices.Contains(requiredTriggers["files"], "trigger_files_storage_usage") {
+		t.Error("files storage counter trigger must be verified")
+	}
+}
+
+func TestTriggerEnabled(t *testing.T) {
+	for state, want := range map[string]bool{
+		"O": true,
+		"A": true,
+		"D": false,
+		"R": false,
+		"":  false,
+	} {
+		if got := triggerEnabled(state); got != want {
+			t.Errorf("triggerEnabled(%q) = %t, want %t", state, got, want)
+		}
 	}
 }
 
@@ -154,5 +171,17 @@ func TestSchemaSnapshotRejectsMalformedFile(t *testing.T) {
 	}
 	if _, err := readSchemaSnapshot(path); err == nil {
 		t.Fatal("a malformed snapshot line must be rejected")
+	}
+}
+
+func TestSchemaSnapshotRejectsDuplicateEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.snapshot.sql")
+	raw := "table\ttenants\t\"r\"\n" +
+		"table\ttenants\t\"p\"\n"
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	if _, err := readSchemaSnapshot(path); err == nil {
+		t.Fatal("duplicate snapshot entries must be rejected instead of silently overwriting")
 	}
 }

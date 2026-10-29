@@ -83,7 +83,7 @@ func TestEffectivePermissionsAreUnionedInTheSessionState(t *testing.T) {
 
 	pair, err := e.Sessions.Issue(ctx, member.UserID, 0, nil)
 	require.NoError(t, err)
-	state, err := e.Stores.Sessions.State(ctx, pair.SessionID, member.UserID)
+	state, err := e.Stores.Sessions.State(ctx, tenant.IDFromContext(ctx), pair.SessionID, member.UserID)
 	require.NoError(t, err)
 	assert.Equal(t, core.RoleMember, state.Role)
 	assert.True(t, state.Platform)

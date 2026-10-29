@@ -3,6 +3,7 @@ package email
 import (
 	"context"
 	"fmt"
+	"net/mail"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
@@ -30,8 +31,12 @@ func NewSender(cfg config.EmailConfig) (Sender, error) {
 }
 
 func formatAddr(name, addr string) string {
+	name = sanitizeHeader(name)
+	addr = sanitizeHeader(addr)
 	if name == "" {
 		return addr
 	}
-	return fmt.Sprintf("%s <%s>", name, addr)
+	// mail.Address quotes/encodes the display name. Building "%s <%s>"
+	// manually lets a name containing a comma or quote corrupt the header.
+	return (&mail.Address{Name: name, Address: addr}).String()
 }

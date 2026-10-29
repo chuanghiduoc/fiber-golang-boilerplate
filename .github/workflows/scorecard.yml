@@ -26,8 +26,6 @@ jobs:
     permissions:
       # Upload the SARIF result to code scanning.
       security-events: write
-      # Needed only when publish_results publishes the score to the OpenSSF API.
-      id-token: write
       contents: read
       actions: read
     steps:

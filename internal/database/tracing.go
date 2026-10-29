@@ -20,37 +20,36 @@ const (
 )
 
 // querySpanKey carries the active span from TraceQueryStart to TraceQueryEnd.
-// A private key prevents collisions with application context values.
+// batchSpanKey carries the per-query spans for a SendBatch call until their
+// results are consumed. Private key types prevent collisions with application
+// context values.
 type querySpanKey struct{}
+type batchSpanKey struct{}
 
-// queryTracer implements pgx.QueryTracer. It intentionally exposes only the
-// statement class and SQLSTATE: queries, bind parameters, and driver error
-// messages routinely contain PII, tokens, or uploaded file metadata.
+type batchSpanState struct {
+	parent  trace.Span
+	queries []trace.Span
+	next    int
+	failed  bool
+}
+
+// queryTracer implements pgx.QueryTracer and pgx.BatchTracer. It intentionally
+// exposes only the statement class and SQLSTATE: queries, bind parameters, and
+// driver error messages routinely contain PII, tokens, or uploaded metadata.
 type queryTracer struct {
 	tp trace.TracerProvider
 }
 
-var _ pgx.QueryTracer = (*queryTracer)(nil)
+var (
+	_ pgx.QueryTracer = (*queryTracer)(nil)
+	_ pgx.BatchTracer = (*queryTracer)(nil)
+)
 
 func (t *queryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	if t == nil || t.tp == nil || ctx == nil {
+	if !t.recording(ctx) {
 		return ctx
 	}
-	// Only contribute spans when an instrumented operation is already
-	// recording. Background work without a root span must not create orphan
-	// database traces or pay the sampling cost.
-	if !trace.SpanFromContext(ctx).IsRecording() {
-		return ctx
-	}
-
-	operation := sqlOperation(data.SQL)
-	ctx, span := t.tp.Tracer(instrumentationName).Start(ctx, "db "+operation,
-		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(
-			semconv.DBSystemNamePostgreSQL,
-			semconv.DBOperationNameKey.String(operation),
-		),
-	)
+	ctx, span := t.startSpan(ctx, sqlOperation(data.SQL))
 	return context.WithValue(ctx, querySpanKey{}, span)
 }
 
@@ -62,9 +61,105 @@ func (t *queryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.T
 	if !ok || span == nil {
 		return
 	}
-	defer span.End()
+	finishSpan(span, data.Err)
+}
 
-	err := data.Err
+// TraceBatchStart creates a parent batch span and one child per queued query.
+// The child spans end as pgx reports each result. Ending the remaining spans in
+// TraceBatchEnd prevents leaks when a caller closes the batch early.
+func (t *queryTracer) TraceBatchStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchStartData) context.Context {
+	if !t.recording(ctx) || data.Batch == nil {
+		return ctx
+	}
+	parentCtx, parent := t.startSpan(ctx, "BATCH")
+	state := &batchSpanState{
+		parent:  parent,
+		queries: make([]trace.Span, len(data.Batch.QueuedQueries)),
+	}
+	for i, query := range data.Batch.QueuedQueries {
+		if query == nil {
+			continue
+		}
+		_, span := t.startSpan(parentCtx, sqlOperation(query.SQL))
+		state.queries[i] = span
+	}
+	return context.WithValue(ctx, batchSpanKey{}, state)
+}
+
+func (t *queryTracer) TraceBatchQuery(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchQueryData) {
+	state := batchStateFromContext(ctx)
+	if state == nil {
+		return
+	}
+	span := state.take()
+	if span == nil {
+		return
+	}
+	if data.Err != nil && !errors.Is(data.Err, pgx.ErrNoRows) {
+		state.failed = true
+	}
+	finishSpan(span, data.Err)
+}
+
+func (t *queryTracer) TraceBatchEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchEndData) {
+	state := batchStateFromContext(ctx)
+	if state == nil {
+		return
+	}
+	for state.next < len(state.queries) {
+		finishSpan(state.take(), nil)
+	}
+	if data.Err != nil {
+		state.failed = true
+	}
+	if state.failed {
+		state.parent.SetStatus(codes.Error, "")
+	}
+	state.parent.End()
+}
+
+func (s *batchSpanState) take() trace.Span {
+	if s == nil || s.next >= len(s.queries) {
+		return nil
+	}
+	span := s.queries[s.next]
+	s.next++
+	return span
+}
+
+func batchStateFromContext(ctx context.Context) *batchSpanState {
+	if ctx == nil {
+		return nil
+	}
+	state, _ := ctx.Value(batchSpanKey{}).(*batchSpanState)
+	return state
+}
+
+func (t *queryTracer) recording(ctx context.Context) bool {
+	if t == nil || t.tp == nil || ctx == nil {
+		return false
+	}
+	// Only contribute spans when an instrumented operation is already
+	// recording. Background work without a root span must not create orphan
+	// database traces or pay the sampling cost.
+	return trace.SpanFromContext(ctx).IsRecording()
+}
+
+func (t *queryTracer) startSpan(ctx context.Context, operation string) (context.Context, trace.Span) {
+	return t.tp.Tracer(instrumentationName).Start(ctx, "db "+operation,
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			semconv.DBSystemNamePostgreSQL,
+			semconv.DBOperationNameKey.String(operation),
+		),
+	)
+}
+
+func finishSpan(span trace.Span, err error) {
+	if span == nil {
+		return
+	}
+	defer span.End()
 	if err == nil || errors.Is(err, pgx.ErrNoRows) {
 		// A miss is a normal application outcome, not an infrastructure error.
 		return

@@ -2,13 +2,14 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/danielgtaylor/huma/v2"
 	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
@@ -19,6 +20,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
@@ -105,29 +107,23 @@ func checkETag(ifMatch string, updatedAt time.Time) error {
 	return httpapi.CheckIfMatchValue(ifMatch, etagOpaque(updatedAt))
 }
 
-// decodeMergePatch decodes an RFC 7396 merge-patch document into a typed DTO
-// whose optional members use patch.Field. The body is read raw because the
-// foundation does not register the application/merge-patch+json media type.
-func decodeMergePatch(raw []byte, out any) error {
-	if strings.TrimSpace(string(raw)) == "" {
-		return apperror.NewBadRequest("request body is required")
-	}
-	if err := json.Unmarshal(raw, out); err != nil {
-		var typeErr *json.UnmarshalTypeError
-		var syntaxErr *json.SyntaxError
-		if errors.As(err, &typeErr) || errors.As(err, &syntaxErr) {
-			return apperror.NewBadRequest("invalid JSON body")
-		}
-		return apperror.NewBadRequest("invalid merge patch body")
-	}
-	return nil
-}
-
 // parseUUID parses a required path parameter that huma documents as a UUID.
 func parseUUID(value, name string) (uuid.UUID, error) {
 	id, err := uuid.Parse(strings.TrimSpace(value))
-	if err != nil || id == uuid.Nil {
-		return uuid.Nil, apperror.NewBadRequest("invalid " + name)
+	if err != nil {
+		// Huma rejects malformed UUIDs before the handler, but keep this path
+		// consistent for direct callers: malformed input is validation (422).
+		return uuid.Nil, apperror.NewValidation("invalid "+name, []apperror.FieldError{{
+			Path:    "path." + name,
+			Code:    "invalid",
+			Message: "invalid " + name,
+		}})
+	}
+	if id == uuid.Nil {
+		// The all-zero UUID is syntactically valid, so treat it like any other
+		// well-formed identifier that names no resource. Typed UUID routes take
+		// the same 404 path through their service/repository lookup.
+		return uuid.Nil, apperror.NewNotFound("resource not found")
 	}
 	return id, nil
 }
@@ -155,13 +151,7 @@ func tenantIDFromContext(ctx context.Context) uuid.UUID {
 
 // paginationLimit clamps a requested page size to the documented range.
 func paginationLimit(limit int) int {
-	if limit <= 0 {
-		return 20
-	}
-	if limit > 100 {
-		return 100
-	}
-	return limit
+	return pagination.NormalizeLimit(limit)
 }
 
 // redirectOutput is a 302 response with only the Location header.
@@ -178,8 +168,22 @@ type exportOutput struct {
 	ContentType        string `header:"Content-Type"`
 	ContentDisposition string `header:"Content-Disposition"`
 	CacheControl       string `header:"Cache-Control"`
-	Body               []byte
+	Body               func(huma.Context)
 }
 
 // HTTPStatus documents the export response as 200.
 func (*exportOutput) HTTPStatus() int { return http.StatusOK }
+
+// streamExport copies the export to the response without buffering it in
+// memory. The reader belongs to this response, so the callback owns its Close.
+func streamExport(reader io.ReadCloser, exportID uuid.UUID) func(huma.Context) {
+	return func(ctx huma.Context) {
+		defer func() { _ = reader.Close() }()
+		if _, err := io.Copy(ctx.BodyWriter(), reader); err != nil {
+			slog.WarnContext(ctx.Context(), "failed to stream data export",
+				slog.String("export_id", exportID.String()),
+				slog.Any("error", err),
+			)
+		}
+	}
+}

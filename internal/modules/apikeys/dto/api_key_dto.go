@@ -40,7 +40,13 @@ func (o *OptionalString) UnmarshalJSON(data []byte) error { return o.Field.Unmar
 
 // Schema declares the member as a nullable string.
 func (OptionalString) Schema(huma.Registry) *huma.Schema {
-	return &huma.Schema{Type: huma.TypeString, Nullable: true}
+	minLength, maxLength := 1, 255
+	return &huma.Schema{
+		Type:      huma.TypeString,
+		Nullable:  true,
+		MinLength: &minLength,
+		MaxLength: &maxLength,
+	}
 }
 
 // OptionalStrings is pkg/patch.Field[[]string] with the array's OpenAPI schema.
@@ -53,10 +59,13 @@ func (o *OptionalStrings) UnmarshalJSON(data []byte) error { return o.Field.Unma
 
 // Schema declares the member as a nullable string array.
 func (OptionalStrings) Schema(huma.Registry) *huma.Schema {
+	minItems, maxItems := 1, 100
 	return &huma.Schema{
 		Type:     huma.TypeArray,
 		Nullable: true,
 		Items:    &huma.Schema{Type: huma.TypeString},
+		MinItems: &minItems,
+		MaxItems: &maxItems,
 	}
 }
 

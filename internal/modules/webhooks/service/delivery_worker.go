@@ -24,8 +24,9 @@ const (
 	defaultLease = 3 * time.Minute
 	maxErrorLen  = 1000
 	// bookkeepingTimeout bounds the detached writes that record an attempt
-	// after the HTTP request was sent.
-	bookkeepingTimeout = 5 * time.Second
+	// after the HTTP request was sent. Each write gets a fresh timeout; it must
+	// not start before a slow receiver has responded.
+	defaultBookkeepingTimeout = 5 * time.Second
 )
 
 // WorkerOptions configures retry and claim behavior.
@@ -61,6 +62,9 @@ type DeliveryWorker struct {
 	client *webhook.Client
 	opts   WorkerOptions
 	now    func() time.Time
+	// bookkeepingTimeout is a field so tests can shrink it without waiting five
+	// seconds; production uses defaultBookkeepingTimeout.
+	bookkeepingTimeout time.Duration
 }
 
 // NewDeliveryWorker returns a worker. Nil client becomes a default SSRF-safe
@@ -82,11 +86,12 @@ func NewDeliveryWorker(store WorkerStore, codec *SecretCodec, client *webhook.Cl
 		client = webhook.NewClient(webhook.ClientConfig{})
 	}
 	return &DeliveryWorker{
-		store:  store,
-		codec:  codec,
-		client: client,
-		opts:   opts,
-		now:    func() time.Time { return time.Now().UTC() },
+		store:              store,
+		codec:              codec,
+		client:             client,
+		opts:               opts,
+		now:                func() time.Time { return time.Now().UTC() },
+		bookkeepingTimeout: defaultBookkeepingTimeout,
 	}
 }
 
@@ -114,14 +119,14 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 		return fmt.Errorf("webhooks: claim delivery %s: %w", job.DeliveryID, err)
 	}
 
-	// Bookkeeping runs detached from job cancellation: an attempt that could
-	// not be sent (or a response that already arrived) must still be recorded,
-	// otherwise the next retry duplicates work before the lease expires.
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
-	defer cancel()
-
 	body, failure := w.prepare(ctx, delivery)
 	if failure != nil {
+		if ctx.Err() != nil {
+			// The snapshot lookup was interrupted by worker shutdown or job
+			// timeout. That is not a delivery failure: release the fenced
+			// claim so the next worker can retry without spending an attempt.
+			return w.releaseInterrupted(ctx, delivery, ctx.Err())
+		}
 		attempt := attemptResult{outcome: webhook.OutcomePermanent, reason: failure.reason}
 		if failure.retryable {
 			// A decryption failure usually means a replica during a key
@@ -129,10 +134,10 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 			// the attempt budget) instead of dead-lettering.
 			attempt.outcome = webhook.OutcomeRetry
 		}
-		if err := w.recordAttempt(writeCtx, delivery, attempt); err != nil {
+		if err := w.recordAttempt(ctx, delivery, attempt); err != nil {
 			return err
 		}
-		return w.finish(writeCtx, delivery, attempt)
+		return w.finish(ctx, delivery, attempt)
 	}
 
 	headers, err := w.requestHeaders(ctx, delivery, body)
@@ -140,17 +145,17 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 		if ctx.Err() != nil {
 			// The worker is shutting down (or the job timed out) before the
 			// request was built; give the attempt back instead of spending it.
-			return w.releaseInterrupted(writeCtx, delivery, ctx.Err())
+			return w.releaseInterrupted(ctx, delivery, ctx.Err())
 		}
 		// A signing-secret lookup or current-key open failure is retryable:
 		// falling back to the snapshot could keep signing with a secret whose
 		// grace window already closed. The cause is logged, not stored in
 		// last_error, which the delivery API exposes.
 		attempt := attemptResult{outcome: webhook.OutcomeRetry, reason: "endpoint signing secret is unavailable"}
-		if recordErr := w.recordAttempt(writeCtx, delivery, attempt); recordErr != nil {
+		if recordErr := w.recordAttempt(ctx, delivery, attempt); recordErr != nil {
 			return recordErr
 		}
-		return w.finish(writeCtx, delivery, attempt)
+		return w.finish(ctx, delivery, attempt)
 	}
 	sent := w.send(ctx, delivery, headers, body)
 	// The job context itself ended (worker shutdown or job timeout), as
@@ -160,13 +165,25 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 	jobErr := ctx.Err()
 
 	if interrupted {
-		return w.releaseInterrupted(writeCtx, delivery, jobErr)
+		return w.releaseInterrupted(ctx, delivery, jobErr)
 	}
 	attempt := classifyAttempt(sent)
-	if err := w.recordAttempt(writeCtx, delivery, attempt); err != nil {
+	if err := w.recordAttempt(ctx, delivery, attempt); err != nil {
 		return err
 	}
-	return w.finish(writeCtx, delivery, attempt)
+	return w.finish(ctx, delivery, attempt)
+}
+
+// bookkeepingContext detaches a write from job cancellation but starts a fresh
+// timeout for it. Starting the deadline before prepare/send would let it expire
+// while a slow receiver is still responding, losing the outcome of an attempt
+// that may already have been delivered.
+func (w *DeliveryWorker) bookkeepingContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := w.bookkeepingTimeout
+	if timeout <= 0 {
+		timeout = defaultBookkeepingTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
 func (w *DeliveryWorker) checkConfigured() error {
@@ -289,7 +306,9 @@ type sentRequest struct {
 // context's error lets the jobs worker requeue the job without consuming its
 // attempt when it is shutting down.
 func (w *DeliveryWorker) releaseInterrupted(ctx context.Context, delivery *Delivery, jobErr error) error {
-	if err := w.store.ReleaseDeliveryClaim(ctx, delivery.ID, delivery.Attempts); err != nil {
+	writeCtx, cancel := w.bookkeepingContext(ctx)
+	defer cancel()
+	if err := w.store.ReleaseDeliveryClaim(writeCtx, delivery.ID, delivery.Attempts); err != nil {
 		if !errors.Is(err, ErrDeliveryLeaseLost) {
 			return fmt.Errorf("webhooks: release interrupted delivery %s: %w", delivery.ID, err)
 		}
@@ -346,7 +365,9 @@ func transportErrorReason(err error) string {
 // recordAttempt appends the attempt to the delivery log before the delivery
 // row changes state.
 func (w *DeliveryWorker) recordAttempt(ctx context.Context, delivery *Delivery, attempt attemptResult) error {
-	if err := w.store.CreateDeliveryAttempt(ctx, AttemptDraft{
+	writeCtx, cancel := w.bookkeepingContext(ctx)
+	defer cancel()
+	if err := w.store.CreateDeliveryAttempt(writeCtx, AttemptDraft{
 		DeliveryID: delivery.ID,
 		Attempt:    delivery.Attempts,
 		StatusCode: attempt.statusCode,
@@ -361,20 +382,22 @@ func (w *DeliveryWorker) recordAttempt(ctx context.Context, delivery *Delivery, 
 // finish applies the attempt outcome to the delivery row: succeeded, dead, or
 // rescheduled with Retry-After/backoff while attempts remain.
 func (w *DeliveryWorker) finish(ctx context.Context, delivery *Delivery, attempt attemptResult) error {
+	writeCtx, cancel := w.bookkeepingContext(ctx)
+	defer cancel()
 	statusCode, reason := attempt.statusCode, attempt.reason
 	switch attempt.outcome {
 	case webhook.OutcomeSuccess:
 		return w.fenced(delivery, "mark delivery succeeded",
-			w.store.MarkDeliverySucceeded(ctx, delivery.ID, delivery.Attempts, statusCode))
+			w.store.MarkDeliverySucceeded(writeCtx, delivery.ID, delivery.Attempts, statusCode))
 
 	case webhook.OutcomePermanent:
 		return w.fenced(delivery, "mark delivery dead",
-			w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, statusCode, reason))
+			w.store.MarkDeliveryDead(writeCtx, delivery.ID, delivery.Attempts, statusCode, reason))
 
 	default:
 		if delivery.Attempts >= delivery.MaxAttempts {
 			return w.fenced(delivery, "mark delivery dead after retries",
-				w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, statusCode, reason))
+				w.store.MarkDeliveryDead(writeCtx, delivery.ID, delivery.Attempts, statusCode, reason))
 		}
 		now := w.now()
 		delay, _ := webhook.RetryDelay(int(delivery.Attempts), w.opts.RetryBase, w.opts.RetryMax, attempt.retryAfter, now)
@@ -382,7 +405,7 @@ func (w *DeliveryWorker) finish(ctx context.Context, delivery *Delivery, attempt
 			delay = 0
 		}
 		next := now.Add(delay)
-		return w.fenced(delivery, "reschedule delivery", w.store.RescheduleDeliveryWithJob(ctx, RetryDraft{
+		return w.fenced(delivery, "reschedule delivery", w.store.RescheduleDeliveryWithJob(writeCtx, RetryDraft{
 			DeliveryID:    delivery.ID,
 			Attempt:       delivery.Attempts,
 			NextAttemptAt: next,

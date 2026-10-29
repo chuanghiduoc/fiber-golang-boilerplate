@@ -3,6 +3,7 @@ package audithttp
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -154,13 +155,27 @@ func recordFallback(c fiber.Ctx, recorder audit.Recorder, event audit.Event) {
 	}
 }
 
-// routeResourceID is the mutated resource's id. Feature-flag routes name the
-// target :key rather than :id.
+// routeResourceID is the mutated resource's id. Routes name their target
+// :memberId, :roleId, :fileId, :key, and so on; only a few older routes use a
+// bare :id. Walk the matched route's parameters from right to left and take
+// the last id-like value, so a nested resource (:memberId/api-keys/:keyId)
+// records the key rather than its owner.
 func routeResourceID(c fiber.Ctx) string {
 	if id := c.Params("id"); id != "" {
 		return id
 	}
-	return c.Params("key")
+	params := c.Route().Params
+	for i := len(params) - 1; i >= 0; i-- {
+		name := params[i]
+		lower := strings.ToLower(name)
+		if lower != "key" && !strings.HasSuffix(lower, "id") {
+			continue
+		}
+		if value := c.Params(name); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // requestRole returns the authenticated subject's role, or "" for an

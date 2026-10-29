@@ -34,13 +34,17 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # Only the ingress-nginx controller may reach the API. Change the namespace
-    # label if your controller runs elsewhere. Metrics scrapers need an extra
-    # rule (see the commented block below).
+    # Only the ingress-nginx controller pods may reach the API. Adjust the
+    # namespace and pod labels if your controller runs elsewhere or your chart
+    # uses different labels. Metrics scrapers need an extra rule (see below).
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+              app.kubernetes.io/component: controller
       ports:
         - protocol: TCP
           port: 8080

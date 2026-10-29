@@ -52,72 +52,46 @@ type SecurityNotice struct {
 }
 
 // SecurityNotifier builds and delivers the localized security notification
-// emails (OWASP ASVS V2.2.3/V6.3.7). When the change runs in a transaction
-// with an email outbox, the email job is enqueued on that transaction, so it
-// can never be sent before the change commits.
+// emails (OWASP ASVS V2.2.3/V6.3.7). Every message is enqueued on the same
+// transaction as the account change, so it can never be sent before commit and
+// an enqueue failure rolls the change back.
 type SecurityNotifier struct {
 	tenants TenantRepository
-	sender  email.Sender
 	now     func() time.Time
 }
 
 // NewSecurityNotifier wires the notifier. tenants resolves the tenant's email
-// locale; sender is the after-commit fallback for deployments without a
-// transactional outbox.
-func NewSecurityNotifier(tenants TenantRepository, sender email.Sender) *SecurityNotifier {
-	return &SecurityNotifier{tenants: tenants, sender: sender, now: time.Now}
+// locale. Identity Build requires the transactional outbox, so there is no
+// direct-send deployment mode.
+func NewSecurityNotifier(tenants TenantRepository) *SecurityNotifier {
+	return &SecurityNotifier{tenants: tenants, now: time.Now}
 }
 
-// Deliver enqueues the notice on tx when it has an email outbox; otherwise it
-// registers the sender as a post-commit callback, so no email can be sent
-// before the change commits. A nil notifier is a no-op, which keeps minimal
-// service wirings (unit tests) valid.
+// Deliver enqueues the notice on the change's transaction. A missing outbox is
+// a wiring error: sending directly would bypass the commit boundary, while
+// silently dropping the notice would hide a security alert. A nil notifier is
+// a no-op, which keeps minimal service wirings (unit tests) valid.
 func (n *SecurityNotifier) Deliver(ctx context.Context, tx TxRepos, notice SecurityNotice) error {
 	if n == nil {
 		return nil
+	}
+	if tx.Mail == nil {
+		return apperror.NewInternal("security notification requires the transactional email outbox")
 	}
 	messages, err := n.messages(ctx, tx, notice)
 	if err != nil {
 		return err
 	}
-	if tx.Mail != nil {
-		for _, msg := range messages {
-			if err := tx.Mail.Send(ctx, msg); err != nil {
-				slog.Error("failed to enqueue security notification email",
-					slog.String("user_id", notice.UserID.String()),
-					slog.String("event", string(notice.Event)),
-					slog.Any("error", err),
-				)
-				return apperror.NewInternal("failed to enqueue security notification email")
-			}
+	for _, msg := range messages {
+		if err := tx.Mail.Send(ctx, msg); err != nil {
+			slog.Error("failed to enqueue security notification email",
+				slog.String("user_id", notice.UserID.String()),
+				slog.String("event", string(notice.Event)),
+				slog.Any("error", err),
+			)
+			return apperror.NewInternal("failed to enqueue security notification email")
 		}
-		return nil
 	}
-	if n.sender == nil || tx.AfterCommit == nil {
-		return nil
-	}
-	// The callback must not inherit the caller's bypass marker (or request
-	// cancellation): it runs after commit, on a clean context that keeps only
-	// the tenant identity needed to enqueue the fallback email.
-	tenantID, tenantSlug := tenant.IDFromContext(ctx), tenant.SlugFromContext(ctx)
-	if tenantID == uuid.Nil {
-		slog.Error("refusing to queue security notification emails without a tenant",
-			slog.String("user_id", notice.UserID.String()),
-			slog.String("event", string(notice.Event)))
-		return nil
-	}
-	sendCtx := tenant.WithIdentity(context.Background(), tenantID, tenantSlug)
-	tx.AfterCommit(func() {
-		for _, msg := range messages {
-			if err := n.sender.Send(sendCtx, msg); err != nil {
-				slog.Warn("failed to send security notification email",
-					slog.String("user_id", notice.UserID.String()),
-					slog.String("event", string(notice.Event)),
-					slog.Any("error", err),
-				)
-			}
-		}
-	})
 	return nil
 }
 

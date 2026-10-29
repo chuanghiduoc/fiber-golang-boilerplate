@@ -11,12 +11,13 @@ import (
 	"github.com/google/uuid"
 
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/internal/platform/authz"
 	"{{.M.ModulePath}}/internal/platform/tenant"
 	"{{.M.ModulePath}}/pkg/apperror"
 	"{{.M.ModulePath}}/pkg/pagination"
 )
 
-// max{{.R.Pascal}}NameLength mirrors name VARCHAR(255) in the migration.
+// max{{.R.Pascal}}NameLength mirrors the name length CHECK in the migration.
 const max{{.R.Pascal}}NameLength = 255
 
 // {{.R.Pascal}} is the service view of one {{.R.Table}} row. repository/
@@ -53,16 +54,17 @@ type {{.R.Pascal}}Page struct {
 // treats a row from another tenant as not found.
 type {{.R.Pascal}}Service struct {
 	repo {{.R.Pascal}}Repository
+	authorizer authz.Authorizer
 }
 
 // New{{.R.Pascal}}Service returns a {{.R.Pascal}}Service over repo.
-func New{{.R.Pascal}}Service(repo {{.R.Pascal}}Repository) *{{.R.Pascal}}Service {
-	return &{{.R.Pascal}}Service{repo: repo}
+func New{{.R.Pascal}}Service(repo {{.R.Pascal}}Repository, authorizer authz.Authorizer) *{{.R.Pascal}}Service {
+	return &{{.R.Pascal}}Service{repo: repo, authorizer: authorizer}
 }
 
 // Create stores a new {{.R.Human}} in the request tenant.
 func (s *{{.R.Pascal}}Service) Create(ctx context.Context, in {{.R.Pascal}}Input) ({{.R.Pascal}}, error) {
-	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write); err != nil {
+	if err := authorize(ctx, s.authorizer, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write); err != nil {
 		return {{.R.Pascal}}{}, err
 	}
 	in, err := normalize{{.R.Pascal}}Input(in)
@@ -78,7 +80,7 @@ func (s *{{.R.Pascal}}Service) Create(ctx context.Context, in {{.R.Pascal}}Input
 
 // Get returns one {{.R.Human}} of the request tenant.
 func (s *{{.R.Pascal}}Service) Get(ctx context.Context, id uuid.UUID) ({{.R.Pascal}}, error) {
-	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read); err != nil {
+	if err := authorize(ctx, s.authorizer, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read); err != nil {
 		return {{.R.Pascal}}{}, err
 	}
 	if id == uuid.Nil {
@@ -95,7 +97,7 @@ func (s *{{.R.Pascal}}Service) Get(ctx context.Context, id uuid.UUID) ({{.R.Pasc
 // clamped to [1, pagination.MaxLimit]; startingAfter is the previous page's
 // NextCursor.
 func (s *{{.R.Pascal}}Service) List(ctx context.Context, limit int, startingAfter string) ({{.R.Pascal}}Page, error) {
-	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read); err != nil {
+	if err := authorize(ctx, s.authorizer, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read); err != nil {
 		return {{.R.Pascal}}Page{}, err
 	}
 	pageSize := pagination.NormalizeLimit(limit)
@@ -114,7 +116,7 @@ func (s *{{.R.Pascal}}Service) List(ctx context.Context, limit int, startingAfte
 	}
 	for i := range items {
 		if _, err := ensure{{.R.Pascal}}Tenant(ctx, items[i]); err != nil {
-			return {{.R.Pascal}}Page{}, fmt.Errorf("{{.M.Name}}: list {{.R.HumanPlural}}: row %d escaped the tenant filter", items[i].ID)
+			return {{.R.Pascal}}Page{}, fmt.Errorf("{{.M.Name}}: list {{.R.HumanPlural}}: row %s escaped the tenant filter", items[i].ID)
 		}
 	}
 	page := {{.R.Pascal}}Page{Items: items}
@@ -132,7 +134,7 @@ func (s *{{.R.Pascal}}Service) List(ctx context.Context, limit int, startingAfte
 // validation error rather than a silent no-op, and a provided name follows the
 // same trim/length rules as create.
 func (s *{{.R.Pascal}}Service) Patch(ctx context.Context, id uuid.UUID, in {{.R.Pascal}}Patch, expected *time.Time) ({{.R.Pascal}}, error) {
-	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write); err != nil {
+	if err := authorize(ctx, s.authorizer, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write); err != nil {
 		return {{.R.Pascal}}{}, err
 	}
 	if id == uuid.Nil {
@@ -163,7 +165,7 @@ func (s *{{.R.Pascal}}Service) Patch(ctx context.Context, id uuid.UUID, in {{.R.
 
 // Delete removes one {{.R.Human}} of the request tenant.
 func (s *{{.R.Pascal}}Service) Delete(ctx context.Context, id uuid.UUID) error {
-	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Delete); err != nil {
+	if err := authorize(ctx, s.authorizer, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Delete); err != nil {
 		return err
 	}
 	if id == uuid.Nil {

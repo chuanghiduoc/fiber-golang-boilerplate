@@ -467,6 +467,21 @@ type MFAFactor struct {
 // Confirmed reports whether the factor completed enrollment.
 func (f *MFAFactor) Confirmed() bool { return f.ConfirmedAt != nil }
 
+// MFAFactorStatus is the public, secret-free state of one MFA factor.
+type MFAFactorStatus struct {
+	ID          uuid.UUID
+	Type        string
+	Status      string
+	ConfirmedAt *time.Time
+	CreatedAt   time.Time
+}
+
+// MFA factor lifecycle values exposed by the status resource.
+const (
+	MFAFactorPending = "pending"
+	MFAFactorActive  = "active"
+)
+
 // MFAStatus is the public state of a user's MFA configuration.
 type MFAStatus struct {
 	Enabled                bool
@@ -489,6 +504,30 @@ type MFAEnrollment struct {
 type MFAConfirmResult struct {
 	RecoveryCodes []string
 	Tokens        TokenPair
+}
+
+// ReauthProof is the caller-supplied evidence for a sensitive account change:
+// the interactive session that authorized it and, for password accounts, the
+// current password. Passwordless accounts are checked by session age instead.
+type ReauthProof struct {
+	SessionID       uuid.UUID
+	CurrentPassword string
+}
+
+// MFACodeChange identifies the TOTP factor and the proofs required to change
+// it: re-authentication plus a current TOTP or recovery code.
+type MFACodeChange struct {
+	FactorID        uuid.UUID
+	SessionID       uuid.UUID
+	CurrentPassword string
+	Code            string
+}
+
+// MFARecoveryChange is the proof for replacing recovery codes.
+type MFARecoveryChange struct {
+	SessionID       uuid.UUID
+	CurrentPassword string
+	Code            string
 }
 
 // MFALogin is a completed two-step sign-in.
@@ -565,6 +604,7 @@ func (p *Passkey) Method() string {
 type PasskeyRepository interface {
 	Create(ctx context.Context, passkey Passkey) (*Passkey, error)
 	ListByUser(ctx context.Context, userID uuid.UUID) ([]Passkey, error)
+	ListByUserLimited(ctx context.Context, userID uuid.UUID, limit int32) ([]Passkey, bool, error)
 	GetByCredentialID(ctx context.Context, credentialID []byte) (*Passkey, error)
 	Get(ctx context.Context, userID, id uuid.UUID) (*Passkey, error)
 	// Delete reports whether a credential of userID was deleted.
@@ -699,9 +739,10 @@ type SessionRepository interface {
 	// method to the session's amr set, so a passkey step-up makes later
 	// RequireMFA checks accept the session without re-issuing its tokens.
 	MarkMFAVerifiedWithMethod(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error)
-	// State loads the validator view of a session of userID (any tenant; the
-	// caller compares SessionState.TenantID with the token's tenant).
-	State(ctx context.Context, sessionID, userID uuid.UUID) (*SessionState, error)
+	// State loads the validator view of a session of userID in tenantID. The
+	// tenant predicate is defense in depth; the validator also compares the
+	// returned TenantID with the token's tenant.
+	State(ctx context.Context, tenantID, sessionID, userID uuid.UUID) (*SessionState, error)
 }
 
 // RefreshRotationState is the one-statement view of a repeated refresh token
@@ -933,16 +974,15 @@ var ErrDataExportInProgress = errors.New("identity: a data export is already in 
 type DataExportRepository interface {
 	Create(ctx context.Context, userID uuid.UUID) (*DataExport, error)
 	Get(ctx context.Context, userID, id uuid.UUID) (*DataExport, error)
-	ListForUser(ctx context.Context, userID uuid.UUID) ([]DataExport, error)
 	ListCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]DataExport, error)
 	MarkRunning(ctx context.Context, userID, id uuid.UUID) (bool, error)
 	MarkReady(ctx context.Context, userID, id uuid.UUID, storagePath string, expiresAt time.Time) (bool, error)
 	MarkFailed(ctx context.Context, userID, id uuid.UUID) error
-	ExpireForUser(ctx context.Context, userID uuid.UUID) ([]DataExport, error)
+	ExpireForUser(ctx context.Context, userID uuid.UUID) error
 	DeleteForUser(ctx context.Context, userID uuid.UUID) error
 	Purgeable(ctx context.Context, limit int32) ([]DataExport, error)
 	Delete(ctx context.Context, id uuid.UUID) error
-	ListSessions(ctx context.Context, userID uuid.UUID) ([]Session, error)
+	ListSessions(ctx context.Context, userID uuid.UUID, limit int32) ([]Session, bool, error)
 	AnonymizeUser(ctx context.Context, userID uuid.UUID, email string) (*User, error)
 	// AnonymizeErasedUserInvitations replaces the address on invitations the
 	// user accepted or that were addressed to them, in the request tenant.

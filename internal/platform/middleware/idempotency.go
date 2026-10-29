@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -21,11 +23,14 @@ import (
 )
 
 const (
-	idempotencyHeader            = "Idempotency-Key"
-	idempotencyReplayedHeader    = "Idempotent-Replayed"
-	idempotencyReplayedLocal     = "idempotency_replayed"
-	idempotencyMaxKeyLen         = 128
-	idempotencyMaxBodyHashSize   = 1 << 20 // 1 MiB
+	idempotencyHeader         = "Idempotency-Key"
+	idempotencyReplayedHeader = "Idempotent-Replayed"
+	idempotencyReplayedLocal  = "idempotency_replayed"
+	idempotencyMaxKeyLen      = 128
+	// idempotencyBodyMemoryLimit keeps ordinary JSON bodies in memory while
+	// spooling larger uploads to a temporary file instead of duplicating them on
+	// the heap.
+	idempotencyBodyMemoryLimit   = 64 << 10
 	idempotencyLockTTL           = 2 * time.Minute
 	idempotencyResponseTTL       = 24 * time.Hour
 	idempotencyBodyMismatchError = "This Idempotency-Key was already used with a different request body. Use a new key for a new request."
@@ -101,12 +106,17 @@ func Idempotency(appCache cache.Cache) fiber.Handler {
 		scope := idempotencyScope(
 			c.Method(), idempotencyRoutePath(c), tenanthttp.ID(c), tenanthttp.Slug(c), idempotencyIdentity(c), key,
 		)
+		bodyHash, cleanup, err := idempotencyBodyHash(c)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
 		req := idempotentRequest{
 			c:           c,
 			cache:       appCache,
 			responseKey: idempotencyResponseKey(scope),
 			lockKey:     idempotencyLockKey(scope),
-			bodyHash:    idempotencyBodyHash(c),
+			bodyHash:    bodyHash,
 		}
 		return req.serve()
 	}
@@ -323,21 +333,94 @@ func validIdempotencyKey(key string) bool {
 	return true
 }
 
-// idempotencyBodyHash binds a key to the request payload for JSON and other
-// non-multipart bodies up to 1 MiB. Multipart and larger bodies return an empty
-// hash and keep the pre-body-binding semantics. The request body is hashed and
-// discarded; only the hash is stored with the cached response.
-func idempotencyBodyHash(c fiber.Ctx) string {
-	if strings.HasPrefix(strings.ToLower(c.Get(fiber.HeaderContentType)), "multipart/form-data") {
-		return ""
+// idempotencyBodyHash binds a key to the exact request payload, including
+// multipart uploads and bodies larger than the JSON limit. The route's body
+// limit bounds this read. Small buffered bodies stay in memory; a streamed body
+// is copied to a private temporary file and the file is put back for Huma and
+// the handler. This avoids copying an entire multipart upload into the heap
+// merely to compute the digest. The caller must run cleanup on every path; it
+// closes and removes the file after the handler finished with the body.
+func idempotencyBodyHash(c fiber.Ctx) (digest string, cleanup func(), err error) {
+	stream := c.Request().BodyStream()
+	if stream == nil {
+		body := c.BodyRaw()
+		// humafiber reads Request().BodyStream() when StreamRequestBody is
+		// enabled, so a buffered body must be exposed as a stream too.
+		c.Request().SetBodyStream(bytes.NewReader(body), len(body))
+		return hashRequestBody(body), func() {}, nil
 	}
-	body := c.Body()
-	// Fiber streams the request body (StreamRequestBody) and Huma reads the
-	// stream, so restore it after hashing or the handler sees an empty body.
-	c.Request().SetBodyStream(bytes.NewReader(body), len(body))
-	if len(body) > idempotencyMaxBodyHashSize {
-		return ""
+
+	limit := idempotencyRequestLimit(c)
+	readLimit := int64(idempotencyBodyMemoryLimit) + 1
+	if limit+1 < readLimit {
+		readLimit = limit + 1
 	}
+	prefix, readErr := io.ReadAll(io.LimitReader(stream, readLimit))
+	if readErr != nil {
+		return "", nil, apperror.NewBadRequest("failed to read request body")
+	}
+	if int64(len(prefix)) > limit {
+		return "", nil, apperror.NewPayloadTooLarge("request body too large")
+	}
+	if int64(len(prefix)) < readLimit {
+		// The stream ended within the in-memory threshold. Keep it exposed as
+		// a stream because that is what humafiber reads when streaming is on.
+		c.Request().SetBodyStream(bytes.NewReader(prefix), len(prefix))
+		return hashRequestBody(prefix), func() {}, nil
+	}
+
+	tmp, createErr := os.CreateTemp("", "fiber-idempotency-body-*")
+	if createErr != nil {
+		return "", nil, apperror.Internal(createErr, "failed to buffer request body")
+	}
+	cleanup = func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+	}
+	prefixWritten, writeErr := tmp.Write(prefix)
+	if writeErr != nil {
+		cleanup()
+		return "", nil, apperror.Internal(writeErr, "failed to buffer request body")
+	}
+	if prefixWritten != len(prefix) {
+		cleanup()
+		return "", nil, apperror.Internal(io.ErrShortWrite, "failed to buffer request body")
+	}
+
+	hasher := sha256.New()
+	_, _ = hasher.Write(prefix)
+	remaining := limit - int64(len(prefix))
+	written, copyErr := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(stream, remaining+1))
+	total := int64(len(prefix)) + written
+	if copyErr != nil {
+		cleanup()
+		return "", nil, apperror.NewBadRequest("failed to read request body")
+	}
+	if total > limit {
+		cleanup()
+		return "", nil, apperror.NewPayloadTooLarge("request body too large")
+	}
+	if _, seekErr := tmp.Seek(0, io.SeekStart); seekErr != nil {
+		cleanup()
+		return "", nil, apperror.Internal(seekErr, "failed to buffer request body")
+	}
+	c.Request().SetBodyStream(tmp, int(total))
+	return hex.EncodeToString(hasher.Sum(nil)), cleanup, nil
+}
+
+// idempotencyRequestLimit is the ceiling already configured on the Fiber app.
+// BodyLimit rejects declared oversize bodies before this middleware runs; this
+// check also bounds a chunked multipart upload so hashing cannot spool an
+// unbounded body to disk.
+func idempotencyRequestLimit(c fiber.Ctx) int64 {
+	limit := c.App().Config().BodyLimit
+	if limit <= 0 {
+		limit = fiber.DefaultBodyLimit
+	}
+	return int64(limit)
+}
+
+func hashRequestBody(body []byte) string {
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
 }

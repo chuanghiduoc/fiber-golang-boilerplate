@@ -35,10 +35,10 @@ const (
 	// mfaEnrollmentTTL bounds a pending enrollment: its secret is generated
 	// once (re-enrolling replaces it) and can only be confirmed while fresh.
 	mfaEnrollmentTTL = 15 * time.Minute
-	// mfaReauthSessionMaxAge is how recent a passwordless (Google-only)
-	// user's interactive sign-in must be to enroll or confirm a factor. The
-	// session row's created_at records that sign-in.
-	mfaReauthSessionMaxAge = 15 * time.Minute
+	// mfaAuditTimeout bounds the detached audit write on a failed MFA attempt.
+	// WithoutCancel keeps the record alive after the request ends, but the write
+	// must still not hold a database connection forever when the store stalls.
+	mfaAuditTimeout = 5 * time.Second
 )
 
 var recoveryEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -50,24 +50,27 @@ type MFAService interface {
 	// the provisioning URI; the secret is never returned again. The caller
 	// re-authenticates with the current password, or (passwordless accounts)
 	// with a session created within the last 15 minutes.
-	EnrollTOTP(ctx context.Context, userID, sessionID uuid.UUID, currentPassword string) (*MFAEnrollment, error)
+	EnrollTOTP(ctx context.Context, userID uuid.UUID, proof ReauthProof) (*MFAEnrollment, error)
 	// ConfirmTOTP verifies the first code, confirms the factor, replaces the
 	// recovery codes, and returns them once. Like enrollment it requires
 	// re-authentication. It bumps the user's token version (every session that
 	// predates the factor is invalid) and re-issues the session that confirmed
 	// it under the new version.
-	ConfirmTOTP(ctx context.Context, userID, sessionID uuid.UUID, currentPassword, code string) (*MFAConfirmResult, error)
-	// Disable removes the factor and recovery codes after a TOTP or recovery
-	// code proof.
-	Disable(ctx context.Context, userID, sessionID uuid.UUID, code string) error
-	// RegenerateRecoveryCodes replaces the set after a code proof and returns
-	// the new codes once.
-	RegenerateRecoveryCodes(ctx context.Context, userID uuid.UUID, code string) ([]string, error)
+	ConfirmTOTP(ctx context.Context, userID uuid.UUID, change MFACodeChange) (*MFAConfirmResult, error)
+	// Disable removes the factor and recovery codes after re-authentication
+	// and a TOTP or recovery code proof bound to factorID.
+	Disable(ctx context.Context, userID uuid.UUID, change MFACodeChange) error
+	// RegenerateRecoveryCodes replaces the set after re-authentication and a
+	// code proof, and returns the new codes once.
+	RegenerateRecoveryCodes(ctx context.Context, userID uuid.UUID, change MFARecoveryChange) ([]string, error)
 	// ResetTOTP is the platform recovery path: it removes the confirmed and
 	// pending factor plus recovery codes, revokes every session, and bumps the
 	// token version. It does not require the user's password or a code.
 	ResetTOTP(ctx context.Context, userID uuid.UUID) error
 	Status(ctx context.Context, userID uuid.UUID) (*MFAStatus, error)
+	// GetTOTP returns the public state of one factor owned by the caller.
+	// Another user's id and an unknown id both behave as not found.
+	GetTOTP(ctx context.Context, userID, factorID uuid.UUID) (*MFAFactorStatus, error)
 	// Required reports whether the user has a confirmed factor.
 	Required(ctx context.Context, userID uuid.UUID) (bool, error)
 	// BeginChallenge seals a short-lived, single-use, tenant-bound challenge
@@ -76,6 +79,10 @@ type MFAService interface {
 	// Verify consumes a challenge and a TOTP or recovery code and issues the
 	// normal token pair.
 	Verify(ctx context.Context, challenge, code string) (*MFALogin, error)
+	// SetAdmission installs the sign-in rule Verify applies before it issues
+	// tokens, so completing a second factor cannot bypass a requirement that
+	// the first factor enforced (email verification). Nil admits everyone.
+	SetAdmission(admit Admission)
 }
 
 // MFADeps are the MFA service's collaborators.
@@ -94,7 +101,10 @@ type MFADeps struct {
 
 type mfaService struct {
 	MFADeps
+	admit Admission
 }
+
+func (s *mfaService) SetAdmission(admit Admission) { s.admit = admit }
 
 // NewMFAService wires the MFA service.
 func NewMFAService(deps MFADeps) MFAService {
@@ -163,8 +173,33 @@ func (s *mfaService) Status(ctx context.Context, userID uuid.UUID) (*MFAStatus, 
 	}, nil
 }
 
-func (s *mfaService) EnrollTOTP(ctx context.Context, userID, sessionID uuid.UUID, currentPassword string) (*MFAEnrollment, error) {
-	if err := s.reauthenticate(ctx, userID, sessionID, currentPassword); err != nil {
+// GetTOTP returns one factor's public state without exposing its sealed secret.
+func (s *mfaService) GetTOTP(ctx context.Context, userID, factorID uuid.UUID) (*MFAFactorStatus, error) {
+	factor, err := s.Stores.MFA.GetTOTP(ctx, userID)
+	if errors.Is(err, apperror.ErrNotFound) {
+		return nil, apperror.NewNotFound("MFA factor not found")
+	}
+	if err != nil {
+		return nil, apperror.NewInternal("failed to load MFA factor")
+	}
+	if factor.ID != factorID {
+		return nil, apperror.NewNotFound("MFA factor not found")
+	}
+	status := MFAFactorPending
+	if factor.Confirmed() {
+		status = MFAFactorActive
+	}
+	return &MFAFactorStatus{
+		ID:          factor.ID,
+		Type:        factor.Type,
+		Status:      status,
+		ConfirmedAt: factor.ConfirmedAt,
+		CreatedAt:   factor.CreatedAt,
+	}, nil
+}
+
+func (s *mfaService) EnrollTOTP(ctx context.Context, userID uuid.UUID, proof ReauthProof) (*MFAEnrollment, error) {
+	if err := s.reauthenticate(ctx, userID, proof); err != nil {
 		return nil, err
 	}
 	if _, err := s.Stores.MFA.GetConfirmedTOTP(ctx, userID); err == nil {
@@ -209,8 +244,10 @@ func (s *mfaService) EnrollTOTP(ctx context.Context, userID, sessionID uuid.UUID
 	return &MFAEnrollment{FactorID: factorID, OtpauthURI: totp.URI(s.Issuer, user.Email, secret)}, nil
 }
 
-func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID uuid.UUID, currentPassword, code string) (*MFAConfirmResult, error) {
-	if err := s.reauthenticate(ctx, userID, sessionID, currentPassword); err != nil {
+func (s *mfaService) ConfirmTOTP(ctx context.Context, userID uuid.UUID, change MFACodeChange) (*MFAConfirmResult, error) {
+	factorID, sessionID := change.FactorID, change.SessionID
+	currentPassword, code := change.CurrentPassword, change.Code
+	if err := s.reauthenticate(ctx, userID, ReauthProof{SessionID: sessionID, CurrentPassword: currentPassword}); err != nil {
 		return nil, err
 	}
 	plain, hashes, err := newRecoveryCodes()
@@ -235,7 +272,7 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID uuid.UUI
 	// keeps working. The per-tenant session-row revocation is recorded by the
 	// follow-up bypass statement after this commits.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		if err := s.confirmFactor(ctx, tx, userID, code); err != nil {
+		if err := s.confirmFactor(ctx, tx, userID, factorID, code); err != nil {
 			return err
 		}
 		if err := tx.MFA.DeleteRecoveryCodes(ctx, userID); err != nil {
@@ -272,13 +309,16 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID uuid.UUI
 // confirmFactor locks the pending factor, verifies the first code, and marks
 // the factor confirmed. The row lock keeps a concurrent enroll from replacing
 // the secret between verification and the confirm update.
-func (s *mfaService) confirmFactor(ctx context.Context, tx TxRepos, userID uuid.UUID, code string) error {
+func (s *mfaService) confirmFactor(ctx context.Context, tx TxRepos, userID, factorID uuid.UUID, code string) error {
 	factor, err := tx.MFA.GetTOTPForUpdate(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return mfaNotEnabled()
 		}
 		return apperror.NewInternal("failed to load MFA factor")
+	}
+	if factor.ID != factorID {
+		return apperror.NewNotFound("MFA factor not found")
 	}
 	if factor.Confirmed() {
 		return mfaAlreadyEnabled()
@@ -309,57 +349,10 @@ func (s *mfaService) confirmFactor(ctx context.Context, tx TxRepos, userID uuid.
 // the per-user re-authentication budget before the comparison, so parallel
 // guesses cannot bypass it. A correct password clears that password budget
 // (but never the TOTP/recovery-code budget). A passwordless account instead
-// needs an interactive sign-in no older than mfaReauthSessionMaxAge: a stolen
+// needs an interactive sign-in no older than core.ReauthSessionMaxAge: a stolen
 // access token alone must not bind a new authenticator.
-func (s *mfaService) reauthenticate(ctx context.Context, userID, sessionID uuid.UUID, currentPassword string) error {
-	user, err := s.Stores.Users.GetByID(ctx, userID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewNotFound("user not found")
-		}
-		return apperror.NewInternal("failed to load user")
-	}
-	if !user.HasPassword {
-		return s.reauthenticateSession(ctx, userID, sessionID)
-	}
-	if s.Cache == nil {
-		return loginLockoutUnavailable(errors.New("MFA attempt store is not configured"))
-	}
-	// Reserve atomically before the Argon2id comparison so parallel guesses
-	// cannot each pass a read-only budget check. This budget is separate from
-	// the TOTP/recovery-code budget; a success clears it and leaves the TOTP
-	// budget untouched.
-	if err := reserveReauthAttempt(ctx, s.Cache, userID); err != nil {
-		return err
-	}
-	hash, err := s.Stores.Users.PasswordHash(ctx, userID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return currentPasswordIncorrect()
-		}
-		return apperror.NewInternal("failed to get user")
-	}
-	if ok, _ := verifyPassword(hash, currentPassword); !ok {
-		return currentPasswordIncorrect()
-	}
-	clearReauthAttempts(ctx, s.Cache, userID)
-	return nil
-}
-
-func (s *mfaService) reauthenticateSession(ctx context.Context, userID, sessionID uuid.UUID) error {
-	sess, err := s.Stores.Sessions.Get(ctx, sessionID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return mfaReauthRequired()
-		}
-		return apperror.NewInternal("failed to load session")
-	}
-	if sess.UserID != userID || sess.TenantID != tenant.IDFromContext(ctx) ||
-		sess.RevokedAt != nil || !sess.ExpiresAt.After(s.now()) ||
-		s.now().Sub(sess.CreatedAt) > mfaReauthSessionMaxAge {
-		return mfaReauthRequired()
-	}
-	return nil
+func (s *mfaService) reauthenticate(ctx context.Context, userID uuid.UUID, proof ReauthProof) error {
+	return (reauthVerifier{stores: s.Stores, attempts: s.Cache, now: s.now}).verify(ctx, userID, proof)
 }
 
 // ResetTOTP removes every second factor of a global user and ends all their
@@ -402,7 +395,15 @@ func (s *mfaService) ResetTOTP(ctx context.Context, userID uuid.UUID) error {
 	return nil
 }
 
-func (s *mfaService) Disable(ctx context.Context, userID, sessionID uuid.UUID, code string) error {
+func (s *mfaService) Disable(ctx context.Context, userID uuid.UUID, change MFACodeChange) error {
+	factorID, sessionID := change.FactorID, change.SessionID
+	currentPassword, code := change.CurrentPassword, change.Code
+	if err := s.reauthenticate(ctx, userID, ReauthProof{SessionID: sessionID, CurrentPassword: currentPassword}); err != nil {
+		return err
+	}
+	if err := s.requireConfirmedFactor(ctx, userID, factorID); err != nil {
+		return err
+	}
 	matched, attempts, err := s.checkCode(ctx, userID, code)
 	if err != nil {
 		s.auditSecondFactorFailure(ctx, userID, attempts, err)
@@ -414,6 +415,13 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID uuid.UUID, c
 			return apperror.NewNotFound("user not found")
 		}
 		return apperror.NewInternal("failed to load user")
+	}
+	// A disabled factor no longer protects any session that survives this
+	// request. Revoke the other sessions before deleting the factor so a
+	// cross-tenant revocation outage fails closed; a post-commit pass below
+	// still catches a session created in the write window.
+	if err := revokeOtherSessions(ctx, s.Stores.Sessions, userID, sessionID, RevokeMFAChanged); err != nil {
+		return apperror.NewInternal("failed to revoke other sessions")
 	}
 	// Disabling the factor and ending the user's other sessions in every tenant
 	// must not half-apply with the factor deletion. The factor rows are global,
@@ -448,7 +456,11 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID uuid.UUID, c
 	return nil
 }
 
-func (s *mfaService) RegenerateRecoveryCodes(ctx context.Context, userID uuid.UUID, code string) ([]string, error) {
+func (s *mfaService) RegenerateRecoveryCodes(ctx context.Context, userID uuid.UUID, change MFARecoveryChange) ([]string, error) {
+	currentPassword, code := change.CurrentPassword, change.Code
+	if err := s.reauthenticate(ctx, userID, ReauthProof{SessionID: change.SessionID, CurrentPassword: currentPassword}); err != nil {
+		return nil, err
+	}
 	matched, attempts, err := s.checkCode(ctx, userID, code)
 	if err != nil {
 		s.auditSecondFactorFailure(ctx, userID, attempts, err)
@@ -517,6 +529,20 @@ func (c *mfaCode) auditMethod() string { return c.method }
 // checkCode counts one second-factor guess against the per-user MFA budget,
 // then matches code. Callers clear the budget after the code is claimed and
 // audit a returned error through auditSecondFactorFailure.
+func (s *mfaService) requireConfirmedFactor(ctx context.Context, userID, factorID uuid.UUID) error {
+	factor, err := s.Stores.MFA.GetConfirmedTOTP(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return mfaNotEnabled()
+		}
+		return apperror.NewInternal("failed to load MFA factor")
+	}
+	if factor.ID != factorID {
+		return apperror.NewNotFound("MFA factor not found")
+	}
+	return nil
+}
+
 func (s *mfaService) checkCode(ctx context.Context, userID uuid.UUID, code string) (*mfaCode, int64, error) {
 	if s.Cache == nil {
 		return nil, 0, loginLockoutUnavailable(errors.New("MFA attempt store is not configured"))
@@ -630,7 +656,8 @@ func (s *mfaService) recordMFABudgetExhausted(ctx context.Context, userID uuid.U
 // recordMFAEventDetached writes a failure event in its own transaction. The
 // request context may be canceled while it fails; the audit must still commit.
 func (s *mfaService) recordMFAEventDetached(ctx context.Context, event audit.Event) {
-	ctx = context.WithoutCancel(ctx)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mfaAuditTimeout)
+	defer cancel()
 	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		return tx.Audit.RecordTx(ctx, event)
 	})
@@ -735,6 +762,19 @@ func (s *mfaService) Verify(ctx context.Context, challenge, code string) (*MFALo
 	amr := append(append([]string(nil), payload.AMR...), mfaMethodAMR(matched.method))
 	var result *MFALogin
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		// Re-apply the first factor's sign-in rule before the session exists.
+		// The password step already checked it, but the flag is dynamic and the
+		// challenge is valid for minutes; issuing tokens here without the same
+		// check would leave a hole that refresh and passkey login do not have.
+		member, err := tx.Memberships.GetActive(ctx, user.ID)
+		if err != nil {
+			return accountNotActive()
+		}
+		if s.admit != nil {
+			if err := s.admit(ctx, member); err != nil {
+				return err
+			}
+		}
 		// Claim the code first: a wrong or replayed code must not burn the
 		// challenge, and only the request that wins the code race may proceed.
 		if err := s.consumeCode(ctx, tx.Stores, user.ID, matched); err != nil {
@@ -747,10 +787,6 @@ func (s *mfaService) Verify(ctx context.Context, challenge, code string) (*MFALo
 		tokens, err := s.Sessions.IssueTx(ctx, tx.Stores, user.ID, payload.TokenVersion, amr)
 		if err != nil {
 			return err
-		}
-		member, err := tx.Memberships.GetActive(ctx, user.ID)
-		if err != nil {
-			return accountNotActive()
 		}
 		event := userEvent(ctx, "auth.mfa_login", user.ID, map[string]any{
 			"method": matched.auditMethod(),

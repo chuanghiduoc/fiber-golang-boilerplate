@@ -5,5 +5,6 @@ kind: Kustomization
 # exist). Keeping it in its own kustomization root lets environment overlays set
 # the namespace and image tag without adding the Job to the app overlay.
 resources:
+  - configmap.yaml
   - serviceaccount.yaml
   - job.yaml

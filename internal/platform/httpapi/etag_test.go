@@ -34,3 +34,28 @@ func TestCheckIfMatchValue(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckIfMatchValueRejectsMalformedValidators(t *testing.T) {
+	cases := map[string]struct {
+		ifMatch string
+		current string
+	}{
+		"empty current with wildcard":   {ifMatch: "*", current: ""},
+		"empty current with quoted tag": {ifMatch: `""`, current: ""},
+		"empty candidate list":          {ifMatch: ",", current: "v2"},
+		"whitespace candidate list":     {ifMatch: " , ", current: "v2"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := httpapi.CheckIfMatchValue(tc.ifMatch, tc.current); err == nil {
+				t.Fatal("malformed If-Match must fail closed")
+			}
+		})
+	}
+}
+
+func TestCheckIfMatchValueHandlesCommaInsideQuotedTag(t *testing.T) {
+	if err := httpapi.CheckIfMatchValue(`"a,b"`, "a,b"); err != nil {
+		t.Fatalf("quoted tag containing a comma was rejected: %v", err)
+	}
+}

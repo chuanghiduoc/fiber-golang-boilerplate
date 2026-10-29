@@ -5,25 +5,33 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	webhooksprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/privacy"
 	webhookssqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 // PrivacyStore implements webhooks/privacy.Store over sqlc.
 type PrivacyStore struct {
-	q *webhookssqlc.Queries
+	q  *webhookssqlc.Queries
+	tx *database.TxManager
 }
 
 var _ webhooksprivacy.Store = (*PrivacyStore)(nil)
 
-func NewPrivacyStore(db webhookssqlc.DBTX) *PrivacyStore {
-	return &PrivacyStore{q: webhookssqlc.New(db)}
+func NewPrivacyStore(db webhookssqlc.DBTX, tx *database.TxManager) *PrivacyStore {
+	return &PrivacyStore{q: webhookssqlc.New(db), tx: tx}
 }
 
-func (s *PrivacyStore) ListEvents(ctx context.Context, tenantID, userID uuid.UUID) ([]webhooksprivacy.Event, error) {
+func (s *PrivacyStore) ListEvents(ctx context.Context, tenantID, userID uuid.UUID, cursor pagination.DBCursor) ([]webhooksprivacy.Event, error) {
 	rows, err := s.q.ListUserWebhookEvents(ctx, webhookssqlc.ListUserWebhookEventsParams{
-		TenantID: tenantID, UserID: userID,
+		TenantID:         tenantID,
+		UserID:           userID,
+		CursorOccurredAt: cursor.CreatedAtParam(),
+		CursorID:         cursor.IDParam(),
+		RowLimit:         cursor.Limit,
 	})
 	if err != nil {
 		return nil, err
@@ -40,9 +48,13 @@ func (s *PrivacyStore) ListEvents(ctx context.Context, tenantID, userID uuid.UUI
 	return out, nil
 }
 
-func (s *PrivacyStore) ListDeliveries(ctx context.Context, tenantID, userID uuid.UUID) ([]webhooksprivacy.Delivery, error) {
+func (s *PrivacyStore) ListDeliveries(ctx context.Context, tenantID, userID uuid.UUID, cursor pagination.DBCursor) ([]webhooksprivacy.Delivery, error) {
 	rows, err := s.q.ListUserWebhookDeliveries(ctx, webhookssqlc.ListUserWebhookDeliveriesParams{
-		TenantID: tenantID, UserID: userID,
+		TenantID:        tenantID,
+		UserID:          userID,
+		CursorCreatedAt: cursor.CreatedAtParam(),
+		CursorID:        cursor.IDParam(),
+		RowLimit:        cursor.Limit,
 	})
 	if err != nil {
 		return nil, err
@@ -66,13 +78,19 @@ func (s *PrivacyStore) ListDeliveries(ctx context.Context, tenantID, userID uuid
 }
 
 func (s *PrivacyStore) DeleteEvents(ctx context.Context, tenantID, userID uuid.UUID) error {
-	if err := s.q.DeleteUserWebhookDeliveries(ctx, webhookssqlc.DeleteUserWebhookDeliveriesParams{
-		TenantID: tenantID, UserID: userID,
-	}); err != nil {
-		return err
+	if s == nil || s.tx == nil {
+		return ErrNoPool
 	}
-	return s.q.DeleteUserWebhookEvents(ctx, webhookssqlc.DeleteUserWebhookEventsParams{
-		TenantID: tenantID, UserID: userID,
+	return s.tx.WithTx(ctx, func(tx pgx.Tx) error {
+		q := s.q.WithTx(tx)
+		if err := q.DeleteUserWebhookDeliveries(ctx, webhookssqlc.DeleteUserWebhookDeliveriesParams{
+			TenantID: tenantID, UserID: userID,
+		}); err != nil {
+			return err
+		}
+		return q.DeleteUserWebhookEvents(ctx, webhookssqlc.DeleteUserWebhookEventsParams{
+			TenantID: tenantID, UserID: userID,
+		})
 	})
 }
 

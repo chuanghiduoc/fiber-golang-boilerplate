@@ -16,3 +16,15 @@ images:
   - name: ghcr.io/OWNER/REPO
     newName: ghcr.io/OWNER/REPO
     newTag: REPLACE_WITH_IMAGE_TAG
+
+patches:
+  - target:
+      kind: ConfigMap
+      name: fiber-boilerplate-seed-config
+    patch: |-
+      - op: replace
+        path: /data/ADMIN_EMAIL
+        value: admin@example.com
+      - op: replace
+        path: /data/ADMIN_NAME
+        value: Admin

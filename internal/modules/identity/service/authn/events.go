@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/google/uuid"
+
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -46,6 +48,7 @@ func userRegisteredEvent(member *Member) (events.Event, error) {
 	}
 	event.TenantID = member.Membership.TenantID
 	event.Actor = events.UserActor(user.ID)
+	event.SubjectUserIDs = []uuid.UUID{user.ID}
 	return event, nil
 }
 

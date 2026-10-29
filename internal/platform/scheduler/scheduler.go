@@ -288,8 +288,11 @@ func (s *Scheduler) runLeader(ctx context.Context) {
 }
 
 // startHeartbeat renews the lease until ctx ends or the lease is lost. A
-// renewal error is treated as a lost lease: continuing to schedule without a
-// confirmed lease could produce two active leaders.
+// transient renewal error is tolerated while the previous renewal is still
+// comfortably inside the lease TTL; stepping down immediately would let a
+// brief database or network hiccup leave the cluster without a scheduler. A
+// definitive lost lease, or errors lasting until the safety margin expires,
+// still cancel the leader before another process can acquire the lease.
 func (s *Scheduler) startHeartbeat(ctx context.Context, lost chan<- struct{}, cancelLeader context.CancelFunc) func() {
 	hbCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	done := make(chan struct{})
@@ -298,19 +301,28 @@ func (s *Scheduler) startHeartbeat(ctx context.Context, lost chan<- struct{}, ca
 		ticker := time.NewTicker(s.heartbeatInterval)
 		defer ticker.Stop()
 
+		// The successful acquisition established the lease; treat it as the
+		// last confirmed renewal until a heartbeat proves otherwise.
+		lastRenewed := s.now()
+		margin := s.leaseCancelMargin()
 		for {
 			select {
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				callCtx, callCancel := context.WithTimeout(hbCtx, bookkeepingTimeout)
+				timeout := min(s.heartbeatInterval, bookkeepingTimeout)
+				// Measure from before the RPC: a slow or failed call must not
+				// make the remaining lease look newer than it is.
+				sentAt := s.now()
+				callCtx, callCancel := context.WithTimeout(hbCtx, timeout)
 				ok, err := s.store.AcquireLease(callCtx, s.holder, s.leaseTTL)
 				callCancel()
 				if err != nil {
-					slog.Warn("scheduler: lease heartbeat failed; stepping down",
-						"holder", s.holder,
-						"error", err,
-					)
+					slog.Warn("scheduler: lease heartbeat failed", "holder", s.holder, "error", err)
+					if s.now().Sub(lastRenewed) < margin {
+						continue
+					}
+					slog.Error("scheduler: lease heartbeat deadline exceeded; stepping down", "holder", s.holder)
 					// Cancel the leader context so an in-flight runOnce stops
 					// enqueueing immediately instead of finishing its pass
 					// without a confirmed lease.
@@ -324,6 +336,7 @@ func (s *Scheduler) startHeartbeat(ctx context.Context, lost chan<- struct{}, ca
 					signalLost(lost)
 					return
 				}
+				lastRenewed = sentAt
 			}
 		}
 	}()
@@ -332,6 +345,18 @@ func (s *Scheduler) startHeartbeat(ctx context.Context, lost chan<- struct{}, ca
 		cancel()
 		<-done
 	}
+}
+
+// leaseCancelMargin leaves one heartbeat interval for the next renewal and one
+// bounded RPC for it to complete before the lease can expire. It is deliberately
+// measured from the last successful renewal, not from the first failure.
+func (s *Scheduler) leaseCancelMargin() time.Duration {
+	callTimeout := min(s.heartbeatInterval, bookkeepingTimeout)
+	margin := s.leaseTTL - s.heartbeatInterval - callTimeout
+	if margin <= 0 {
+		return s.heartbeatInterval
+	}
+	return margin
 }
 
 func (s *Scheduler) release(ctx context.Context) {

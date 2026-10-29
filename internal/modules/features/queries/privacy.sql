@@ -5,7 +5,8 @@
 SELECT * FROM feature_flag_targets
 WHERE tenant_id = @tenant_id::uuid
   AND user_id = @user_id::uuid
-ORDER BY id;
+ORDER BY id
+LIMIT @row_limit::int;
 
 -- name: DeleteFeatureFlagTargetsForPrivacy :execrows
 DELETE FROM feature_flag_targets

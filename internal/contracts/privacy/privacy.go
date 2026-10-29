@@ -14,11 +14,35 @@ import (
 	"github.com/google/uuid"
 )
 
+// Export limits shared by privacy providers. Exports are deliberately bounded:
+// a provider must never materialize an unbounded user history, and it must say
+// so in its section when the limit omitted data.
+const (
+	// DefaultRowLimit is the maximum number of rows one collection contributes
+	// to an export section.
+	DefaultRowLimit int32 = 1000
+	// DefaultByteLimit is the maximum size of inline payload data, or of a
+	// non-file section, in bytes.
+	DefaultByteLimit int64 = 64 << 20
+)
+
+// Budget describes the bounds a section applied and whether they omitted data.
+// Returned is the number of rows included in the section. RowLimit and
+// ByteLimit are zero when that bound is not enforced for the section.
+type Budget struct {
+	RowLimit  int32 `json:"rowLimit,omitempty"`
+	ByteLimit int64 `json:"byteLimit,omitempty"`
+	Returned  int   `json:"returned"`
+	Truncated bool  `json:"truncated"`
+}
+
 // Section is one module's contribution to a data export. Name is the module
-// name; Data must be a JSON value.
+// name; Data must be a JSON value. Truncated tells the document builder that
+// the provider applied a budget and omitted part of the user's data.
 type Section struct {
-	Name string
-	Data json.RawMessage
+	Name      string
+	Data      json.RawMessage
+	Truncated bool
 }
 
 // Exporter returns the module's data for one user in one tenant. Implementations

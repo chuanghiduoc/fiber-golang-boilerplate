@@ -222,6 +222,52 @@ func TestUpdateEndpointMergePatch(t *testing.T) {
 	assert.Equal(t, "disabled", updatedBody.Status)
 }
 
+func TestUpdateEndpointEmptyPatchIsNoOp(t *testing.T) {
+	id := uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000015")
+	updated := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	current := endpointFixture(id, updated)
+	svc := &fakeService{
+		getEndpoint: func(context.Context, uuid.UUID) (*webhookservice.Endpoint, error) {
+			return current, nil
+		},
+	}
+	fiberApp, _ := newAPI(t, svc)
+
+	resp, body := do(t, fiberApp, http.MethodPatch, "/api/v1/webhooks/endpoints/"+id.String(), map[string]any{}, map[string]string{
+		"If-Match":     strconv.Quote(strconv.FormatInt(updated.UnixNano(), 10)),
+		"Content-Type": "application/merge-patch+json",
+	})
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", body)
+	assert.Equal(t, strconv.Quote(strconv.FormatInt(updated.UnixNano(), 10)), resp.Header.Get("ETag"))
+	assert.Equal(t, "https://receiver.example/hook", decode[dto.WebhookEndpointResponse](t, body).URL)
+}
+
+func TestUpdateEndpointNullStatusRestoresActive(t *testing.T) {
+	id := uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000016")
+	updated := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	current := endpointFixture(id, updated)
+	var patch webhookservice.UpdateEndpointInput
+	svc := &fakeService{
+		getEndpoint: func(context.Context, uuid.UUID) (*webhookservice.Endpoint, error) {
+			return current, nil
+		},
+		updateEndpoint: func(_ context.Context, _, _ uuid.UUID, in webhookservice.UpdateEndpointInput) (*webhookservice.Endpoint, error) {
+			patch = in
+			next := endpointFixture(id, updated.Add(time.Minute))
+			next.Status = in.Status
+			return next, nil
+		},
+	}
+	fiberApp, _ := newAPI(t, svc)
+
+	resp, body := do(t, fiberApp, http.MethodPatch, "/api/v1/webhooks/endpoints/"+id.String(), map[string]any{"status": nil}, map[string]string{
+		"Content-Type": "application/merge-patch+json",
+	})
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body: %s", body)
+	assert.Equal(t, webhookservice.StatusActive, patch.Status)
+	assert.Equal(t, webhookservice.StatusActive, decode[dto.WebhookEndpointResponse](t, body).Status)
+}
+
 func TestDeleteEndpointNoContent(t *testing.T) {
 	id := uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000014")
 	called := false

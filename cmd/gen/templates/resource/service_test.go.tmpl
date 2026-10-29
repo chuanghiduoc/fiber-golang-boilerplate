@@ -100,7 +100,7 @@ func (f *fake{{.R.Pascal}}Repository) Delete{{.R.Pascal}}(ctx context.Context, i
 }
 
 func Test{{.R.Pascal}}ServiceCRUD(t *testing.T) {
-	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{})
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{}, testAuthorizer())
 	ctx := adminContext(testTenant)
 
 	created, err := svc.Create(ctx, {{.R.Pascal}}Input{Name: "  first  "})
@@ -130,7 +130,7 @@ func Test{{.R.Pascal}}ServiceCRUD(t *testing.T) {
 }
 
 func Test{{.R.Pascal}}ServiceValidates(t *testing.T) {
-	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{})
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{}, testAuthorizer())
 	for name, input := range map[string]string{"blank": "   ", "too long": strings.Repeat("x", max{{.R.Pascal}}NameLength+1)} {
 		_, err := svc.Create(adminContext(testTenant), {{.R.Pascal}}Input{Name: input})
 		var appErr *apperror.AppError
@@ -142,7 +142,7 @@ func Test{{.R.Pascal}}ServiceValidates(t *testing.T) {
 
 func Test{{.R.Pascal}}ServiceTenantIsolation(t *testing.T) {
 	repo := &fake{{.R.Pascal}}Repository{}
-	svc := New{{.R.Pascal}}Service(repo)
+	svc := New{{.R.Pascal}}Service(repo, testAuthorizer())
 	created, err := svc.Create(adminContext(testTenant), {{.R.Pascal}}Input{Name: "tenant one"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -171,7 +171,7 @@ func Test{{.R.Pascal}}ServiceTenantIsolation(t *testing.T) {
 }
 
 func Test{{.R.Pascal}}ServicePaginates(t *testing.T) {
-	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{})
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{}, testAuthorizer())
 	ctx := adminContext(testTenant)
 	for _, name := range []string{"a", "b", "c"} {
 		if _, err := svc.Create(ctx, {{.R.Pascal}}Input{Name: name}); err != nil {
@@ -192,7 +192,7 @@ func Test{{.R.Pascal}}ServicePaginates(t *testing.T) {
 }
 
 func Test{{.R.Pascal}}ServiceFailsClosed(t *testing.T) {
-	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{})
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{}, testAuthorizer())
 	for name, ctx := range map[string]context.Context{"no subject": context.Background(), "missing permission": userContext(testTenant)} {
 		t.Run(name, func(t *testing.T) {
 			_, err := svc.Create(ctx, {{.R.Pascal}}Input{Name: "x"})
@@ -205,7 +205,7 @@ func Test{{.R.Pascal}}ServiceFailsClosed(t *testing.T) {
 
 func Test{{.R.Pascal}}ServiceWrapsRepositoryErrors(t *testing.T) {
 	boom := errors.New("connection reset")
-	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{err: boom})
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{err: boom}, testAuthorizer())
 	if _, err := svc.Get(adminContext(testTenant), missingID); !errors.Is(err, boom) {
 		t.Fatalf("Get = %v, want the wrapped repository error", err)
 	}

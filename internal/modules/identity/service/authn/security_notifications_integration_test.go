@@ -34,7 +34,7 @@ func TestChangePassword_NotificationJobRollsBackWithChange(t *testing.T) {
 	codec, err := jobs.NewPayloadCodec("identity-notification-encryption-key")
 	require.NoError(t, err)
 	sender := jobs.NewQueuedSender(queue, codec)
-	security := authn.NewSecurityNotifier(e.Stores.Tenants, nil)
+	security := authn.NewSecurityNotifier(e.Stores.Tenants)
 	newUsers := func(tx *identityrepo.Transactor) authn.UserService {
 		return authn.NewUserService(authn.UserDeps{
 			Stores: e.Stores, Tx: tx, Cache: cache.NewMemoryCache(), Security: security,

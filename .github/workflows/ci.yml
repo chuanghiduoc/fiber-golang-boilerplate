@@ -63,11 +63,41 @@ jobs:
             echo "::error::no internal/modules/*/sqlc.yaml found" && exit 1
           fi
           for config in "${configs[@]}"; do
-            echo "sqlc generate -f $config"
+            echo "go tool sqlc generate -f $config"
             go tool sqlc generate -f "$config"
           done
           git add -N internal/modules/*/sqlc/
           git diff --exit-code internal/modules/*/sqlc/ || (echo "sqlc code is outdated. Run 'make sqlc-generate' and commit." && exit 1)
+
+  # The README quick start is Compose; a missing or malformed variable must
+  # fail here instead of on a fresh clone. init-env.sh also proves the local
+  # secret generator works, and the config test loads the same environment the
+  # app sees (durations included).
+  deploy-config:
+    name: Deploy config smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Generate the local environment
+        run: sh scripts/init-env.sh
+
+      - name: Validate Compose interpolation
+        run: docker compose config --quiet
+
+      - name: Load the generated environment through app config
+        run: |
+          set -a
+          . ./.env
+          set +a
+          go test ./config -run '^TestLoad_DefaultValues$' -count=1
 
   # cmd/openapi emits the same OpenAPI 3.1 document the server serves, so base
   # and PR specs are compared directly and oasdiff fails on ERR-level breaking
@@ -299,6 +329,7 @@ jobs:
             /tmp/component-external-secrets.yaml \
             /tmp/component-keda-worker-scaler.yaml \
             deploy/k8s/migration/job.yaml \
+            deploy/k8s/migration/cronjob.yaml \
             deploy/k8s/seed/job.yaml \
             deploy/k8s/secret.example.yaml \
             deploy/k8s/migrate-secret.example.yaml \
@@ -512,6 +543,9 @@ jobs:
 
       - name: Run tests
         run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Verify generated code builds
+        run: go test -tags=generator_e2e -count=1 -run TestGeneratedCodeBuilds ./cmd/gen
 
       - name: Show coverage
         run: |

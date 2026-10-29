@@ -145,7 +145,8 @@ JOIN roles r ON r.id = mr.role_id
 WHERE mr.tenant_id = @tenant_id::uuid
   AND mr.user_id = @user_id::uuid
   AND r.scope = 'tenant'
-ORDER BY mr.created_at, r.key;
+ORDER BY mr.created_at, r.key
+LIMIT @row_limit::int;
 
 -- name: UpdateRoleIfUnchanged :one
 -- Renames a tenant role only while its updated_at still matches the ETag the

@@ -29,10 +29,11 @@ const (
 	myNotificationPreferences = "/api/v1/me/notification-preferences"
 	myNotificationPreference  = "/api/v1/me/notification-preferences/{type}/{channel}"
 	memberNotificationsPath   = "/api/v1/members/{memberId}/notifications"
+	memberNotificationPath    = "/api/v1/members/{memberId}/notifications/{notificationId}"
 	notificationsTag          = "Notifications"
-	// The created notification's canonical item URI is the member feed item,
-	// which is the only per-notification resource in the route table.
-	notificationLocationFmt = "/api/v1/me/notifications/%s"
+	// The created notification's canonical item URI is the recipient's
+	// member-scoped item, which the admin who sent it can read back.
+	memberNotificationLocationFmt = "/api/v1/members/%s/notifications/%s"
 )
 
 // Handler binds requests, validates input, and calls the service.
@@ -49,7 +50,6 @@ func New(svc service.NotificationService) *Handler {
 // contract test/arch and cmd/openapi read; the HTTP foundation builds the
 // middleware chain from it.
 func (h *Handler) Register(api *httpapi.API) {
-	prepareRequestBody(api)
 	bestEffort := func(action, resource string) httpapi.AuditPolicy {
 		return httpapi.AuditPolicy{Guard: &httpapi.GuardPolicy{
 			Mode:     audithttp.ModeBestEffort,
@@ -116,6 +116,14 @@ func (h *Handler) Register(api *httpapi.API) {
 	}, h.setPreference)
 
 	httpapi.Register(api, httpapi.Op{
+		Method: "GET", Path: memberNotificationPath, OperationID: "getMemberNotification",
+		Tags: []string{notificationsTag}, Summary: "Get a notification sent to a member",
+		Description: "Returns one notification in another member's feed. Requires the send permission; a cross-tenant id is not found.",
+	}, httpapi.Policy{
+		Permission: notificationscatalog.PermissionNotificationsSend, RateLimit: httpapi.RateLimitRelaxed,
+	}, h.getForMember)
+
+	httpapi.Register(api, httpapi.Op{
 		Method: "POST", Path: memberNotificationsPath, OperationID: "createMemberNotification",
 		Tags: []string{notificationsTag}, Summary: "Send a notification to a member",
 		Description: "Create an in-app notification and enqueue its email channel for another member of the request tenant.",
@@ -129,7 +137,7 @@ func (h *Handler) Register(api *httpapi.API) {
 
 // listMyNotificationsInput is the feed page request.
 type listMyNotificationsInput struct {
-	Limit         int    `query:"limit" default:"20" minimum:"1" maximum:"100"`
+	Limit         int    `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string `query:"startingAfter"`
 	UnreadOnly    bool   `query:"unreadOnly"`
 }
@@ -163,6 +171,11 @@ type setPreferenceInput struct {
 type createMemberNotificationInput struct {
 	MemberID uuid.UUID `path:"memberId" format:"uuid"`
 	Body     dto.CreateMemberNotificationRequest
+}
+
+type memberNotificationInput struct {
+	MemberID       uuid.UUID `path:"memberId" format:"uuid"`
+	NotificationID uuid.UUID `path:"notificationId" format:"uuid"`
 }
 
 func (h *Handler) list(ctx context.Context, in *listMyNotificationsInput) (*httpapi.ListOutput[dto.NotificationResponse], error) {
@@ -281,6 +294,17 @@ func (h *Handler) setPreference(ctx context.Context, in *setPreferenceInput) (*h
 	return &httpapi.Output[dto.NotificationPreferenceResponse]{Body: *toPreferenceResponse(pref)}, nil
 }
 
+func (h *Handler) getForMember(ctx context.Context, in *memberNotificationInput) (*httpapi.Output[dto.NotificationResponse], error) {
+	if _, err := requestSubject(ctx); err != nil {
+		return nil, err
+	}
+	item, err := h.service.Get(ctx, in.MemberID, in.NotificationID)
+	if err != nil {
+		return nil, err
+	}
+	return &httpapi.Output[dto.NotificationResponse]{Body: *toNotificationResponse(item)}, nil
+}
+
 func (h *Handler) createForMember(ctx context.Context, in *createMemberNotificationInput) (*httpapi.Created[dto.CreateNotificationResponse], error) {
 	if _, err := requestSubject(ctx); err != nil {
 		return nil, err
@@ -313,7 +337,7 @@ func (h *Handler) createForMember(ctx context.Context, in *createMemberNotificat
 
 	var location string
 	if result.Notification != nil {
-		location = fmt.Sprintf(notificationLocationFmt, result.Notification.ID)
+		location = fmt.Sprintf(memberNotificationLocationFmt, in.MemberID, result.Notification.ID)
 	}
 	return httpapi.NewCreated(location, dto.CreateNotificationResponse{
 		Notification: toNotificationResponse(result.Notification),

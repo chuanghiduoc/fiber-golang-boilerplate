@@ -9,7 +9,8 @@ SELECT id, tenant_id, user_id, name, prefix, expires_at, revoked_at,
 FROM api_keys
 WHERE tenant_id = @tenant_id::uuid
   AND user_id = @user_id::uuid
-ORDER BY id;
+ORDER BY id
+LIMIT @row_limit::int;
 
 -- name: DeleteAPIKeysForPrivacy :execrows
 DELETE FROM api_keys

@@ -11,33 +11,25 @@ import (
 	"github.com/google/uuid"
 )
 
-const deleteNotificationPreferencesForPrivacy = `-- name: DeleteNotificationPreferencesForPrivacy :exec
-DELETE FROM notification_preferences
-WHERE tenant_id = $1 AND user_id = $2
+const deleteAllNotificationPrivacy = `-- name: DeleteAllNotificationPrivacy :exec
+WITH removed_preferences AS (
+    DELETE FROM notification_preferences AS np
+    WHERE np.tenant_id = $1 AND np.user_id = $2
+)
+DELETE FROM notifications AS n
+WHERE n.tenant_id = $1 AND n.user_id = $2
 `
 
-type DeleteNotificationPreferencesForPrivacyParams struct {
+type DeleteAllNotificationPrivacyParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
 }
 
-func (q *Queries) DeleteNotificationPreferencesForPrivacy(ctx context.Context, arg DeleteNotificationPreferencesForPrivacyParams) error {
-	_, err := q.db.Exec(ctx, deleteNotificationPreferencesForPrivacy, arg.TenantID, arg.UserID)
-	return err
-}
-
-const deleteNotificationsForPrivacy = `-- name: DeleteNotificationsForPrivacy :exec
-DELETE FROM notifications
-WHERE tenant_id = $1 AND user_id = $2
-`
-
-type DeleteNotificationsForPrivacyParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	UserID   uuid.UUID `json:"user_id"`
-}
-
-func (q *Queries) DeleteNotificationsForPrivacy(ctx context.Context, arg DeleteNotificationsForPrivacyParams) error {
-	_, err := q.db.Exec(ctx, deleteNotificationsForPrivacy, arg.TenantID, arg.UserID)
+// One statement so a failed erasure cannot leave notifications without their
+// preferences (or the reverse): a data-modifying CTE runs both deletes in the
+// same transaction, even though it does not reference the CTE result.
+func (q *Queries) DeleteAllNotificationPrivacy(ctx context.Context, arg DeleteAllNotificationPrivacyParams) error {
+	_, err := q.db.Exec(ctx, deleteAllNotificationPrivacy, arg.TenantID, arg.UserID)
 	return err
 }
 
@@ -45,18 +37,20 @@ const listNotificationsForPrivacy = `-- name: ListNotificationsForPrivacy :many
 
 SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at FROM notifications
 WHERE tenant_id = $1 AND user_id = $2
-ORDER BY id
+ORDER BY created_at DESC, id DESC
+LIMIT $3::int
 `
 
 type ListNotificationsForPrivacyParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
 }
 
 // Privacy export/erasure for the notification feed and preferences. The
 // tenant and user are explicit because the privacy contract passes them.
 func (q *Queries) ListNotificationsForPrivacy(ctx context.Context, arg ListNotificationsForPrivacyParams) ([]Notification, error) {
-	rows, err := q.db.Query(ctx, listNotificationsForPrivacy, arg.TenantID, arg.UserID)
+	rows, err := q.db.Query(ctx, listNotificationsForPrivacy, arg.TenantID, arg.UserID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -90,15 +84,17 @@ const listPreferencesForPrivacy = `-- name: ListPreferencesForPrivacy :many
 SELECT tenant_id, user_id, type, channel, enabled, created_at, updated_at FROM notification_preferences
 WHERE tenant_id = $1 AND user_id = $2
 ORDER BY type, channel
+LIMIT $3::int
 `
 
 type ListPreferencesForPrivacyParams struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
+	RowLimit int32     `json:"row_limit"`
 }
 
 func (q *Queries) ListPreferencesForPrivacy(ctx context.Context, arg ListPreferencesForPrivacyParams) ([]NotificationPreference, error) {
-	rows, err := q.db.Query(ctx, listPreferencesForPrivacy, arg.TenantID, arg.UserID)
+	rows, err := q.db.Query(ctx, listPreferencesForPrivacy, arg.TenantID, arg.UserID, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}

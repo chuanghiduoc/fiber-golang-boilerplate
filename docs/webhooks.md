@@ -24,7 +24,7 @@ flowchart LR
     WH -->|"webhook_events + webhook_deliveries + jobs"| PG[(PostgreSQL)]
     PG -->|"webhook.delivery job"| DW[delivery worker]
     DW -->|"Standard Webhooks POST via pkg/webhook.Client"| RX[Receiver]
-    EXT[External sender] -->|"POST /webhooks/inbound/:id"| WH
+    EXT[External sender] -->|"POST /api/v1/webhooks/inbound/{sourceId}"| WH
 ```
 
 Producers never import or call the webhooks module: they publish domain
@@ -65,6 +65,13 @@ Every event, and therefore every outbound webhook body, is one envelope
 `specversion` is always `1.0`, so a relay can emit CloudEvents without touching
 producers. The bus also carries an internal `requestId` for log/trace
 correlation; it is never stored in `webhook_events` or sent to receivers.
+It also carries `subjectUserIds`, the users whose data the event concerns. The
+dispatcher unions that list with the user actor and the legacy top-level keys
+(`userId`, `ownerId`, `accountId`, `memberId`, `subjectId`, `targetUserId`) and
+stores the result in `webhook_events.subject_user_ids`. A producer whose event
+concerns a user other than the actor (for example an admin takedown of another
+user's file) must set `SubjectUserIDs`. This metadata is never part of the
+signed body and is never sent to receivers.
 
 **Evolution rule.** Adding an optional field to `data` keeps `dataVersion`.
 Removing, renaming, or retyping a field, or changing its meaning, is breaking:
@@ -151,8 +158,8 @@ Step by step, the fan-out:
 3. Inserts the `webhook_events` row (first endpoint only), a
    `webhook_deliveries` row, and a `webhook.delivery` job in **one
    transaction**. The event row stores the envelope once (id, type,
-   `data_version`, actor, `occurred_at`, data); the delivery snapshots the
-   endpoint URL, secret id, max attempts, and timeout.
+   `data_version`, actor, `subject_user_ids`, `occurred_at`, data); the delivery
+   snapshots the endpoint URL, secret id, max attempts, and timeout.
 4. Returns the number of newly created deliveries; handling the same event
    again is a no-op.
 
@@ -331,8 +338,8 @@ whose snapshot is older than that previous secret is signed with the current
   immediate retry), and is capped at the same maximum.
 - Every attempt is recorded in `webhook_delivery_attempts` with status code,
   duration, and a truncated error (never the response body).
-- Replay (`POST /webhooks/deliveries/:id/replay`) creates a **new delivery row
-  and attempt counter for the original message**: `webhook-id`, the body
+- Replay (`POST /api/v1/webhooks/deliveries/{deliveryId}/replay`) creates a
+  **new delivery row and attempt counter for the original message**: `webhook-id`, the body
   `id`, and `occurredAt` stay the original ones, so a Standard Webhooks
   receiver deduplicates the replay instead of processing it twice. It is
   delivered to the endpoint's current URL with its active secret. The original
@@ -402,7 +409,7 @@ sequenceDiagram
     participant SV as Webhooks service
     participant DB as PostgreSQL
 
-    S->>H: POST /webhooks/inbound/:id
+    S->>H: POST /api/v1/webhooks/inbound/{sourceId}
     H->>SV: ReceiveInbound(sourceID, headers, raw body)
     SV->>SV: body non-empty, <= 1 MiB, valid JSON (else 400)
     SV->>SV: webhook-id present and well-formed (else 400)
@@ -468,7 +475,7 @@ database predates v3, so there is nothing to migrate).
 
 | Rotation | Behavior |
 |---|---|
-| Endpoint | Locks the endpoint row, retires the old secret with `grace_expires_at = now() + 24h`, inserts the next version (concurrent rotations serialize), and expires any older retired row. Every delivery sent while the previous secret is unexpired is signed with both, current first (see [Signing during secret rotation](#signing-during-secret-rotation)); after it only the current secret signs. `POST /webhooks/endpoints/:id/rotate-secret` accepts `{"expirePrevious": true}` to close the grace immediately, so the previous secret stops co-signing at once. A failed signing-secret lookup or an unreadable current secret is a retryable attempt failure; the worker never falls back to the delivery snapshot (it may be past its grace), and a structurally invalid envelope or a non-`whsec_` secret is dead. Replays use the current active secret. |
+| Endpoint | Locks the endpoint row, retires the old secret with `grace_expires_at = now() + 24h`, inserts the next version (concurrent rotations serialize), and expires any older retired row. Every delivery sent while the previous secret is unexpired is signed with both, current first (see [Signing during secret rotation](#signing-during-secret-rotation)); after it only the current secret signs. `POST /api/v1/webhooks/endpoints/{endpointId}/rotate-secret` accepts `{"expirePrevious": true}` to close the grace immediately, so the previous secret stops co-signing at once. A failed signing-secret lookup or an unreadable current secret is a retryable attempt failure; the worker never falls back to the delivery snapshot (it may be past its grace), and a structurally invalid envelope or a non-`whsec_` secret is dead. Replays use the current active secret. |
 | Inbound source | Locks the source row, retires the old secret with `grace_expires_at = now() + 24h`, and inserts the next version into `webhook_inbound_source_secrets`. Verification accepts the current secret or, while unexpired, the immediately previous one; a second rotation within the window expires the older retired row, so only that one survives. |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | Two-phase: add the new key to `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` everywhere, then promote it and keep the old key listed. Rows keep the key that sealed them until their secret is rotated, so drop the old key only after every endpoint/source secret is rotated and no pending delivery snapshot uses it ([Key rotation](operations.md#key-rotation)). |
 
@@ -544,7 +551,7 @@ Idempotency:
 |---|---|
 | `webhook_endpoints` + `webhook_endpoint_secrets` | Endpoints and versioned secrets (one active, plus at most one retired with an unexpired grace window). |
 | `webhook_endpoint_subscriptions` | One row per `eventTypes` pattern of an endpoint. |
-| `webhook_events` | Each dispatched event envelope once: id, type, `data_version`, `actor_type`/`actor_id`, `occurred_at`, and `payload` (the envelope data). The worker rebuilds the signed body from it. |
+| `webhook_events` | Each dispatched event envelope once: id, type, `data_version`, `actor_type`/`actor_id`, `subject_user_ids` (privacy attribution), `occurred_at`, and `payload` (the envelope data). The worker rebuilds the signed body from it, deliberately without `subject_user_ids`. |
 | `webhook_deliveries` | Outbox + endpoint snapshot (URL, secret id, timeout, max attempts) + state. |
 | `webhook_delivery_attempts` | One row per attempt. |
 | `webhook_inbound_sources` + `webhook_inbound_source_secrets` | Inbound receivers and their versioned sealed secrets (one active, plus at most one retired with an unexpired grace window). |

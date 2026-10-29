@@ -47,6 +47,7 @@ SET outcome = $2,
     error_code = $4,
     completed_at = $5
 WHERE id = $1
+  AND created_at = $6
   AND source = 'http'
   AND outcome = 'started'`
 
@@ -171,30 +172,34 @@ func (r *PostgresRecorder) RecordTx(ctx context.Context, tx pgx.Tx, event Event)
 }
 
 // RecordID inserts a pre-write intent row (source=http, outcome=started) and
-// returns its ID. It is used by [Guard] before a Tier 2 handler runs.
-func (r *PostgresRecorder) RecordID(ctx context.Context, event Event) (uuid.UUID, error) {
+// returns the identity completion needs. It is used by [Guard] before a Tier 2
+// handler runs.
+func (r *PostgresRecorder) RecordID(ctx context.Context, event Event) (IntentRef, error) {
 	if err := event.validateIntent(); err != nil {
-		return uuid.Nil, err
+		return IntentRef{}, err
 	}
 	event.Outcome = OutcomeStarted
 	values, err := r.values(ctx, event)
 	if err != nil {
-		return uuid.Nil, err
+		return IntentRef{}, err
 	}
-	var id uuid.UUID
+	var intent IntentRef
 	if err := r.db.QueryRow(ctx, insertEventSQL+`
- RETURNING id`, insertArgs(event, values)...).Scan(&id); err != nil {
-		return uuid.Nil, fmt.Errorf("audit: insert intent event: %w", err)
+ RETURNING id, created_at`, insertArgs(event, values)...).Scan(&intent.ID, &intent.CreatedAt); err != nil {
+		return IntentRef{}, fmt.Errorf("audit: insert intent event: %w", err)
 	}
-	return id, nil
+	return intent, nil
 }
 
 // Complete transitions a started HTTP intent row to a terminal outcome. Rows
 // that are already completed, were not started, or are not HTTP events return
 // [ErrAlreadyCompleted]; completions are immutable and happen at most once.
-func (r *PostgresRecorder) Complete(ctx context.Context, id uuid.UUID, completion Completion) error {
-	if id == uuid.Nil {
+func (r *PostgresRecorder) Complete(ctx context.Context, intent IntentRef, completion Completion) error {
+	if intent.ID == uuid.Nil {
 		return fmt.Errorf("%w: invalid event id", ErrInvalidEvent)
+	}
+	if intent.CreatedAt.IsZero() {
+		return fmt.Errorf("%w: intent created_at is required", ErrInvalidEvent)
 	}
 	if err := completion.Validate(); err != nil {
 		return err
@@ -207,11 +212,12 @@ func (r *PostgresRecorder) Complete(ctx context.Context, id uuid.UUID, completio
 		completedAt = time.Now().UTC()
 	}
 	tag, err := r.db.Exec(ctx, completeEventSQL,
-		id,
+		intent.ID,
 		completion.Outcome,
 		nullableStatusCode(completion.StatusCode),
 		nullableString(completion.ErrorCode),
 		completedAt,
+		intent.CreatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("audit: complete event: %w", err)

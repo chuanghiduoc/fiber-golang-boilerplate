@@ -125,10 +125,10 @@ func (handlerSessions) InvalidatePermissions(context.Context) error { return nil
 type handlerAudit struct{}
 
 func (handlerAudit) Record(context.Context, audit.Event) error { return nil }
-func (handlerAudit) RecordID(context.Context, audit.Event) (uuid.UUID, error) {
-	return uuid.New(), nil
+func (handlerAudit) RecordID(context.Context, audit.Event) (audit.IntentRef, error) {
+	return audit.IntentRef{ID: uuid.New()}, nil
 }
-func (handlerAudit) Complete(context.Context, uuid.UUID, audit.Completion) error { return nil }
+func (handlerAudit) Complete(context.Context, audit.IntentRef, audit.Completion) error { return nil }
 
 type filesHarness struct {
 	app   *app.App
@@ -241,8 +241,23 @@ func TestGetFileNotFound(t *testing.T) {
 func TestGetFileInvalidID(t *testing.T) {
 	h := newFilesHarness(t, newMockUploadService(), 10*1024*1024, nil, nil, 0)
 
-	resp, _ := get(t, h, "/api/v1/files/1")
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	resp, body := get(t, h, "/api/v1/files/1")
+	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
+	var problem apperror.ProblemDetails
+	require.NoError(t, json.Unmarshal(body, &problem))
+	assert.Equal(t, string(apperror.CodeRequestValidationFailed), problem.Code)
+	require.Len(t, problem.Errors, 1)
+	assert.Equal(t, "path.fileId", problem.Errors[0].Path)
+}
+
+func TestGetFileNilIDIsNotFound(t *testing.T) {
+	h := newFilesHarness(t, newMockUploadService(), 10*1024*1024, nil, nil, 0)
+
+	resp, body := get(t, h, "/api/v1/files/00000000-0000-0000-0000-000000000000")
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	var problem apperror.ProblemDetails
+	require.NoError(t, json.Unmarshal(body, &problem))
+	assert.Equal(t, string(apperror.CodeResourceNotFound), problem.Code)
 }
 
 func TestGetFileContent(t *testing.T) {
@@ -332,7 +347,8 @@ func TestCreateFileRequiresFile(t *testing.T) {
 		[]string{"application/pdf"}, nil, 0)
 
 	resp, _ := upload(t, h, "", nil)
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode,
+		"the multipart schema marks file required, so huma rejects the missing part before the handler")
 }
 
 func TestCreateFileRejectsDisallowedMIME(t *testing.T) {
@@ -349,6 +365,21 @@ func TestCreateFileRejectsBodyOverLimit(t *testing.T) {
 
 	resp, _ := upload(t, h, "large.txt", bytes.Repeat([]byte("x"), 256))
 	assert.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
+}
+
+// TestCreateFileAcceptsMultipartAboveHumaDefault proves the upload operation
+// binds bodies larger than huma's 1 MiB default up to APP_BODY_LIMIT. The
+// global BodyLimit still enforces the smaller JSON cap on every other route.
+func TestCreateFileAcceptsMultipartAboveHumaDefault(t *testing.T) {
+	const bodyLimit = 12 << 20
+	h := newFilesHarness(t, newMockUploadService(), 10*1024*1024,
+		[]string{"text/plain; charset=utf-8"}, nil, bodyLimit)
+
+	content := bytes.Repeat([]byte("x"), 2<<20)
+	resp, body := upload(t, h, "large.txt", content)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	file := decodeFile(t, body)
+	assert.Equal(t, int64(len(content)), file.Size)
 }
 
 func TestCreateFileRejectsOversizedFile(t *testing.T) {

@@ -87,11 +87,12 @@ var codePattern = regexp.MustCompile(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$`)
 // per-request read path is lock-free after startup. There is deliberately no
 // process-wide registry.
 type Catalog struct {
-	mu     sync.RWMutex
-	specs  map[Code]Spec
-	owners map[Code]string
-	order  []Code
-	sealed bool
+	mu          sync.RWMutex
+	specs       map[Code]Spec
+	owners      map[Code]string
+	order       []Code
+	sealed      bool
+	docsBaseURL string
 }
 
 // NewCatalog returns a catalog pre-populated with the platform-wide codes. It
@@ -179,6 +180,20 @@ func (c *Catalog) Seal() {
 	c.sealed = true
 }
 
+// SetDocsBaseURL configures the absolute prefix used for RFC 9457 "type"
+// links. It is instance-scoped and may be set after Seal because it is
+// presentation configuration, not catalog membership. Trailing slashes and
+// surrounding whitespace are removed so the configured base and DocPath do not
+// produce a double slash.
+func (c *Catalog) SetDocsBaseURL(base string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.docsBaseURL = strings.TrimRight(strings.TrimSpace(base), "/")
+}
+
 func validateSpec(code Code, spec Spec) error {
 	if !codePattern.MatchString(string(code)) {
 		return fmt.Errorf("invalid code %q (want dotted lower-case segments)", code)
@@ -261,7 +276,7 @@ func (c *Catalog) Resolve(code Code) (Code, Spec) {
 func (c *Catalog) Problem(appErr *AppError, requestID, instance string) ProblemDetails {
 	code, spec := c.Resolve(Code(appErr.Code))
 	return ProblemDetails{
-		Type:      DocsBaseURL + spec.DocPath,
+		Type:      c.typeURL(spec.DocPath),
 		Title:     spec.Title,
 		Status:    spec.Status,
 		Code:      string(code),
@@ -269,8 +284,33 @@ func (c *Catalog) Problem(appErr *AppError, requestID, instance string) ProblemD
 		Instance:  instance,
 		RequestID: requestID,
 		Timestamp: timestamp(),
-		Errors:    appErr.Errors,
+		Errors:    normalizeFieldPaths(appErr.Errors),
 	}
+}
+
+func (c *Catalog) typeURL(docPath string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.docsBaseURL + docPath
+}
+
+// normalizeFieldPaths applies the wire grammar for errors[].path at the one
+// rendering boundary:
+//   - body fields are body-relative: "name", "items[0].name"
+//   - query/path/header fields keep their location prefix: "query.limit"
+//   - an error about the whole body stays "body"
+//
+// The input slice is copied; rendering must never mutate the AppError.
+func normalizeFieldPaths(fields []FieldError) []FieldError {
+	if len(fields) == 0 {
+		return fields
+	}
+	out := make([]FieldError, len(fields))
+	for i, field := range fields {
+		field.Path = strings.TrimPrefix(field.Path, "body.")
+		out[i] = field
+	}
+	return out
 }
 
 // NewCode builds an *AppError from code and public detail. It is a pure

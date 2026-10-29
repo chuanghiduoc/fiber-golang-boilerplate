@@ -20,8 +20,8 @@ func NewSessionStateReader(sessions core.SessionRepository) *SessionStateReader 
 	return &SessionStateReader{sessions: sessions}
 }
 
-func (r *SessionStateReader) SessionState(ctx context.Context, sessionID, userID uuid.UUID) (session.State, error) {
-	state, err := r.sessions.State(ctx, sessionID, userID)
+func (r *SessionStateReader) SessionState(ctx context.Context, tenantID, sessionID, userID uuid.UUID) (session.State, error) {
+	state, err := r.sessions.State(ctx, tenantID, sessionID, userID)
 	if err != nil {
 		return session.State{}, err
 	}

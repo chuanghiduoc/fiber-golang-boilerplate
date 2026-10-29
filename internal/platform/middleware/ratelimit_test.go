@@ -268,3 +268,43 @@ func TestNewLimiter_FailsOpenOnCacheError(t *testing.T) {
 		}
 	}
 }
+
+func TestAdmissionDelayMatchesLinearScan(t *testing.T) {
+	for window := int64(1); window <= 12; window++ {
+		for elapsed := int64(0); elapsed < window; elapsed++ {
+			for limit := int64(1); limit <= 8; limit++ {
+				for previous := int64(0); previous <= 12; previous++ {
+					for current := int64(0); current <= 12; current++ {
+						want := linearAdmissionDelay(previous, current, limit, elapsed, window)
+						got := admissionDelay(previous, current, limit, elapsed, window)
+						if got != want {
+							t.Fatalf("admissionDelay(prev=%d, cur=%d, limit=%d, elapsed=%d, window=%d) = %d, want %d",
+								previous, current, limit, elapsed, window, got, want)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// linearAdmissionDelay is the former implementation, kept as an oracle for the
+// binary search. It is only used with small windows.
+func linearAdmissionDelay(previous, current, limit, elapsed, window int64) int64 {
+	for delay := int64(1); delay <= 2*window; delay++ {
+		offset := (elapsed + delay) / window
+		at := (elapsed + delay) % window
+		prev, cur := previous, current
+		switch offset {
+		case 0:
+		case 1:
+			prev, cur = current, 0
+		default:
+			prev, cur = 0, 0
+		}
+		if prev*(window-at)/window+cur+1 <= limit {
+			return delay
+		}
+	}
+	return window
+}

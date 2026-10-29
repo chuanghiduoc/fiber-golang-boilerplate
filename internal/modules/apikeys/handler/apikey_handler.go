@@ -31,7 +31,7 @@ func NewHandler(service apikeysvc.Service) *Handler {
 
 // ListMineInput is the query for the caller's page of keys.
 type ListMineInput struct {
-	Limit         int    `query:"limit" default:"20" minimum:"1" maximum:"100" doc:"Maximum number of keys to return."`
+	Limit         int    `query:"limit" default:"20" doc:"Maximum number of keys to return (values outside 1-100 are clamped)."`
 	StartingAfter string `query:"startingAfter" doc:"Opaque cursor from the previous page."`
 }
 
@@ -42,32 +42,32 @@ type CreateInput struct {
 
 // ListMemberInput is the query for one member's page of keys.
 type ListMemberInput struct {
-	MemberID      uuid.UUID `path:"memberId" doc:"Member id (UUID) whose keys are listed."`
-	Limit         int       `query:"limit" default:"20" minimum:"1" maximum:"100" doc:"Maximum number of keys to return."`
+	MemberID      uuid.UUID `path:"memberId" format:"uuid" doc:"Member id (UUID) whose keys are listed."`
+	Limit         int       `query:"limit" default:"20" doc:"Maximum number of keys to return (values outside 1-100 are clamped)."`
 	StartingAfter string    `query:"startingAfter" doc:"Opaque cursor from the previous page."`
 }
 
 // KeyInput addresses the caller's key.
 type KeyInput struct {
-	KeyID uuid.UUID `path:"keyId" doc:"API key id (UUID)."`
+	KeyID uuid.UUID `path:"keyId" format:"uuid" doc:"API key id (UUID)."`
 }
 
 // UpdateMineInput is a merge-patch request for the caller's key.
 type UpdateMineInput struct {
-	KeyID uuid.UUID                     `path:"keyId" doc:"API key id (UUID)."`
+	KeyID uuid.UUID                     `path:"keyId" format:"uuid" doc:"API key id (UUID)."`
 	Body  apikeydto.UpdateAPIKeyRequest `contentType:"application/merge-patch+json"`
 }
 
 // MemberKeyInput addresses a key owned by a member.
 type MemberKeyInput struct {
-	MemberID uuid.UUID `path:"memberId" doc:"Member id (UUID) whose key is addressed."`
-	KeyID    uuid.UUID `path:"keyId" doc:"API key id (UUID)."`
+	MemberID uuid.UUID `path:"memberId" format:"uuid" doc:"Member id (UUID) whose key is addressed."`
+	KeyID    uuid.UUID `path:"keyId" format:"uuid" doc:"API key id (UUID)."`
 }
 
 // UpdateMemberInput is a merge-patch request for another member's key.
 type UpdateMemberInput struct {
-	MemberID uuid.UUID                     `path:"memberId" doc:"Member id (UUID) whose key is addressed."`
-	KeyID    uuid.UUID                     `path:"keyId" doc:"API key id (UUID)."`
+	MemberID uuid.UUID                     `path:"memberId" format:"uuid" doc:"Member id (UUID) whose key is addressed."`
+	KeyID    uuid.UUID                     `path:"keyId" format:"uuid" doc:"API key id (UUID)."`
 	Body     apikeydto.UpdateAPIKeyRequest `contentType:"application/merge-patch+json"`
 }
 
@@ -109,7 +109,7 @@ func (h *Handler) GetMine(ctx context.Context, in *KeyInput) (*httpapi.Output[ap
 	if err != nil {
 		return nil, err
 	}
-	if err := requireID(in.KeyID, "keyId"); err != nil {
+	if err := requireID(in.KeyID); err != nil {
 		return nil, err
 	}
 	key, err := h.service.GetOwnedBy(ctx, caller, in.KeyID)
@@ -125,7 +125,7 @@ func (h *Handler) UpdateMine(ctx context.Context, in *UpdateMineInput) (*httpapi
 	if err != nil {
 		return nil, err
 	}
-	if err := requireID(in.KeyID, "keyId"); err != nil {
+	if err := requireID(in.KeyID); err != nil {
 		return nil, err
 	}
 	update, err := mergeUpdate(in.Body)
@@ -145,7 +145,7 @@ func (h *Handler) DeleteMine(ctx context.Context, in *KeyInput) (*httpapi.Empty,
 	if err != nil {
 		return nil, err
 	}
-	if err := requireID(in.KeyID, "keyId"); err != nil {
+	if err := requireID(in.KeyID); err != nil {
 		return nil, err
 	}
 	if err := h.service.RevokeOwnedBy(ctx, caller, in.KeyID); err != nil {
@@ -161,7 +161,7 @@ func (h *Handler) RotateMine(ctx context.Context, in *KeyInput) (*httpapi.Create
 	if err != nil {
 		return nil, err
 	}
-	if err := requireID(in.KeyID, "keyId"); err != nil {
+	if err := requireID(in.KeyID); err != nil {
 		return nil, err
 	}
 	rotated, err := h.service.Rotate(ctx, caller, in.KeyID)
@@ -175,7 +175,7 @@ func (h *Handler) RotateMine(ctx context.Context, in *KeyInput) (*httpapi.Create
 // ListMember returns another member's keys. The route permission is
 // admin:api_keys:read; the page is scoped to the member id on the path.
 func (h *Handler) ListMember(ctx context.Context, in *ListMemberInput) (*httpapi.ListOutput[apikeydto.APIKeyResponse], error) {
-	if err := requireID(in.MemberID, "memberId"); err != nil {
+	if err := requireID(in.MemberID); err != nil {
 		return nil, err
 	}
 	keys, hasMore, err := h.service.ListForMember(ctx, in.MemberID, in.Limit, in.StartingAfter)
@@ -187,10 +187,10 @@ func (h *Handler) ListMember(ctx context.Context, in *ListMemberInput) (*httpapi
 
 // UpdateMember applies an RFC 7396 merge patch to another member's key.
 func (h *Handler) UpdateMember(ctx context.Context, in *UpdateMemberInput) (*httpapi.Output[apikeydto.APIKeyResponse], error) {
-	if err := requireID(in.MemberID, "memberId"); err != nil {
+	if err := requireID(in.MemberID); err != nil {
 		return nil, err
 	}
-	if err := requireID(in.KeyID, "keyId"); err != nil {
+	if err := requireID(in.KeyID); err != nil {
 		return nil, err
 	}
 	update, err := mergeUpdate(in.Body)
@@ -206,10 +206,10 @@ func (h *Handler) UpdateMember(ctx context.Context, in *UpdateMemberInput) (*htt
 
 // DeleteMember revokes another member's key.
 func (h *Handler) DeleteMember(ctx context.Context, in *MemberKeyInput) (*httpapi.Empty, error) {
-	if err := requireID(in.MemberID, "memberId"); err != nil {
+	if err := requireID(in.MemberID); err != nil {
 		return nil, err
 	}
-	if err := requireID(in.KeyID, "keyId"); err != nil {
+	if err := requireID(in.KeyID); err != nil {
 		return nil, err
 	}
 	if err := h.service.RevokeForMember(ctx, in.MemberID, in.KeyID); err != nil {
@@ -261,10 +261,11 @@ func callerID(ctx context.Context) (uuid.UUID, error) {
 }
 
 // requireID rejects the nil UUID, which is syntactically valid in a path but
-// can never identify a stored resource.
-func requireID(id uuid.UUID, name string) error {
+// can never identify a stored resource. Treat it as a missing resource rather
+// than malformed input, matching the identity and files modules.
+func requireID(id uuid.UUID) error {
 	if id == uuid.Nil {
-		return apperror.NewBadRequest("invalid " + name)
+		return apperror.NewNotFound("resource not found")
 	}
 	return nil
 }

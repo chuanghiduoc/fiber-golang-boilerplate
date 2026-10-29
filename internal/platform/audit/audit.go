@@ -113,9 +113,18 @@ type TxRecorder interface {
 	RecordTx(ctx context.Context, tx pgx.Tx, event Event) error
 }
 
-// IDRecorder persists a pre-write intent event and returns its row ID.
+// IntentRef identifies a persisted pre-write intent row. CreatedAt is part of
+// the audit_events primary key, so completion needs both values to prune the
+// update to a single monthly partition; an id-only lookup would scan every
+// partition.
+type IntentRef struct {
+	ID        uuid.UUID
+	CreatedAt time.Time
+}
+
+// IDRecorder persists a pre-write intent event and returns its row identity.
 type IDRecorder interface {
-	RecordID(ctx context.Context, event Event) (uuid.UUID, error)
+	RecordID(ctx context.Context, event Event) (IntentRef, error)
 }
 
 // Completion describes the observed outcome of a guarded request.
@@ -131,7 +140,7 @@ type Completion struct {
 
 // CompletionRecorder completes a started HTTP intent row.
 type CompletionRecorder interface {
-	Complete(ctx context.Context, id uuid.UUID, completion Completion) error
+	Complete(ctx context.Context, intent IntentRef, completion Completion) error
 }
 
 // MetadataLocalKey is the Fiber locals key handlers may set to a

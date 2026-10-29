@@ -52,3 +52,14 @@ func TestRegistryRequiresExporterAndEraser(t *testing.T) {
 	}()
 	r.Register(Provider{Name: "files", Exporter: fakeProvider{"files"}})
 }
+
+func TestBudgetUsesCamelCaseJSONFields(t *testing.T) {
+	raw, err := json.Marshal(Budget{RowLimit: 10, ByteLimit: 20, Returned: 3, Truncated: true})
+	if err != nil {
+		t.Fatalf("marshal budget: %v", err)
+	}
+	want := `{"rowLimit":10,"byteLimit":20,"returned":3,"truncated":true}`
+	if string(raw) != want {
+		t.Fatalf("budget json = %s, want %s", raw, want)
+	}
+}

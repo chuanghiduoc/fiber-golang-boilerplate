@@ -37,7 +37,7 @@ func TestPasswordReset_DeletesPendingMFAEnrollment(t *testing.T) {
 	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "reset-mfa@example.com",
 		testutil.MemberOptions{Password: pgfixtures.Passphrase})
 
-	_, err := e.MFA.EnrollTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase)
+	_, err := e.MFA.EnrollTOTP(ctx, user.UserID, core.ReauthProof{SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), scalar[int64](t, e.Pool,
 		`SELECT count(*) FROM mfa_factors WHERE user_id = $1 AND confirmed_at IS NULL`, user.UserID))
@@ -58,7 +58,7 @@ func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
 	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "reenroll@example.com",
 		testutil.MemberOptions{Password: pgfixtures.Passphrase})
 
-	first, err := e.MFA.EnrollTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase)
+	first, err := e.MFA.EnrollTOTP(ctx, user.UserID, core.ReauthProof{SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase})
 	require.NoError(t, err)
 	firstSecret := enrollmentSecret(t, first)
 
@@ -71,7 +71,7 @@ func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
 		VALUES ($1, 'totp', 'sealed:stale-secret', NOW() - INTERVAL '16 minutes')`, user.UserID)
 	require.NoError(t, err)
 
-	second, err := e.MFA.EnrollTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase)
+	second, err := e.MFA.EnrollTOTP(ctx, user.UserID, core.ReauthProof{SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase})
 	require.NoError(t, err)
 	secondSecret := enrollmentSecret(t, second)
 	require.NotEqual(t, firstSecret, secondSecret, "re-enrollment must generate a new pending secret")
@@ -85,13 +85,13 @@ func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
 
 	firstCode, err := totp.Code(firstSecret, time.Now())
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, firstCode)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: first.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: firstCode})
 	require.Error(t, err, "the replaced secret must no longer confirm")
 	assert.Equal(t, "auth.mfa_invalid_code", pgfixtures.AppCode(err))
 
 	secondCode, err := totp.Code(secondSecret, time.Now())
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, secondCode)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: second.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: secondCode})
 	require.NoError(t, err)
 }
 
@@ -109,10 +109,13 @@ func TestMFAConfirm_ExpiredEnrollmentInDatabase(t *testing.T) {
 		VALUES ($1, 'totp', $2, NOW() - INTERVAL '16 minutes')`,
 		user.UserID, "sealed:"+secret)
 	require.NoError(t, err)
+	var factorID uuid.UUID
+	require.NoError(t, e.Pool.QueryRow(ctx,
+		`SELECT id FROM mfa_factors WHERE user_id = $1`, user.UserID).Scan(&factorID))
 
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: factorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: code})
 	require.Error(t, err)
 	assert.Equal(t, "auth.mfa_enrollment_expired", pgfixtures.AppCode(err))
 }
@@ -134,10 +137,11 @@ func TestMFAResetTOTP_PlatformRecovery(t *testing.T) {
 		t.Fatalf("create acme membership: %v", err)
 	}
 
-	secret := pgfixtures.EnrollTOTPSecret(t, e, user.UserID)
+	totpFixture := pgfixtures.EnrollTOTP(t, e, user.UserID)
+	secret := totpFixture.Secret
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, uuid.Nil, pgfixtures.Passphrase, code)
+	_, err = e.MFA.ConfirmTOTP(ctx, user.UserID, core.MFACodeChange{FactorID: totpFixture.FactorID, SessionID: uuid.Nil, CurrentPassword: pgfixtures.Passphrase, Code: code})
 	require.NoError(t, err)
 
 	// Confirmation bumped the token version; both post-enable sessions carry

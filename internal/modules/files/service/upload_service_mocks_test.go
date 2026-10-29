@@ -80,11 +80,10 @@ func (p *recordingPublisher) Publish(_ context.Context, event events.Event) erro
 // ---------------------------------------------------------------------------
 
 type mockFileRepo struct {
-	files  map[uuid.UUID]*File
-	nextID int64
-	// quotaLocks counts LockQuota calls; the usage totals are computed from
-	// files, so tests seed rows instead of stubbing them.
-	quotaLocks int
+	files       map[uuid.UUID]*File
+	nextID      int64
+	usageScopes []QuotaScope
+	lockScopes  []QuotaScope
 }
 
 // scoped mirrors the repository's tenant predicate so service tests cannot
@@ -204,22 +203,30 @@ func (m *mockFileRepo) AdminFileStats(ctx context.Context) (FileStats, error) {
 	return stats, nil
 }
 
-func (m *mockFileRepo) LockQuota(context.Context) error {
-	m.quotaLocks++
-	return nil
+func (m *mockFileRepo) StorageUsage(ctx context.Context, userID uuid.UUID, scope QuotaScope) (QuotaUsage, error) {
+	m.usageScopes = append(m.usageScopes, scope)
+	return m.storageUsage(ctx, userID, scope), nil
 }
 
-func (m *mockFileRepo) StorageUsage(ctx context.Context, userID uuid.UUID) (tenantBytes, userBytes int64, err error) {
+func (m *mockFileRepo) LockStorageUsage(ctx context.Context, userID uuid.UUID, scope QuotaScope) (QuotaUsage, error) {
+	m.lockScopes = append(m.lockScopes, scope)
+	return m.storageUsage(ctx, userID, scope), nil
+}
+
+func (m *mockFileRepo) storageUsage(ctx context.Context, userID uuid.UUID, scope QuotaScope) QuotaUsage {
+	var usage QuotaUsage
 	for _, f := range m.files {
 		if !m.scoped(ctx, f) {
 			continue
 		}
-		tenantBytes += f.Size
-		if f.UserID == userID {
-			userBytes += f.Size
+		if scope.Tenant {
+			usage.TenantBytes += f.Size
+		}
+		if scope.User && f.UserID == userID {
+			usage.UserBytes += f.Size
 		}
 	}
-	return tenantBytes, userBytes, nil
+	return usage
 }
 
 // ---------------------------------------------------------------------------

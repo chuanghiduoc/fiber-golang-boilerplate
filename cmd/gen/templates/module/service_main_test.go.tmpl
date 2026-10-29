@@ -3,8 +3,6 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os"
 	"testing"
 
 	"github.com/google/uuid"
@@ -23,15 +21,18 @@ var (
 	testUserID  = uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000c1")
 )
 
-// TestMain registers the module catalog: these tests do not build the app,
-// and unregistered permissions or error codes would fail closed.
-func TestMain(m *testing.M) {
-	if err := {{.M.Ident}}catalog.Register(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+// testCatalog is the module's permission catalog without the process-wide
+// registry: tests construct the same injected instance production uses.
+var testCatalog = func() *authz.Catalog {
+	c := authz.NewCatalog()
+	if err := c.Add(authz.Provider{Owner: {{.M.Ident}}catalog.Owner, Grants: {{.M.Ident}}catalog.Permissions()}); err != nil {
+		panic(err)
 	}
-	os.Exit(m.Run())
-}
+	c.Seal()
+	return c
+}()
+
+func testAuthorizer() authz.Authorizer { return authz.NewAuthorizer(testCatalog) }
 
 // adminContext is a request context for an administrator of tenantID.
 func adminContext(tenantID uuid.UUID) context.Context {

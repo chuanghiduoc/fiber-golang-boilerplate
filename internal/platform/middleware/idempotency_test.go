@@ -246,7 +246,7 @@ func TestIdempotency_BodyBindingRejectsDifferentPayload(t *testing.T) {
 	}
 }
 
-func TestIdempotency_MultipartSkipsBodyBinding(t *testing.T) {
+func TestIdempotency_MultipartBindsBody(t *testing.T) {
 	mem := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = mem.Close() })
 
@@ -266,15 +266,18 @@ func TestIdempotency_MultipartSkipsBodyBinding(t *testing.T) {
 	}
 
 	second, body := doIdempotencyRequestWithContentType(t, app, http.MethodPost, "/test", "multipart-key", secondBody, secondType)
-	if second.StatusCode != fiber.StatusCreated || body != "call-1" {
-		t.Fatalf("multipart replay = %d %q, want 201 call-1", second.StatusCode, body)
+	if second.StatusCode != fiber.StatusUnprocessableEntity {
+		t.Fatalf("multipart mismatch = %d %q, want 422", second.StatusCode, body)
+	}
+	if !strings.Contains(body, "different request body") {
+		t.Errorf("multipart mismatch body = %q, want a body-mismatch problem", body)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("handler calls = %d, want 1 (multipart bodies skip binding)", got)
+		t.Fatalf("handler calls = %d, want 1 (multipart bodies bind to the key)", got)
 	}
 }
 
-func TestIdempotency_LargeBodySkipsBodyBinding(t *testing.T) {
+func TestIdempotency_LargeBodyBindsBody(t *testing.T) {
 	mem := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = mem.Close() })
 
@@ -285,8 +288,9 @@ func TestIdempotency_LargeBodySkipsBodyBinding(t *testing.T) {
 		return c.Status(fiber.StatusCreated).SendString("call-" + strconv.Itoa(int(n)))
 	})
 
-	firstBody := strings.Repeat("a", idempotencyMaxBodyHashSize+1)
-	secondBody := strings.Repeat("b", idempotencyMaxBodyHashSize+1)
+	const overOneMiB = 1<<20 + 1
+	firstBody := strings.Repeat("a", overOneMiB)
+	secondBody := strings.Repeat("b", overOneMiB)
 
 	first, _ := doIdempotencyRequest(t, app, http.MethodPost, "/test", "large-key", firstBody)
 	if first.StatusCode != fiber.StatusCreated {
@@ -294,11 +298,14 @@ func TestIdempotency_LargeBodySkipsBodyBinding(t *testing.T) {
 	}
 
 	second, body := doIdempotencyRequest(t, app, http.MethodPost, "/test", "large-key", secondBody)
-	if second.StatusCode != fiber.StatusCreated || body != "call-1" {
-		t.Fatalf("large-body replay = %d %q, want 201 call-1", second.StatusCode, body)
+	if second.StatusCode != fiber.StatusUnprocessableEntity {
+		t.Fatalf("large-body mismatch = %d %q, want 422", second.StatusCode, body)
+	}
+	if !strings.Contains(body, "different request body") {
+		t.Errorf("large-body mismatch body = %q, want a body-mismatch problem", body)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("handler calls = %d, want 1 (large bodies skip binding)", got)
+		t.Fatalf("handler calls = %d, want 1 (large bodies bind to the key)", got)
 	}
 }
 
@@ -978,5 +985,71 @@ func TestIdempotency_KeysDoNotContainBodyOrPassword(t *testing.T) {
 		if !strings.HasPrefix(key, "idempotency:POST:/test:tenant="+uuid.Nil.String()+"::0.0.0.0:") {
 			t.Errorf("cache key %q is not scoped by method, path, tenant, and identity", key)
 		}
+	}
+}
+
+func TestIdempotency_StreamedBodyIsSpooledAndPreserved(t *testing.T) {
+	mem := cache.NewMemoryCache()
+	t.Cleanup(func() { _ = mem.Close() })
+
+	app := fiber.New(fiber.Config{
+		BodyLimit:         1 << 20,
+		StreamRequestBody: true,
+	})
+	var calls atomic.Int32
+	var streamed atomic.Bool
+	var got atomic.Value
+	app.Post("/test", Idempotency(mem), func(c fiber.Ctx) error {
+		calls.Add(1)
+		streamed.Store(c.Request().IsBodyStream())
+		got.Store(string(c.Body()))
+		return c.Status(fiber.StatusCreated).SendString("created")
+	})
+
+	body := strings.Repeat("x", idempotencyBodyMemoryLimit*4)
+	first, firstBody := doIdempotencyRequest(t, app, http.MethodPost, "/test", "streamed-key", body)
+	second, secondBody := doIdempotencyRequest(t, app, http.MethodPost, "/test", "streamed-key", body)
+
+	if calls.Load() != 1 {
+		t.Fatalf("handler calls = %d, want 1", calls.Load())
+	}
+	if !streamed.Load() {
+		t.Fatal("test did not exercise a streamed request body")
+	}
+	if got, _ := got.Load().(string); got != body {
+		t.Fatalf("handler body length = %d, want %d", len(got), len(body))
+	}
+	if first.StatusCode != fiber.StatusCreated || second.StatusCode != fiber.StatusCreated {
+		t.Fatalf("statuses = %d, %d; want 201, 201", first.StatusCode, second.StatusCode)
+	}
+	if firstBody != "created" || secondBody != "created" {
+		t.Fatalf("bodies = %q, %q; want created, created", firstBody, secondBody)
+	}
+	if second.Header.Get("Idempotent-Replayed") != "true" {
+		t.Fatal("second streamed request was not replayed")
+	}
+}
+
+func TestIdempotency_SmallStreamedBodyIsPreserved(t *testing.T) {
+	mem := cache.NewMemoryCache()
+	t.Cleanup(func() { _ = mem.Close() })
+
+	app := fiber.New(fiber.Config{
+		BodyLimit:         1 << 20,
+		StreamRequestBody: true,
+	})
+	var got atomic.Value
+	app.Post("/test", Idempotency(mem), func(c fiber.Ctx) error {
+		got.Store(string(c.Body()))
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	body := `{"read":true}`
+	resp, _ := doIdempotencyRequestWithContentType(t, app, http.MethodPost, "/test", "small-body-key", body, "application/merge-patch+json")
+	if resp.StatusCode != fiber.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+	if got, _ := got.Load().(string); got != body {
+		t.Fatalf("handler body = %q, want %q", got, body)
 	}
 }

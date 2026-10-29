@@ -30,6 +30,9 @@ func NewTenantPurger(db apikeyssqlc.DBTX) *TenantPurger {
 func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	ctx = tenant.WithID(ctx, tenantID)
 	for {
+		if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+			return err
+		}
 		deleted, err := p.q.DeleteTenantAPIKeysBatch(ctx, apikeyssqlc.DeleteTenantAPIKeysBatchParams{
 			TenantID:  tenantID,
 			BatchSize: tenancycontracts.PurgeBatchSize,

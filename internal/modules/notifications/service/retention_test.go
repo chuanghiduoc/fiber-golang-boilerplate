@@ -40,6 +40,14 @@ func TestRetentionPurgeErrorFails(t *testing.T) {
 	require.Error(t, NewRetentionPurger(repo, 180).HandleJob(context.Background(), nil))
 }
 
+// A repository deadline is not the retention budget expiring. Swallowing it
+// would report a failed purge as success and hide a broken database path.
+func TestRetentionPurgeRepositoryDeadlineFails(t *testing.T) {
+	repo := &fakeRetentionRepo{err: context.DeadlineExceeded}
+	err := NewRetentionPurger(repo, 180).HandleJob(context.Background(), nil)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
 func TestRetentionPurgeCanceledJobFails(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

@@ -50,3 +50,27 @@ func TestAPIKeyResponseUsesUUIDStrings(t *testing.T) {
 		t.Fatal("expiresAt must always be serialized: every key expires")
 	}
 }
+
+func TestUpdateAPIKeySchemaConstrainsNameAndScopes(t *testing.T) {
+	nameSchema := (OptionalString{}).Schema(nil)
+	if nameSchema.MinLength == nil || *nameSchema.MinLength != 1 {
+		t.Fatalf("name MinLength = %v, want 1", nameSchema.MinLength)
+	}
+	if nameSchema.MaxLength == nil || *nameSchema.MaxLength != 255 {
+		t.Fatalf("name MaxLength = %v, want 255", nameSchema.MaxLength)
+	}
+	if !nameSchema.Nullable {
+		t.Fatal("name schema must remain nullable for merge-patch decoding")
+	}
+
+	scopesSchema := (OptionalStrings{}).Schema(nil)
+	if scopesSchema.MinItems == nil || *scopesSchema.MinItems != 1 {
+		t.Fatalf("scopes MinItems = %v, want 1", scopesSchema.MinItems)
+	}
+	if scopesSchema.MaxItems == nil || *scopesSchema.MaxItems != 100 {
+		t.Fatalf("scopes MaxItems = %v, want 100", scopesSchema.MaxItems)
+	}
+	if !scopesSchema.Nullable {
+		t.Fatal("scopes schema must remain nullable for merge-patch decoding")
+	}
+}

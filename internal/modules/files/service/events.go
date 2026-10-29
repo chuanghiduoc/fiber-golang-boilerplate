@@ -47,12 +47,15 @@ func fileRestored(file *File) filescontracts.FileRestored {
 // publishEvent publishes one domain event through the transaction, so the
 // event (and every durable subscriber job, such as webhook fan-out) commits
 // or rolls back with the mutation. The actor and request id come from ctx.
-func publishEvent(ctx context.Context, publisher EventPublisher, eventType string, dataVersion int, tenantID uuid.UUID, data any) error {
+func publishEvent(ctx context.Context, publisher EventPublisher, eventType string, dataVersion int, tenantID uuid.UUID, subjectUserIDs []uuid.UUID, data any) error {
 	event, err := events.NewEvent(eventType, dataVersion, data)
 	if err != nil {
 		return fmt.Errorf("build %s event: %w", eventType, err)
 	}
 	event.TenantID = tenantID
+	if len(subjectUserIDs) > 0 {
+		event.SubjectUserIDs = append([]uuid.UUID(nil), subjectUserIDs...)
+	}
 	if err := publisher.Publish(ctx, event); err != nil {
 		slog.Error("failed to publish file event",
 			slog.String("event", eventType),

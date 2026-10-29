@@ -5,7 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"strings"
+	"sync"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/gofiber/fiber/v3"
@@ -15,33 +15,60 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
-// installErrorHooks points huma's own error constructors at the injected
-// catalog and i18n bundle. huma exposes these as package variables, so a
-// second API built in the same process (tests) replaces them with its own
-// equivalent instance.
-func installErrorHooks(catalog *apperror.Catalog, bundle *i18n.Bundle) {
-	if catalog == nil {
-		catalog = apperror.PlatformCatalog()
-	}
-	huma.NewError = func(status int, msg string, errs ...error) huma.StatusError {
-		appErr := apperror.NewForStatus(status, msg)
-		problem := catalog.Problem(appErr, "", "")
-		problem.Errors = humaFieldErrors(errs)
-		return &problem
-	}
-	huma.NewErrorWithContext = func(ctx huma.Context, status int, msg string, errs ...error) huma.StatusError {
-		appErr := apperror.NewForStatus(status, msg)
-		problem := catalog.Problem(appErr, requestctx.RequestID(ctx.Context()), ctx.URL().Path)
-		problem.Errors = localizeFieldErrorsWith(bundle, i18n.LocaleFromContext(ctx.Context()), humaFieldErrors(errs))
-		if status >= http.StatusInternalServerError {
-			slog.ErrorContext(ctx.Context(), "huma request failed",
-				slog.String("path", ctx.URL().Path),
-				slog.String("request_id", requestctx.RequestID(ctx.Context())),
-				slog.Any("cause", errors.Join(errs...)),
-			)
+// errorRenderer is the per-request catalog/i18n pair. huma's error
+// constructors are package-global, so the hook installed below reads this from
+// the request context instead of closing over one API's dependencies.
+type errorRenderer struct {
+	catalog *apperror.Catalog
+	bundle  *i18n.Bundle
+}
+
+type errorRendererKey struct{}
+
+func withErrorRenderer(ctx context.Context, renderer *errorRenderer) context.Context {
+	return context.WithValue(ctx, errorRendererKey{}, renderer)
+}
+
+func errorRendererFrom(ctx context.Context) *errorRenderer {
+	renderer, _ := ctx.Value(errorRendererKey{}).(*errorRenderer)
+	return renderer
+}
+
+var installErrorHooksOnce sync.Once
+
+// installErrorHooks installs huma's global constructors exactly once. Each API
+// injects its own renderer through the operation middleware, so a second API in
+// the same process (tests) cannot replace the first API's catalog or locale.
+func installErrorHooks() {
+	installErrorHooksOnce.Do(func() {
+		huma.NewError = func(status int, msg string, errs ...error) huma.StatusError {
+			appErr := apperror.NewForStatus(status, msg)
+			problem := apperror.PlatformCatalog().Problem(appErr, "", "")
+			problem.Errors = humaFieldErrors(errs)
+			return &problem
 		}
-		return &problem
-	}
+		huma.NewErrorWithContext = func(ctx huma.Context, status int, msg string, errs ...error) huma.StatusError {
+			catalog := apperror.PlatformCatalog()
+			var bundle *i18n.Bundle
+			if renderer := errorRendererFrom(ctx.Context()); renderer != nil {
+				if renderer.catalog != nil {
+					catalog = renderer.catalog
+				}
+				bundle = renderer.bundle
+			}
+			appErr := apperror.NewForStatus(status, msg)
+			problem := catalog.Problem(appErr, requestctx.RequestID(ctx.Context()), ctx.URL().Path)
+			problem.Errors = localizeFieldErrorsWith(bundle, i18n.LocaleFromContext(ctx.Context()), humaFieldErrors(errs))
+			if status >= http.StatusInternalServerError {
+				slog.ErrorContext(ctx.Context(), "huma request failed",
+					slog.String("path", ctx.URL().Path),
+					slog.String("request_id", requestctx.RequestID(ctx.Context())),
+					slog.Any("cause", errors.Join(errs...)),
+				)
+			}
+			return &problem
+		}
+	})
 }
 
 // errorFor converts anything a handler returns into the one RFC 9457 shape.
@@ -145,7 +172,6 @@ func humaFieldErrors(errs []error) []apperror.FieldError {
 			field.Path = d.Location
 			field.Message = d.Message
 		}
-		field.Path = strings.TrimPrefix(field.Path, "body.")
 		out = append(out, field)
 	}
 	return out

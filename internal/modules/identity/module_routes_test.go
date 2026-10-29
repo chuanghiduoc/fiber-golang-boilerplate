@@ -14,6 +14,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 )
 
@@ -51,12 +52,15 @@ var expectedOperations = []operationSpec{
 	{http.MethodDelete, "/api/v1/me/sessions", "deleteMySessions"},
 	{http.MethodGet, "/api/v1/me/mfa", "getMyMFA"},
 	{http.MethodPost, "/api/v1/me/mfa/totp", "startTOTPEnrollment"},
+	{http.MethodGet, "/api/v1/me/mfa/totp/{factorId}", "getTOTPEnrollment"},
 	{http.MethodPost, "/api/v1/me/mfa/totp/{factorId}/confirm", "confirmTOTPEnrollment"},
 	{http.MethodPost, "/api/v1/me/mfa/{factorId}/disable", "disableMFAFactor"},
 	{http.MethodPost, "/api/v1/me/mfa/recovery-codes", "createRecoveryCodes"},
 	{http.MethodPost, "/api/v1/me/mfa/step-up", "stepUpMFA"},
 	{http.MethodPost, "/api/v1/me/mfa/passkeys/options", "startPasskeyRegistration"},
 	{http.MethodPost, "/api/v1/me/mfa/passkeys", "createPasskey"},
+	{http.MethodGet, "/api/v1/me/mfa/passkeys", "listPasskeys"},
+	{http.MethodGet, "/api/v1/me/mfa/passkeys/{passkeyId}", "getPasskey"},
 	{http.MethodDelete, "/api/v1/me/mfa/passkeys/{passkeyId}", "deletePasskey"},
 	{http.MethodGet, "/api/v1/me/data-exports", "listMyDataExports"},
 	{http.MethodPost, "/api/v1/me/data-exports", "createDataExport"},
@@ -71,6 +75,7 @@ var expectedOperations = []operationSpec{
 	{http.MethodPatch, "/api/v1/members/{memberId}", "updateMember"},
 	{http.MethodDelete, "/api/v1/members/{memberId}", "deleteMember"},
 	{http.MethodPost, "/api/v1/members/{memberId}/erasure-requests", "createMemberErasureRequest"},
+	{http.MethodGet, "/api/v1/members/{memberId}/erasure-requests/{requestId}", "getMemberErasureRequest"},
 	{http.MethodGet, "/api/v1/stats", "getTenantStats"},
 
 	{http.MethodGet, "/api/v1/invitations", "listInvitations"},
@@ -163,6 +168,8 @@ func TestRegisterRoutesPolicies(t *testing.T) {
 	}{
 		{id: "register", public: true, idem: true, tier1: "auth.registered"},
 		{id: "login", public: true, noStore: true, guard: "auth.login"},
+		{id: "startGoogleLogin", public: true, noStore: true},
+		{id: "completeGoogleLogin", public: true, noStore: true, tier1: "auth.google_login"},
 		{id: "deleteMySessions", jwtOnly: true, guard: "auth.logout_all", permitted: true},
 		{id: "updateMyProfile", idem: true, tier1: "user.profile_updated", permitted: true},
 		{id: "createDataExport", idem: true, guard: "data_export.requested", permitted: true},
@@ -198,7 +205,11 @@ func TestRegisterRoutesPolicies(t *testing.T) {
 	require.Equal(t, "platform:tenants:read", string(tenants.Policy.Permission))
 
 	memberUpdate := byID["updateMember"]
-	require.Len(t, memberUpdate.Policy.AnyOf, 2)
+	require.ElementsMatch(t, []authz.Permission{
+		authz.PermissionAdminUsersRole,
+		authz.PermissionAdminUsersBan,
+		authz.PermissionAdminUsersDelete,
+	}, memberUpdate.Policy.AnyOf)
 }
 
 func TestModuleImplementsRouteProvider(t *testing.T) {

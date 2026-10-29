@@ -104,12 +104,15 @@ Policy shorthand in the tables: `Public` / `Permission` / `AnyOf` / `JWT-only`
 | `DELETE /api/v1/me/sessions` | `deleteMySessions` | `sessions:revoke`, JWT-only, normal, Guard(`auth.logout_all`) | → `204` | `POST /auth/logout-all` |
 | `GET /api/v1/me/mfa` | `getMyMFA` | `mfa:read`, JWT-only, relaxed, No-store | → `200 MFAStatusResponse` | `GET /auth/mfa/status` |
 | `POST /api/v1/me/mfa/totp` | `startTOTPEnrollment` | `mfa:write`, JWT-only, normal, No-store, Tier1(`auth.mfa_enrollment_started`) | `{currentPassword?}` → `201 Location /me/mfa/totp/{factorId}`, `{otpauthUri}` | `POST /auth/mfa/totp/enroll` |
+| `GET /api/v1/me/mfa/totp/{factorId}` | `getTOTPEnrollment` | `mfa:read`, JWT-only, relaxed, No-store | → `200 MFAFactorResponse` (secret-free; the `Location` target of enrollment) | new (status resource) |
 | `POST /api/v1/me/mfa/totp/{factorId}/confirm` | `confirmTOTPEnrollment` | `mfa:write`, JWT-only, normal, No-store, Tier1(`auth.mfa_enabled`) | `{code,currentPassword?}` → `200 MFAConfirmResponse` (recovery codes + reissued tokens) | `POST /auth/mfa/totp/confirm` |
 | `POST /api/v1/me/mfa/{factorId}/disable` | `disableMFAFactor` | `mfa:write`, JWT-only, normal, Tier1(`auth.mfa_disabled`) | `{code}` → `204` (custom method: DELETE has no defined body semantics, RFC 9110 §9.3.5) | `POST /auth/mfa/disable` |
-| `POST /api/v1/me/mfa/recovery-codes` | `createRecoveryCodes` | `mfa:write`, JWT-only, normal, No-store, Tier1(`auth.mfa_recovery_codes_regenerated`) | `{code}` → `201 RecoveryCodesResponse` | `POST /auth/mfa/recovery-codes/regenerate` |
+| `POST /api/v1/me/mfa/recovery-codes` | `createRecoveryCodes` | `mfa:write`, JWT-only, normal, No-store, Tier1(`auth.mfa_recovery_codes_regenerated`) | `{code}` → `200 RecoveryCodesResponse` (no addressable resource to locate) | `POST /auth/mfa/recovery-codes/regenerate` |
 | `POST /api/v1/me/mfa/step-up` | `stepUpMFA` | `mfa:write`, JWT-only, normal, No-store, Tier1(`auth.mfa_step_up`) | `{code}` or `{passkey}` → `200 {verifiedAt}` | `POST /auth/mfa/step-up` |
 | `POST /api/v1/me/mfa/passkeys/options` | `startPasskeyRegistration` | `mfa:write`, JWT-only, normal, No-store | → `200 PublicKeyCredentialCreationOptions` | new (passkey enrollment) |
-| `POST /api/v1/me/mfa/passkeys` | `createPasskey` | `mfa:write`, JWT-only, normal, No-store, Tier1(`auth.passkey_registered`) | attestation → `201 PasskeyResponse` | new (passkey enrollment) |
+| `POST /api/v1/me/mfa/passkeys` | `createPasskey` | `mfa:write`, JWT-only, normal, No-store, Tier1(`auth.passkey_registered`) | attestation → `201 Location /me/mfa/passkeys/{passkeyId}`, `PasskeyResponse` | new (passkey enrollment) |
+| `GET /api/v1/me/mfa/passkeys` | `listPasskeys` | `mfa:read`, JWT-only, relaxed, No-store | → `200 PasskeyListResponse` | new (passkey status) |
+| `GET /api/v1/me/mfa/passkeys/{passkeyId}` | `getPasskey` | `mfa:read`, JWT-only, relaxed, No-store | → `200 PasskeyResponse`; another owner is `404` | new (passkey status) |
 | `DELETE /api/v1/me/mfa/passkeys/{passkeyId}` | `deletePasskey` | `mfa:write`, JWT-only, normal, Tier1(`auth.passkey_deleted`) | → `204` | new (passkey enrollment) |
 | `GET /api/v1/me/api-keys` | `listMyAPIKeys` | `api_keys:read`, relaxed | → `200 pagination.List[APIKeyResponse]` | `GET /admin/api-keys` |
 | `POST /api/v1/me/api-keys` | `createAPIKey` | `api_keys:create`, normal, No-store, Tier1(`api_key.created`) | `{name,scopes,expiresAt?}` → `201 Location`, `{key,...}` | `POST /admin/api-keys` |
@@ -121,7 +124,7 @@ Policy shorthand in the tables: `Public` / `Permission` / `AnyOf` / `JWT-only`
 | `POST /api/v1/me/data-exports` | `createDataExport` | `profile:read`, normal, Idempotent, Guard(`data_export.requested`) | → `202 Location /me/data-exports/{exportId}` | `POST /me/data-exports` |
 | `GET /api/v1/me/data-exports/{exportId}` | `getDataExport` | `profile:read`, relaxed | → `200 DataExportResponse` | `GET /me/data-exports/{id}` |
 | `GET /api/v1/me/data-exports/{exportId}/content` | `getDataExportContent` | `profile:read`, relaxed, No-store | → `200` JSON document | `GET /me/data-exports/{id}/download` |
-| `POST /api/v1/me/erasure-requests` | `createMyErasureRequest` | `profile:write`, JWT-only, normal, Idempotent, Tier1(`user.erasure_requested`) | `{currentPassword}` → `202 Location /me/erasure-requests/{requestId}` | `POST /me/erasure` |
+| `POST /api/v1/me/erasure-requests` | `createMyErasureRequest` | `profile:write`, JWT-only, normal, Idempotent, Tier1(`user.erasure_requested`) | `{currentPassword?}` → `202 Location /me/erasure-requests/{requestId}` | `POST /me/erasure` |
 | `GET /api/v1/me/erasure-requests` | `listMyErasureRequests` | `profile:read`, JWT-only, relaxed | → `200 pagination.List[ErasureRequestResponse]` | new (status resource) |
 | `GET /api/v1/me/erasure-requests/{requestId}` | `getMyErasureRequest` | `profile:read`, JWT-only, relaxed | → `200 ErasureRequestResponse` | new (status resource) |
 
@@ -143,10 +146,12 @@ Policy shorthand in the tables: `Public` / `Permission` / `AnyOf` / `JWT-only`
 |---|---|---|---|---|
 | `GET /api/v1/members` | `listMembers` | `admin:users:read`, relaxed | query `limit,startingAfter,status,role` → `200 pagination.List[MemberResponse]` | `GET /admin/users` and `GET /users` |
 | `GET /api/v1/members/{memberId}` | `getMember` | `admin:users:read`, relaxed | → `200 MemberResponse` | `GET /users/{id}` |
-| `PATCH /api/v1/members/{memberId}` | `updateMember` | AnyOf `admin:users:role`,`admin:users:ban`; normal, Idempotent, ETag/If-Match, merge-patch, Tier1(`admin.user.updated`) | `{roleIds?,status?}` (`active`/`suspended`/`removed` (a ban is `suspended` plus `bannedAt`)) → `200 MemberResponse` | `PUT /admin/users/{id}/role`, `PUT /admin/users/{id}/roles`, `POST /admin/users/{id}/ban`, `POST /admin/users/{id}/unban` |
+| `PATCH /api/v1/members/{memberId}` | `updateMember` | AnyOf `admin:users:role`,`admin:users:ban`,`admin:users:delete`; normal, Idempotent, ETag/If-Match, merge-patch, field-level permission checks, Tier1(`admin.user.updated`) | `{roleIds?,status?}` (`active`/`suspended`/`removed` (a ban is `suspended` plus `bannedAt`)) → `200 MemberResponse` | `PUT /admin/users/{id}/role`, `PUT /admin/users/{id}/roles`, `POST /admin/users/{id}/ban`, `POST /admin/users/{id}/unban` |
 | `DELETE /api/v1/members/{memberId}` | `deleteMember` | `admin:users:delete`, normal, Idempotent, Tier1(`admin.user.removed`) | → `204` | `DELETE /users/{id}` (another id) |
 | `POST /api/v1/members/{memberId}/erasure-requests` | `createMemberErasureRequest` | `admin:users:delete`, JWT-only, normal, Idempotent, Tier1(`admin.user.erasure_requested`) | → `202 Location` | `POST /admin/users/{id}/erasure` |
-| `POST /api/v1/members/{memberId}/notifications` | `createMemberNotification` | `notifications:send`, normal, Idempotent, Guard(`notification.sent`) | `{type,title,body}` → `201 NotificationResponse` or `201 {notification:null,emailQueued}` | `POST /notifications/send` |
+| `GET /api/v1/members/{memberId}/erasure-requests/{requestId}` | `getMemberErasureRequest` | `admin:users:delete`, JWT-only, relaxed | → `200 ErasureRequestResponse` (`requestId` is the member id) | new (status resource) |
+| `POST /api/v1/members/{memberId}/notifications` | `createMemberNotification` | `notifications:send`, normal, Idempotent, Guard(`notification.sent`) | `{type,title,body}` → `201` with `Location /members/{memberId}/notifications/{notificationId}`; `NotificationResponse` or `{notification:null,emailQueued}` | `POST /notifications/send` |
+| `GET /api/v1/members/{memberId}/notifications/{notificationId}` | `getMemberNotification` | `notifications:send`, relaxed | → `200 NotificationResponse` | new (admin read-back) |
 | `GET /api/v1/members/{memberId}/api-keys` | `listMemberAPIKeys` | `admin:api_keys:read`, relaxed | → `200 pagination.List[APIKeyResponse]` | `GET /admin/api-keys?userId=` |
 | `PATCH /api/v1/members/{memberId}/api-keys/{keyId}` | `updateMemberAPIKey` | `admin:api_keys:update`, normal, Idempotent, merge-patch, Tier1(`api_key.updated`) | `{name?,scopes?}` → `200 APIKeyResponse` | `PUT /admin/api-keys/{id}` for another owner |
 | `DELETE /api/v1/members/{memberId}/api-keys/{keyId}` | `deleteMemberAPIKey` | `admin:api_keys:revoke`, normal, Idempotent, Tier1(`api_key.revoked`) | → `204` | `DELETE /admin/api-keys/{id}` for another owner |
@@ -239,6 +244,7 @@ a tenant or a permission:
 |---|---|---|---|
 | `GET /healthz` | `getLiveness` | Public, no rate limit | `200 {status:"up"}` |
 | `GET /readyz` | `getReadiness` | Public, no rate limit | `200` degraded/up or `503` down |
+| `GET /health` | `getHealth` | Public, no rate limit | Alias of `/readyz`; same readiness body/status |
 | `GET /metrics` | `getMetrics` | Public; Bearer `METRICS_AUTH_TOKEN` when configured | `200 text/plain` Prometheus exposition |
 
 ## Removed routes and mechanics

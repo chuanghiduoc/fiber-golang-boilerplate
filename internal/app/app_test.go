@@ -354,6 +354,8 @@ func TestCORSPreflightAllowsIdempotencyKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
 	assert.Contains(t, resp.Header.Get(fiber.HeaderAccessControlAllowHeaders), "Idempotency-Key")
+	assert.NotEmpty(t, resp.Header.Get("X-Request-Id"), "preflight must still be correlated")
+	assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"), "preflight must carry security headers")
 
 	actual, err := http.NewRequest(http.MethodGet, "/api/v1/ping", http.NoBody)
 	require.NoError(t, err)
@@ -365,6 +367,29 @@ func TestCORSPreflightAllowsIdempotencyKey(t *testing.T) {
 		"browser clients must be able to read the replay marker: %q",
 		resp.Header.Get(fiber.HeaderAccessControlExposeHeaders),
 	)
+}
+
+// CORS preflight is answered at the transport layer before routing. An unknown
+// path therefore gets 204 rather than 404: this deliberately does not reveal
+// whether a route exists, and no handler, auth check, or audit row runs.
+func TestCORSPreflightUnknownPathIsHandledBeforeRouting(t *testing.T) {
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"https://app.example.com"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
+	}
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
+
+	preflight, err := http.NewRequest(http.MethodOptions, "/api/v1/does-not-exist", http.NoBody)
+	require.NoError(t, err)
+	preflight.Header.Set(fiber.HeaderOrigin, "https://app.example.com")
+	preflight.Header.Set(fiber.HeaderAccessControlRequestMethod, http.MethodGet)
+
+	resp, err := application.Fiber().Test(preflight)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
+	assert.NotEmpty(t, resp.Header.Get("X-Request-Id"))
+	assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
 }
 
 // Credentialed CORS is enabled only by the refresh-cookie transport; JSON

@@ -14,6 +14,13 @@ SELECT * FROM webauthn_credentials
 WHERE user_id = @user_id
 ORDER BY created_at DESC, id DESC;
 
+-- name: ListPasskeysByUserLimited :many
+-- Export: one bounded page of passkey metadata, newest first.
+SELECT * FROM webauthn_credentials
+WHERE user_id = @user_id
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;
+
 -- name: GetPasskeyByCredentialID :one
 -- Assertions are global: the credential id is unique across users and is the
 -- only value a discoverable login knows before resolving the owner.

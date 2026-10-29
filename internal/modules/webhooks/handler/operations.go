@@ -77,25 +77,25 @@ func inboundSourceEventsPath(id uuid.UUID) string {
 // Page inputs.
 
 type listWebhookEndpointsInput struct {
-	Limit         int    `query:"limit" default:"20" minimum:"1" maximum:"100" doc:"Page size."`
+	Limit         int    `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string `query:"startingAfter" maxLength:"512" doc:"Opaque cursor from the previous page."`
 }
 
 type listWebhookDeliveriesInput struct {
 	EndpointID    uuid.UUID `query:"endpointId" format:"uuid" doc:"Only deliveries of this endpoint."`
 	Status        string    `query:"status" enum:"pending,succeeded,dead" doc:"Only deliveries in this state."`
-	Limit         int       `query:"limit" default:"20" minimum:"1" maximum:"100" doc:"Page size."`
+	Limit         int       `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string    `query:"startingAfter" maxLength:"512" doc:"Opaque cursor from the previous page."`
 }
 
 type listInboundSourcesInput struct {
-	Limit         int    `query:"limit" default:"20" minimum:"1" maximum:"100" doc:"Page size."`
+	Limit         int    `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string `query:"startingAfter" maxLength:"512" doc:"Opaque cursor from the previous page."`
 }
 
 type listInboundSourceEventsInput struct {
 	SourceID      uuid.UUID `path:"sourceId" format:"uuid" doc:"Inbound source ID."`
-	Limit         int       `query:"limit" default:"20" minimum:"1" maximum:"100" doc:"Page size."`
+	Limit         int       `query:"limit" default:"20" doc:"Page size (values outside 1-100 are clamped)."`
 	StartingAfter string    `query:"startingAfter" maxLength:"512" doc:"Opaque cursor from the previous page."`
 }
 

@@ -4,8 +4,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/patch"
 )
 
 const (
@@ -35,8 +33,8 @@ type CreateRoleRequest struct {
 
 // RolePatch is the RFC 7396 merge patch for a tenant role.
 type RolePatch struct {
-	Name        patch.Field[string]   `json:"name,omitempty"`
-	Permissions patch.Field[[]string] `json:"permissions,omitempty"`
+	Name        Optional[string]   `json:"name,omitempty" doc:"Replacement role name."`
+	Permissions Optional[[]string] `json:"permissions,omitempty" doc:"Replacement permission set; null clears it."`
 }
 
 // InviteRequest invites an address into the request tenant.
@@ -52,12 +50,12 @@ type ReplaceMemberRolesRequest struct {
 
 // MemberPatch is the RFC 7396 merge patch for a member's roles and status.
 type MemberPatch struct {
-	RoleIDs patch.Field[[]uuid.UUID] `json:"roleIds,omitempty"`
-	Status  patch.Field[string]      `json:"status,omitempty"`
+	RoleIDs Optional[RoleIDList] `json:"roleIds,omitempty" doc:"Replacement role ids; null or an empty list is rejected."`
+	Status  Optional[string]     `json:"status,omitempty" enum:"active,suspended,removed" doc:"Membership status."`
 }
 
 // TenantPatch is the RFC 7396 merge patch for a platform tenant.
 type TenantPatch struct {
-	Name   patch.Field[string] `json:"name,omitempty"`
-	Status patch.Field[string] `json:"status,omitempty"`
+	Name   Optional[string] `json:"name,omitempty" doc:"Replacement tenant name."`
+	Status Optional[string] `json:"status,omitempty" doc:"Replacement tenant status."`
 }

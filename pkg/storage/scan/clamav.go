@@ -19,6 +19,10 @@ const clamavChunkSize = 32 << 10
 // short line; anything larger is a broken or hostile peer.
 const maxClamdResponseBytes = 8 << 10
 
+// maxEmptyReads matches io.Copy's tolerance for a Reader that keeps returning
+// (0, nil). A broken upload stream must fail the scan instead of spinning.
+const maxEmptyReads = 100
+
 // clamavScanner implements the clamd INSTREAM protocol:
 //
 //	client: "zINSTREAM\0"
@@ -60,9 +64,11 @@ func (s *clamavScanner) Scan(ctx context.Context, r io.Reader, _ int64) (Verdict
 		return VerdictClean, fmt.Errorf("scan: send INSTREAM: %w", err)
 	}
 	buf := make([]byte, clamavChunkSize)
+	emptyReads := 0
 	for {
 		n, readErr := r.Read(buf)
 		if n > 0 {
+			emptyReads = 0
 			var size [4]byte
 			binary.BigEndian.PutUint32(size[:], uint32(n)) // #nosec G115 -- n <= len(buf) = clamavChunkSize (32 KiB)
 			if _, err := conn.Write(size[:]); err != nil {
@@ -70,6 +76,11 @@ func (s *clamavScanner) Scan(ctx context.Context, r io.Reader, _ int64) (Verdict
 			}
 			if _, err := conn.Write(buf[:n]); err != nil {
 				return VerdictClean, fmt.Errorf("scan: send chunk: %w", err)
+			}
+		} else if readErr == nil {
+			emptyReads++
+			if emptyReads >= maxEmptyReads {
+				return VerdictClean, fmt.Errorf("scan: read upload: %w", io.ErrNoProgress)
 			}
 		}
 		if readErr == io.EOF {

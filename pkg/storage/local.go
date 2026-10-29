@@ -15,6 +15,13 @@ type LocalStorage struct {
 	basePath string
 }
 
+const (
+	copyBufferSize = 32 << 10
+	// maxEmptyReads matches io.Copy's tolerance for a Reader that returns
+	// (0, nil) repeatedly. Without it, a broken upload stream spins forever.
+	maxEmptyReads = 100
+)
+
 func NewLocalStorage(basePath string) (*LocalStorage, error) {
 	abs, err := filepath.Abs(basePath)
 	if err != nil {
@@ -82,7 +89,13 @@ func resolveExistingPrefix(fullPath string) (string, error) {
 	}
 }
 
-func (s *LocalStorage) Put(_ context.Context, path string, reader io.Reader, size int64, _ string) error {
+func (s *LocalStorage) Put(ctx context.Context, path string, reader io.Reader, size int64, _ string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	fullPath, err := s.safePath(path)
 	if err != nil {
 		return err
@@ -106,7 +119,7 @@ func (s *LocalStorage) Put(_ context.Context, path string, reader io.Reader, siz
 		_ = os.Remove(tmpName)
 	}
 
-	written, err := io.Copy(f, reader)
+	written, err := copyWithContext(ctx, f, reader)
 	if err != nil {
 		cleanup()
 		return fmt.Errorf("failed to write file: %w", err)
@@ -123,12 +136,53 @@ func (s *LocalStorage) Put(_ context.Context, path string, reader io.Reader, siz
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("failed to close file: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("failed to write file: %w", err)
+	}
 	if err := os.Rename(tmpName, fullPath); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("failed to commit file: %w", err)
 	}
 
 	return nil
+}
+
+// copyWithContext is io.Copy with cancellation between reads. io.Copy alone
+// cannot be interrupted, so a canceled upload would keep consuming disk and
+// delaying handler cleanup until the source reached EOF.
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	buf := make([]byte, copyBufferSize)
+	var written int64
+	emptyReads := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			emptyReads = 0
+			w, writeErr := dst.Write(buf[:n])
+			written += int64(w)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if w != n {
+				return written, io.ErrShortWrite
+			}
+		} else if readErr == nil {
+			emptyReads++
+			if emptyReads >= maxEmptyReads {
+				return written, io.ErrNoProgress
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return written, nil
+			}
+			return written, readErr
+		}
+	}
 }
 
 func (s *LocalStorage) Get(_ context.Context, path string) (io.ReadCloser, error) {

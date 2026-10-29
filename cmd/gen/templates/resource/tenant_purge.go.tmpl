@@ -32,6 +32,9 @@ func New{{.R.Pascal}}TenantPurger(db {{.M.Ident}}sqlc.DBTX) *{{.R.Pascal}}Tenant
 func (p *{{.R.Pascal}}TenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	ctx = tenant.WithID(ctx, tenantID)
 	for {
+		if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+			return err
+		}
 		deleted, err := p.q.DeleteTenant{{.R.Pascal}}Batch(ctx, {{.M.Ident}}sqlc.DeleteTenant{{.R.Pascal}}BatchParams{
 			TenantID:  tenantID,
 			BatchSize: tenancycontracts.PurgeBatchSize,

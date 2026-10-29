@@ -48,7 +48,6 @@ func NewHandler(service featuresservice.Service) *Handler {
 // Register declares every feature-flag operation. Process-wide flag rows live
 // under /platform; tenant admins manage their own targets under /feature-flags.
 func (h *Handler) Register(api *httpapi.API) {
-	prepareRequestBody(api)
 
 	requiredGuard := func(action, resource string) httpapi.AuditPolicy {
 		return httpapi.AuditPolicy{Guard: &httpapi.GuardPolicy{Action: action, Resource: resource}}
@@ -505,5 +504,5 @@ func parseTargetUUID(raw string) (uuid.UUID, error) {
 }
 
 func invalidTargetID() error {
-	return apperror.NewBadRequest("targetId must be tenant, tenant:{tenantId}, user:{userId}, or user:{tenantId}:{userId}")
+	return apperror.NewBadRequest("targetId has an unsupported or invalid format")
 }

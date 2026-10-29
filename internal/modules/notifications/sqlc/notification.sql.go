@@ -290,20 +290,31 @@ func (q *Queries) ListUnreadNotificationsCursor(ctx context.Context, arg ListUnr
 }
 
 const markAllNotificationsRead = `-- name: MarkAllNotificationsRead :execrows
-UPDATE notifications
+WITH batch AS (
+    SELECT id
+    FROM notifications
+    WHERE tenant_id = $1::uuid
+      AND user_id = $2::uuid
+      AND read_at IS NULL
+    ORDER BY created_at, id
+    LIMIT $3::int
+)
+UPDATE notifications AS n
 SET read_at = NOW()
-WHERE tenant_id = $1::uuid
-  AND user_id = $2::uuid
-  AND read_at IS NULL
+FROM batch
+WHERE n.id = batch.id
 `
 
 type MarkAllNotificationsReadParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	UserID   uuid.UUID `json:"user_id"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	UserID    uuid.UUID `json:"user_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
+// Bounded so one request cannot lock an arbitrarily large unread set. The
+// repository repeats the statement until a short batch is returned.
 func (q *Queries) MarkAllNotificationsRead(ctx context.Context, arg MarkAllNotificationsReadParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markAllNotificationsRead, arg.TenantID, arg.UserID)
+	result, err := q.db.Exec(ctx, markAllNotificationsRead, arg.TenantID, arg.UserID, arg.BatchSize)
 	if err != nil {
 		return 0, err
 	}

@@ -38,13 +38,20 @@ func registerPasskeyUser(t *testing.T, e *pgfixtures.Env, email string) *core.Me
 	return member
 }
 
+func passkeyReauthProof(t *testing.T, e *pgfixtures.Env, ctx context.Context, user core.User) core.ReauthProof {
+	t.Helper()
+	pair, err := e.Sessions.Issue(ctx, user.ID, user.TokenVersion, []string{core.AMRPassword})
+	require.NoError(t, err)
+	return core.ReauthProof{SessionID: pair.SessionID, CurrentPassword: testPassphrase}
+}
+
 func TestPasskeyRegistrationLoginAndCounterPersistence(t *testing.T) {
 	e := pgfixtures.NewEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	member := registerPasskeyUser(t, e, "passkey-integration@example.com")
 	authenticator := softauthenticator.New(t, integrationPasskeyRPID, integrationPasskeyOrigin)
 
-	creation, err := e.Passkeys.BeginRegistration(ctx, member.User.ID)
+	creation, err := e.Passkeys.BeginRegistration(ctx, member.User.ID, passkeyReauthProof(t, e, ctx, member.User))
 	require.NoError(t, err)
 	passkey, err := e.Passkeys.FinishRegistration(ctx, member.User.ID, "Laptop",
 		authenticator.Attestation(t, creation.Response.Challenge.String()))
@@ -97,7 +104,7 @@ func TestPasskeySyncedCredentialRecordsSoftwareAMR(t *testing.T) {
 	authenticator.BackupEligible = true
 	authenticator.BackupState = true
 
-	creation, err := e.Passkeys.BeginRegistration(ctx, member.User.ID)
+	creation, err := e.Passkeys.BeginRegistration(ctx, member.User.ID, passkeyReauthProof(t, e, ctx, member.User))
 	require.NoError(t, err)
 	_, err = e.Passkeys.FinishRegistration(ctx, member.User.ID, "Phone",
 		authenticator.Attestation(t, creation.Response.Challenge.String()))
@@ -116,7 +123,7 @@ func TestPasskeyExportListsMetadataOnlyAndErasureDeletes(t *testing.T) {
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	member := registerPasskeyUser(t, e, "passkey-erasure@example.com")
 	authenticator := softauthenticator.New(t, integrationPasskeyRPID, integrationPasskeyOrigin)
-	creation, err := e.Passkeys.BeginRegistration(ctx, member.User.ID)
+	creation, err := e.Passkeys.BeginRegistration(ctx, member.User.ID, passkeyReauthProof(t, e, ctx, member.User))
 	require.NoError(t, err)
 	_, err = e.Passkeys.FinishRegistration(ctx, member.User.ID, "YubiKey",
 		authenticator.Attestation(t, creation.Response.Challenge.String()))

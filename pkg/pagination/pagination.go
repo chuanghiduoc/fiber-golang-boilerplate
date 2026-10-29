@@ -48,14 +48,20 @@ func LimitOffset(page, perPage int) (limit, offset int32) {
 	return clampInt32(perPage), clampInt32(int(off))
 }
 
-// TotalPages calculates total number of pages.
+// TotalPages calculates total number of pages. It saturates at the platform's
+// maximum int instead of overflowing when the row count exceeds what an int
+// can represent (int is 32-bit on some targets).
 func TotalPages(total int64, perPage int) int {
-	if perPage <= 0 {
+	if total <= 0 || perPage <= 0 {
 		return 0
 	}
-	tp := int(total) / perPage
-	if int(total)%perPage != 0 {
-		tp++
+	per := int64(perPage)
+	pages := total / per
+	if total%per != 0 {
+		pages++
 	}
-	return tp
+	if pages > int64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(pages)
 }

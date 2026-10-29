@@ -51,10 +51,10 @@ func (moduleSessions) InvalidatePermissions(context.Context) error { return nil 
 type moduleAudit struct{}
 
 func (moduleAudit) Record(context.Context, audit.Event) error { return nil }
-func (moduleAudit) RecordID(context.Context, audit.Event) (uuid.UUID, error) {
-	return uuid.New(), nil
+func (moduleAudit) RecordID(context.Context, audit.Event) (audit.IntentRef, error) {
+	return audit.IntentRef{ID: uuid.New()}, nil
 }
-func (moduleAudit) Complete(context.Context, uuid.UUID, audit.Completion) error { return nil }
+func (moduleAudit) Complete(context.Context, audit.IntentRef, audit.Completion) error { return nil }
 
 // moduleUploadService is enough of the files service for the upload gate test.
 type moduleUploadService struct{}

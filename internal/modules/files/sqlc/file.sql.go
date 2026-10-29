@@ -14,10 +14,10 @@ import (
 
 const adminFileStats = `-- name: AdminFileStats :one
 SELECT
-    count(*) FILTER (WHERE deleted_at IS NULL)::bigint AS total_files,
-    COALESCE(SUM(size) FILTER (WHERE deleted_at IS NULL), 0)::bigint AS total_file_size
+    count(*)::bigint AS total_files,
+    COALESCE(SUM(size), 0)::bigint AS total_file_size
 FROM files
-WHERE tenant_id = $1
+WHERE tenant_id = $1 AND deleted_at IS NULL
 `
 
 type AdminFileStatsRow struct {
@@ -158,32 +158,6 @@ func (q *Queries) DeleteFile(ctx context.Context, arg DeleteFileParams) (File, e
 		&i.PurgeAttempts,
 		&i.PurgeRetryAfter,
 	)
-	return i, err
-}
-
-const filesStorageUsage = `-- name: FilesStorageUsage :one
-SELECT
-    COALESCE(SUM(size), 0)::bigint AS tenant_bytes,
-    COALESCE(SUM(size) FILTER (WHERE user_id = $1::uuid), 0)::bigint AS user_bytes
-FROM files
-WHERE tenant_id = $2::uuid
-`
-
-type FilesStorageUsageParams struct {
-	UserID   uuid.UUID `json:"user_id"`
-	TenantID uuid.UUID `json:"tenant_id"`
-}
-
-type FilesStorageUsageRow struct {
-	TenantBytes int64 `json:"tenant_bytes"`
-	UserBytes   int64 `json:"user_bytes"`
-}
-
-// Both quotas count trashed rows: a soft-deleted blob still occupies storage.
-func (q *Queries) FilesStorageUsage(ctx context.Context, arg FilesStorageUsageParams) (FilesStorageUsageRow, error) {
-	row := q.db.QueryRow(ctx, filesStorageUsage, arg.UserID, arg.TenantID)
-	var i FilesStorageUsageRow
-	err := row.Scan(&i.TenantBytes, &i.UserBytes)
 	return i, err
 }
 
@@ -401,15 +375,37 @@ func (q *Queries) ListFilesCursor(ctx context.Context, arg ListFilesCursorParams
 	return items, nil
 }
 
-const lockFilesQuota = `-- name: LockFilesQuota :exec
-SELECT pg_advisory_xact_lock(hashtextextended('files.quota:' || $1::uuid, 0))
+const lockTenantQuota = `-- name: LockTenantQuota :exec
+SELECT pg_advisory_xact_lock(
+    hashtextextended('files.quota:' || $1::text, 0)
+)
 `
 
-// Serializes uploads of one tenant for the rest of the metadata transaction,
-// so a concurrent upload cannot read the same free space and also pass.
-func (q *Queries) LockFilesQuota(ctx context.Context, tenantID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, lockFilesQuota, tenantID)
+// Serialize authoritative tenant-quota checks without writing a shared tenant
+// aggregate row. This is taken only when the tenant quota is enabled.
+func (q *Queries) LockTenantQuota(ctx context.Context, tenantID string) error {
+	_, err := q.db.Exec(ctx, lockTenantQuota, tenantID)
 	return err
+}
+
+const lockUserStorageUsage = `-- name: LockUserStorageUsage :one
+INSERT INTO files_storage_usage (tenant_id, user_id, bytes)
+VALUES ($1::uuid, $2::uuid, 0)
+ON CONFLICT ON CONSTRAINT uq_files_storage_usage_tenant_user DO UPDATE
+SET bytes = files_storage_usage.bytes
+RETURNING bytes
+`
+
+type LockUserStorageUsageParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) LockUserStorageUsage(ctx context.Context, arg LockUserStorageUsageParams) (int64, error) {
+	row := q.db.QueryRow(ctx, lockUserStorageUsage, arg.TenantID, arg.UserID)
+	var bytes int64
+	err := row.Scan(&bytes)
+	return bytes, err
 }
 
 const restoreFile = `-- name: RestoreFile :one
@@ -443,4 +439,38 @@ func (q *Queries) RestoreFile(ctx context.Context, arg RestoreFileParams) (File,
 		&i.PurgeRetryAfter,
 	)
 	return i, err
+}
+
+const tenantStorageUsage = `-- name: TenantStorageUsage :one
+SELECT COALESCE(SUM(bytes), 0)::bigint AS bytes
+FROM files_storage_usage
+WHERE tenant_id = $1::uuid
+`
+
+// Tenant usage is the sum of per-user counters, so this is O(users), never
+// O(files), and user-only quota checks never read it.
+func (q *Queries) TenantStorageUsage(ctx context.Context, tenantID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, tenantStorageUsage, tenantID)
+	var bytes int64
+	err := row.Scan(&bytes)
+	return bytes, err
+}
+
+const userStorageUsage = `-- name: UserStorageUsage :one
+SELECT COALESCE((
+    SELECT bytes FROM files_storage_usage
+    WHERE tenant_id = $1::uuid AND user_id = $2::uuid
+), 0)::bigint AS bytes
+`
+
+type UserStorageUsageParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) UserStorageUsage(ctx context.Context, arg UserStorageUsageParams) (int64, error) {
+	row := q.db.QueryRow(ctx, userStorageUsage, arg.TenantID, arg.UserID)
+	var bytes int64
+	err := row.Scan(&bytes)
+	return bytes, err
 }

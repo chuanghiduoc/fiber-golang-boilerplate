@@ -29,6 +29,7 @@ type fakeStore struct {
 
 	acquireResults []bool
 	acquireErrors  []error
+	acquireError   error
 	acquireDefault bool
 	acquireCalls   int
 	releaseCalls   int
@@ -62,6 +63,9 @@ func (s *fakeStore) AcquireLease(context.Context, string, time.Duration) (bool, 
 		err := s.acquireErrors[0]
 		s.acquireErrors = s.acquireErrors[1:]
 		return false, err
+	}
+	if s.acquireError != nil {
+		return false, s.acquireError
 	}
 	if len(s.acquireResults) > 0 {
 		result := s.acquireResults[0]
@@ -374,6 +378,49 @@ func TestSchedulerHeartbeatLossStepsDown(t *testing.T) {
 	defer cancel()
 	s.runLeader(ctx) // returns on the first failed heartbeat, not the poll interval
 	require.Len(t, st.enqueuedJobs(), 1)
+}
+
+func TestSchedulerTransientHeartbeatErrorKeepsLeadership(t *testing.T) {
+	st := newFakeStore()
+	st.acquireErrors = []error{errors.New("temporary database outage")}
+	s := testScheduler(t, st, Spec{Name: "cleanup", Interval: time.Minute, Kind: "maintenance.cleanup"},
+		WithHeartbeatInterval(5*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lost := make(chan struct{}, 1)
+	stop := s.startHeartbeat(ctx, lost, cancel)
+	require.Eventually(t, func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.acquireCalls >= 3
+	}, time.Second, 5*time.Millisecond, "heartbeat should retry after a transient error")
+	stop()
+
+	select {
+	case <-lost:
+		t.Fatal("a transient heartbeat error must not resign leadership")
+	default:
+	}
+}
+
+func TestSchedulerHeartbeatErrorsStepDownBeforeLeaseExpiry(t *testing.T) {
+	st := newFakeStore()
+	st.acquireError = errors.New("database unavailable")
+	s := testScheduler(t, st, Spec{Name: "cleanup", Interval: time.Minute, Kind: "maintenance.cleanup"},
+		WithLeaseTTL(50*time.Millisecond), WithHeartbeatInterval(10*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lost := make(chan struct{}, 1)
+	stop := s.startHeartbeat(ctx, lost, cancel)
+	defer stop()
+
+	select {
+	case <-lost:
+	case <-time.After(time.Second):
+		t.Fatal("repeated heartbeat errors must resign before the lease expires")
+	}
 }
 
 func TestSchedulerLeaseErrorDoesNotRunSchedules(t *testing.T) {

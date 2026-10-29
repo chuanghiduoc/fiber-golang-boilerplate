@@ -253,3 +253,21 @@ func insufficientRank(detail string) error {
 func permissionDenied() error {
 	return apperror.NewCode(apperror.CodePermissionDenied, "insufficient permissions")
 }
+
+// requirePermission checks one effective permission in the request subject.
+// A context without a subject is allowed only for the authz system marker;
+// every other subject-less caller fails closed. Route-level AnyOf checks are
+// not enough when one request can mutate several fields with different grants.
+func requirePermission(ctx context.Context, permission authz.Permission) error {
+	subject, ok := authz.SubjectFromContext(ctx)
+	if !ok {
+		if authz.IsSystemContext(ctx) {
+			return nil
+		}
+		return permissionDenied()
+	}
+	if !subject.Has(permission) {
+		return permissionDenied()
+	}
+	return nil
+}

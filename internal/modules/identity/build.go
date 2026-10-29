@@ -105,7 +105,7 @@ func Build(infra app.Infra, settings Settings, deps Deps) (*Module, error) {
 	stores := identityrepository.NewStores(infra.DB, banHasher)
 	// Security notifications commit their email.send.encrypted job with the
 	// change on the transactional outbox.
-	securityNotifier := identityauthn.NewSecurityNotifier(stores.Tenants, infra.Email)
+	securityNotifier := identityauthn.NewSecurityNotifier(stores.Tenants)
 	// cmd/api always supplies the DATA_ENCRYPTION_KEY codec. Builds without one
 	// (unit/arch tests, an app built with New) derive it from the same
 	// dedicated key; there is no JWT_SECRET fallback.

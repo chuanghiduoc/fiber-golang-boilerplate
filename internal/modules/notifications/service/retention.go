@@ -60,7 +60,7 @@ func (p *RetentionPurger) HandleJob(ctx context.Context, _ json.RawMessage) erro
 			return nil
 		case err == nil:
 			continue
-		case ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded):
+		case ctx.Err() == nil && errors.Is(budgetCtx.Err(), context.DeadlineExceeded):
 			slog.Warn("notification retention budget exhausted; the next run continues")
 			return nil
 		default:

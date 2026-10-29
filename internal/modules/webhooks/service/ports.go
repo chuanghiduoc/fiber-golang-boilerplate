@@ -205,9 +205,9 @@ type UpdateEndpointDraft struct {
 }
 
 // DeliveryDraft creates one delivery row and its first durable job atomically.
-// EventType, DataVersion, ActorType/ActorID, EventCreatedAt, and Payload (the
-// envelope data) describe the event: they are written to webhook_events by
-// the first delivery of EventID and ignored afterwards.
+// EventType, DataVersion, ActorType/ActorID, SubjectUserIDs, EventCreatedAt,
+// and Payload (the envelope data) describe the event: they are written to
+// webhook_events by the first delivery of EventID and ignored afterwards.
 type DeliveryDraft struct {
 	TenantID       uuid.UUID
 	EndpointID     uuid.UUID
@@ -217,6 +217,7 @@ type DeliveryDraft struct {
 	DataVersion    int32
 	ActorType      string
 	ActorID        string
+	SubjectUserIDs []uuid.UUID
 	EventCreatedAt time.Time
 	URL            string
 	Payload        json.RawMessage

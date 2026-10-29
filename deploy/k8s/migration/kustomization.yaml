@@ -7,3 +7,4 @@ kind: Kustomization
 resources:
   - serviceaccount.yaml
   - job.yaml
+  - cronjob.yaml

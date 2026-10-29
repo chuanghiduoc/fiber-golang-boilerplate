@@ -16,8 +16,9 @@ import (
 // the chain in order, so existing middleware (JWT/API-key auth, authz, MFA,
 // idempotency, audit guard, limiters) works unchanged.
 type fiberAdapter struct {
-	app    *fiber.App
-	router fiber.Router
+	app      *fiber.App
+	router   fiber.Router
+	renderer *errorRenderer
 }
 
 var _ huma.Adapter = (*fiberAdapter)(nil)
@@ -32,6 +33,12 @@ func (a *fiberAdapter) Handle(op *huma.Operation, handler func(huma.Context)) {
 		return nil
 	}
 	handlers := make([]any, 0, len(chain)+1)
+	if a.renderer != nil {
+		handlers = append(handlers, func(c fiber.Ctx) error {
+			c.SetContext(withErrorRenderer(c.Context(), a.renderer))
+			return c.Next()
+		})
+	}
 	for _, middleware := range chain {
 		handlers = append(handlers, middleware)
 	}

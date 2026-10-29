@@ -2,9 +2,31 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
+	"strings"
 	"time"
 )
+
+// broadPrivateProxyNetworks are the canonical private aggregates. Trusting one
+// of these is effectively trusting every workload and peer in the private
+// network, so a single spoofed X-Forwarded-For can bypass IP-based limits and
+// poison audit/login lockout state. Narrow pod/service or node CIDRs remain
+// valid.
+var broadPrivateProxyNetworks = []*net.IPNet{
+	mustParseProxyCIDR("10.0.0.0/8"),
+	mustParseProxyCIDR("172.16.0.0/12"),
+	mustParseProxyCIDR("192.168.0.0/16"),
+	mustParseProxyCIDR("fc00::/7"),
+}
+
+func mustParseProxyCIDR(cidr string) *net.IPNet {
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(fmt.Sprintf("invalid built-in proxy CIDR %q: %v", cidr, err))
+	}
+	return network
+}
 
 // APP_ENV values. Only local and test may use the public sample secrets;
 // production additionally enables the production safety rails.
@@ -138,12 +160,19 @@ func validateAppEnv(normalized, raw string) error {
 	}
 }
 
+// normalizeAppEnv canonicalizes APP_ENV before validation. Load, LoadDatabase,
+// and LoadSeed all use the same rule so an upper-case or padded value cannot
+// take a different path in a migration or seed command than it does in the API.
+func normalizeAppEnv(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
 // validate checks the listener, environment, request timeout, and frontend URL.
 func (a AppConfig) validate() error {
 	if a.Port < 1 || a.Port > maxTCPPort {
 		return fmt.Errorf("APP_PORT must be between 1 and %d", maxTCPPort)
 	}
-	if err := validateAppEnv(a.Env, a.Env); err != nil {
+	if err := validateAppEnv(normalizeAppEnv(a.Env), a.Env); err != nil {
 		return err
 	}
 	switch a.EffectiveRole() {
@@ -180,6 +209,10 @@ func (a AppConfig) validateBodyLimits() error {
 
 // validateTrustedProxies requires an explicit, non-wildcard allowlist when
 // proxy headers are trusted; otherwise any client could spoof X-Forwarded-For.
+// Values must be IPs or CIDRs, so a placeholder left in a deployment manifest
+// fails at startup instead of silently trusting nothing or everything. Broad
+// private aggregates are rejected because they trust every peer in the range,
+// not just the ingress hop.
 func (a AppConfig) validateTrustedProxies() error {
 	if !a.TrustProxy {
 		return nil
@@ -189,11 +222,30 @@ func (a AppConfig) validateTrustedProxies() error {
 		return fmt.Errorf("APP_TRUSTED_PROXIES must list at least one IP/CIDR when APP_TRUST_PROXY=true")
 	}
 	for _, proxy := range proxies {
-		if proxy == "0.0.0.0/0" || proxy == "::/0" {
-			return fmt.Errorf("APP_TRUSTED_PROXIES must not trust every address (%s)", proxy)
+		if ip := net.ParseIP(proxy); ip != nil {
+			continue
+		}
+		_, network, err := net.ParseCIDR(proxy)
+		if err != nil {
+			return fmt.Errorf("APP_TRUSTED_PROXIES contains an invalid IP/CIDR (%s)", proxy)
+		}
+		ones, _ := network.Mask.Size()
+		if ones == 0 || containsBroadProxyNetwork(network) {
+			return fmt.Errorf("APP_TRUSTED_PROXIES must not trust every address or a broad private aggregate (%s)", proxy)
 		}
 	}
 	return nil
+}
+
+func containsBroadProxyNetwork(network *net.IPNet) bool {
+	ones, bits := network.Mask.Size()
+	for _, broad := range broadPrivateProxyNetworks {
+		broadOnes, broadBits := broad.Mask.Size()
+		if bits == broadBits && ones <= broadOnes && network.Contains(broad.IP) {
+			return true
+		}
+	}
+	return false
 }
 
 // validateProductionBodyLimit leaves room for multipart framing around the

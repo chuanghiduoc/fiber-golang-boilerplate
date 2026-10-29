@@ -276,6 +276,9 @@ func (s *SessionService) Refresh(ctx context.Context, plain string, admit Admiss
 			return err
 		}
 		if err := tx.Sessions.Touch(ctx, sess.session.ID, userAgentFromContext(ctx), clientIPFromContext(ctx)); err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return refreshInvalid("session has been revoked or expired")
+			}
 			return apperror.NewInternal("failed to update session")
 		}
 		return nil

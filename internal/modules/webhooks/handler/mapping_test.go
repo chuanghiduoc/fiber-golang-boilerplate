@@ -201,6 +201,13 @@ func TestApplyEndpointPatch(t *testing.T) {
 	require.NotNil(t, patched.MaxAttempts)
 	assert.Equal(t, 3, *patched.MaxAttempts)
 	assert.Nil(t, patched.TimeoutMS)
+
+	// status is an enum without an empty value: null restores the documented
+	// active default instead of sending an invalid empty string to the service.
+	nullStatus := applyEndpointPatch(current, dto.UpdateWebhookEndpointRequest{
+		Status: dto.Optional[string]{Present: true, Null: true},
+	})
+	assert.Equal(t, webhookservice.StatusActive, nullStatus.Status)
 }
 
 func TestApplyInboundSourcePatch(t *testing.T) {
@@ -220,4 +227,9 @@ func TestApplyInboundSourcePatch(t *testing.T) {
 	assert.Equal(t, webhookservice.UpdateInboundSourceInput{
 		Name: "Payments", Slug: "stripe", Status: webhookservice.StatusDisabled,
 	}, patched)
+
+	nullStatus := applyInboundSourcePatch(current, dto.UpdateInboundSourceRequest{
+		Status: dto.Optional[string]{Present: true, Null: true},
+	})
+	assert.Equal(t, webhookservice.StatusActive, nullStatus.Status)
 }

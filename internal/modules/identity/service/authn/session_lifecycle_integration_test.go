@@ -128,3 +128,34 @@ func TestSessions_ReuseAfterGraceRevokesSession(t *testing.T) {
 	assert.Equal(t, string(identitycatalog.CodeAuthRefreshInvalid), pgfixtures.AppCode(err))
 	assert.Equal(t, "refresh_reuse", scalar[string](t, e.Pool, `SELECT revoked_reason FROM sessions WHERE id = $1`, pair.SessionID))
 }
+
+// Two tokens rotated inside the same millisecond: uuidv7 ordering then falls
+// back to random bits, so the newer row can carry the smaller id. The grace
+// decision must compare creation time, not id, or a benign concurrent refresh
+// revokes the shared session.
+func TestSessions_ConcurrentRefreshGraceIgnoresUUIDOrder(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	user := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "uuid-order@example.com", testutil.MemberOptions{})
+
+	pair, err := e.Sessions.Issue(ctx, user.UserID, user.TokenVersion, []string{core.AMRPassword})
+	require.NoError(t, err)
+	_, err = e.Sessions.Refresh(ctx, pair.RefreshToken, nil)
+	require.NoError(t, err)
+
+	// The used token gets the larger id, the newer unused token the smaller.
+	_, err = e.Pool.Exec(ctx, `
+		UPDATE refresh_tokens
+		SET id = CASE WHEN used_at IS NULL
+		              THEN '00000000-0000-7000-8000-000000000001'::uuid
+		              ELSE '00000000-0000-7000-8000-000000000002'::uuid END,
+		    created_at = '2026-01-01 00:00:00+00'::timestamptz
+		WHERE session_id = $1`, pair.SessionID)
+	require.NoError(t, err)
+
+	_, err = e.Sessions.Refresh(ctx, pair.RefreshToken, nil)
+	require.Error(t, err)
+	assert.Equal(t, string(identitycatalog.CodeAuthRefreshConcurrent), pgfixtures.AppCode(err))
+	assert.Nil(t, scalar[*time.Time](t, e.Pool, `SELECT revoked_at FROM sessions WHERE id = $1`, pair.SessionID),
+		"a concurrent refresh must not revoke the session")
+}

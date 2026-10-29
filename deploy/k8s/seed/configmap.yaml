@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fiber-boilerplate-seed-config
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: seed-config
+data:
+  # Bootstrap admin identity for the one-shot seed Job only. ADMIN_PASSWORD is
+  # mounted from fiber-boilerplate-seed-secrets. These values must not be put in
+  # the shared app ConfigMap: the API requires ADMIN_EMAIL and ADMIN_PASSWORD as
+  # a pair, while only the seed Job mounts the password.
+  ADMIN_EMAIL: "admin@example.com"
+  ADMIN_NAME: "Admin"

@@ -17,7 +17,7 @@ import (
 	"{{.M.ModulePath}}/internal/platform/authz"
 	"{{.M.ModulePath}}/internal/platform/session"
 	"{{.M.ModulePath}}/internal/platform/tenant"
-	"{{.M.ModulePath}}/internal/testutil"
+	pgtest "{{.M.ModulePath}}/internal/testutil/pgtest"
 )
 
 // integrationSessions is an active administrator snapshot for the module's
@@ -43,28 +43,23 @@ func (integrationSessions) InvalidatePermissions(context.Context) error { return
 // Test{{.R.Pascal}}CRUDAndTenantIsolation runs the generated routes through the
 // full middleware stack against PostgreSQL (Testcontainers, or
 // TEST_DATABASE_URL): CRUD in one tenant, and every cross-tenant id is 404.
-// SetupTestDB returns the BYPASS fixture pool, so the application is wired
-// with testutil.Scoped/NewTxManager (the normal RLS role). If the repository
-// used the raw pool, the cross-tenant reads below would succeed and prove
-// nothing.
+// pgtest.New returns the BYPASS fixture pool, so the application is wired
+// with fx.Scoped/fx.Tx (the normal RLS role). If the repository used the raw
+// pool, the cross-tenant reads below would succeed and prove nothing.
 func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	ctx := context.Background()
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	if err != nil {
-		t.Fatalf("SetupTestDB: %v", err)
-	}
-	t.Cleanup(cleanup)
-
+	fx := pgtest.New(t)
+	pool := fx.Bypass
 	var tenantB uuid.UUID
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name) VALUES ('{{.M.Route}}-{{.R.Route}}-b', 'Tenant B') RETURNING id`,
 	).Scan(&tenantB); err != nil {
 		t.Fatalf("insert tenant: %v", err)
 	}
-	db := testutil.Scoped(pool)
+	db := fx.Scoped()
 	recorder := audit.NewPostgresRecorder(db)
 	fiberApp := testApp(t,
-		app.Infra{DB: db, Tx: testutil.NewTxManager(pool), Audit: recorder},
+		app.Infra{DB: db, Tx: fx.Tx(), Audit: recorder},
 		app.Deps{Audit: recorder, Sessions: integrationSessions{}})
 	userA := uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000a1")
 	userB := uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000b1")

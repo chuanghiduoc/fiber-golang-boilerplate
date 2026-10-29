@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 // breachTestPassword is a runtime-built fixture passphrase, so the test file
@@ -46,6 +48,30 @@ func TestPasswordWeakness_BreachCheck(t *testing.T) {
 	checker.mu.Unlock()
 	if len(seen) == 0 || seen[0] != strong {
 		t.Fatalf("checker saw %q, want the NFKC-normalized password", seen)
+	}
+}
+
+// fieldCode must not run the breached-password network check a second time.
+// Besides wasting a request, a transient failure on the second call would
+// mislabel a breached password as merely weak.
+func TestValidateStruct_BreachCheckRunsOnce(t *testing.T) {
+	checker := &fakeBreachChecker{breached: true}
+	SetBreachChecker(checker)
+	t.Cleanup(func() { SetBreachChecker(nil) })
+
+	err := ValidateStruct(passwordReq{Password: breachTestPassword})
+	appErr, ok := err.(*apperror.AppError)
+	if !ok || len(appErr.Errors) == 0 {
+		t.Fatalf("ValidateStruct error = %v, want a validation AppError", err)
+	}
+	if got := appErr.Errors[0].Code; got != CodePasswordBreached {
+		t.Fatalf("validation code = %q, want %q", got, CodePasswordBreached)
+	}
+	checker.mu.Lock()
+	calls := len(checker.seen)
+	checker.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("breach checker calls = %d, want exactly 1", calls)
 	}
 }
 
@@ -161,5 +187,20 @@ func TestHIBPCheckerTimeoutIsBounded(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("Breached took %v, want it bounded by the configured timeout", elapsed)
+	}
+}
+
+func TestHIBPCheckerRejectsOversizedResponse(t *testing.T) {
+	line := "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF:0\n"
+	payload := strings.Repeat(line, hibpMaxResponseBytes/len(line)+2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(payload))
+	}))
+	t.Cleanup(server.Close)
+
+	checker := NewHIBPChecker(5 * time.Second)
+	checker.endpoint = server.URL + "/range/"
+	if _, err := checker.Breached(breachTestPassword); err == nil {
+		t.Fatal("Breached accepted a response over the byte budget, want an error")
 	}
 }

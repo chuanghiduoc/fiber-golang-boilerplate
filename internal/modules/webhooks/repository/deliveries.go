@@ -64,16 +64,21 @@ func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft webhooksvc.D
 	if err != nil {
 		return uuid.Nil, false, err
 	}
+	subjectUserIDs := draft.SubjectUserIDs
+	if subjectUserIDs == nil {
+		subjectUserIDs = []uuid.UUID{}
+	}
 	err = r.withTx(ctx, func(tx pgx.Tx, q *webhooksqlc.Queries) error {
 		if err := q.CreateWebhookEvent(ctx, webhooksqlc.CreateWebhookEventParams{
-			TenantID:    draft.TenantID,
-			EventID:     draft.EventID,
-			EventType:   draft.EventType,
-			DataVersion: draft.DataVersion,
-			ActorType:   draft.ActorType,
-			ActorID:     actorID,
-			OccurredAt:  database.Timestamptz(draft.EventCreatedAt),
-			Payload:     draft.Payload,
+			TenantID:       draft.TenantID,
+			EventID:        draft.EventID,
+			EventType:      draft.EventType,
+			DataVersion:    draft.DataVersion,
+			ActorType:      draft.ActorType,
+			ActorID:        actorID,
+			SubjectUserIds: subjectUserIDs,
+			OccurredAt:     database.Timestamptz(draft.EventCreatedAt),
+			Payload:        draft.Payload,
 		}); err != nil {
 			return err
 		}

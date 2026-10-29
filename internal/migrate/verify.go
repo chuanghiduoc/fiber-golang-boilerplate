@@ -23,6 +23,7 @@ var requiredTriggers = map[string][]string{
 	"invitations":               {"trigger_invitations_role_scope"},
 	"data_exports":              {"trigger_data_exports_updated_at"},
 	"webauthn_credentials":      {"trigger_webauthn_credentials_updated_at"},
+	"files":                     {"trigger_files_storage_usage"},
 	"audit_events": {
 		"trigger_audit_events_completion",
 		"trigger_audit_events_no_delete",
@@ -45,6 +46,7 @@ var requiredRLS = []string{
 	"data_exports",
 	"api_keys",
 	"files",
+	"files_storage_usage",
 	"feature_flag_targets",
 	"notifications",
 	"notification_preferences",
@@ -78,11 +80,11 @@ type rlsTable struct {
 // checkRLS reports every table with a tenant_id column whose row-level
 // security is not enabled and forced, or whose policies are not exactly one
 // tenant_isolation policy calling app_tenant_visible. Partition children are
-// excluded: a partition inherits its parent's RLS and policy, and enabling RLS
-// on the parent is what protects every partition. The table set is
-// discovered from the catalog rather than a static list, so a later migration
-// cannot add a tenant-owned table that this guard silently ignores: TRUNCATE
-// ignores RLS, but SELECT/INSERT/UPDATE/DELETE do not.
+// checked too: a direct read of a partition does not use the parent's policy,
+// so every partition must independently enable/force RLS and carry the policy.
+// The table set is discovered from the catalog rather than a static list, so a
+// later migration cannot add a tenant-owned table that this guard silently
+// ignores: TRUNCATE ignores RLS, but SELECT/INSERT/UPDATE/DELETE do not.
 func checkRLS(ctx context.Context, pool *pgxpool.Pool, schema string) ([]string, error) {
 	var tables []rlsTable
 	current := -1
@@ -245,14 +247,14 @@ func checkTriggers(ctx context.Context, pool *pgxpool.Pool, schema string) ([]st
 	err := scanRows(ctx, pool, "verify schema triggers", "verify schema: scan trigger",
 		func(rows pgx.Rows) error {
 			var table, trigger string
-			var isEnabled bool
-			if err := rows.Scan(&table, &trigger, &isEnabled); err != nil {
+			var tgenabled string
+			if err := rows.Scan(&table, &trigger, &tgenabled); err != nil {
 				return err
 			}
-			enabled[table+"."+trigger] = isEnabled
+			enabled[table+"."+trigger] = triggerEnabled(tgenabled)
 			return nil
 		},
-		`SELECT c.relname, tg.tgname, tg.tgenabled <> 'D'
+		`SELECT c.relname, tg.tgname, tg.tgenabled
 		 FROM pg_trigger tg
 		 JOIN pg_class c ON c.oid = tg.tgrelid
 		 JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -276,6 +278,14 @@ func checkTriggers(ctx context.Context, pool *pgxpool.Pool, schema string) ([]st
 		}
 	}
 	return missing, nil
+}
+
+// triggerEnabled reports whether a trigger fires in a normal origin session.
+// PostgreSQL's tgenabled values are O (origin, the default), D (disabled),
+// R (replica only), and A (always). Treating R as enabled would let a quota or
+// append-only trigger silently stop running during ordinary application writes.
+func triggerEnabled(tgenabled string) bool {
+	return tgenabled == "O" || tgenabled == "A"
 }
 
 // checkTenantColumnDefaults reports tenant_id columns that still carry a

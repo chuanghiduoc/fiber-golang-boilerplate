@@ -107,7 +107,9 @@ func requireMFAMethod(maxAge time.Duration, passkeyOnly bool) fiber.Handler {
 		if !subject.HasMFA() {
 			return apperror.NewCode(apperror.CodeMFARequired, "multi-factor authentication is required")
 		}
-		if subject.MFAVerifiedAt.IsZero() || (maxAge > 0 && time.Since(subject.MFAVerifiedAt) > maxAge) {
+		now := time.Now()
+		if subject.MFAVerifiedAt.IsZero() || subject.MFAVerifiedAt.After(now) ||
+			(maxAge > 0 && now.Sub(subject.MFAVerifiedAt) > maxAge) {
 			return apperror.NewCode(apperror.CodeMFARequired,
 				"multi-factor authentication has expired; re-authenticate at POST /me/mfa/step-up")
 		}

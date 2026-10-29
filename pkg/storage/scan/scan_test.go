@@ -298,3 +298,29 @@ func TestClamAVScanHonoursContext(t *testing.T) {
 		t.Fatalf("Scan took %v, want about the 200ms context deadline", elapsed)
 	}
 }
+
+type stallingReader struct{ reads int }
+
+func (r *stallingReader) Read([]byte) (int, error) {
+	r.reads++
+	if r.reads > 10_000 {
+		return 0, io.EOF
+	}
+	return 0, nil
+}
+
+func TestScan_StalledReaderFailsInsteadOfSpinning(t *testing.T) {
+	server := newFakeClamd(t, "stream: OK")
+	scanner, err := New(Config{Driver: "clamav", ClamAVAddr: server.addr(), Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	reader := &stallingReader{}
+	if _, err := scanner.Scan(context.Background(), reader, 0); err == nil {
+		t.Fatal("Scan must fail when the upload reader makes no progress")
+	}
+	if reader.reads > maxEmptyReads+1 {
+		t.Fatalf("reader called %d times, want at most %d", reader.reads, maxEmptyReads+1)
+	}
+}

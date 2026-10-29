@@ -21,12 +21,19 @@ func NewPrivacyStore(db apikeyssqlc.DBTX) *PrivacyStore {
 	return &PrivacyStore{q: apikeyssqlc.New(db)}
 }
 
-func (s *PrivacyStore) List(ctx context.Context, tenantID, userID uuid.UUID) ([]apikeysprivacy.Key, error) {
+func (s *PrivacyStore) List(ctx context.Context, tenantID, userID uuid.UUID, limit int32) ([]apikeysprivacy.Key, bool, error) {
+	if limit <= 0 {
+		return []apikeysprivacy.Key{}, false, nil
+	}
 	rows, err := s.q.ListAPIKeysForPrivacy(ctx, apikeyssqlc.ListAPIKeysForPrivacyParams{
-		TenantID: tenantID, UserID: userID,
+		TenantID: tenantID, UserID: userID, RowLimit: limit + 1,
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	truncated := len(rows) > int(limit)
+	if truncated {
+		rows = rows[:limit]
 	}
 	out := make([]apikeysprivacy.Key, len(rows))
 	for i, row := range rows {
@@ -41,7 +48,7 @@ func (s *PrivacyStore) List(ctx context.Context, tenantID, userID uuid.UUID) ([]
 			UpdatedAt:          row.UpdatedAt.Time,
 		}
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 func (s *PrivacyStore) DeleteAll(ctx context.Context, tenantID, userID uuid.UUID) error {

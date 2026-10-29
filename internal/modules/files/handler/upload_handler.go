@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -225,9 +226,16 @@ func authUserID(ctx context.Context) (uuid.UUID, error) {
 }
 
 func parseFileID(raw string) (uuid.UUID, error) {
-	id, err := uuid.Parse(raw)
-	if err != nil || id == uuid.Nil {
-		return uuid.Nil, apperror.NewBadRequest("invalid fileId")
+	id, err := uuid.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return uuid.Nil, apperror.NewValidation("invalid fileId", []apperror.FieldError{{
+			Path:    "path.fileId",
+			Code:    "invalid",
+			Message: "invalid fileId",
+		}})
+	}
+	if id == uuid.Nil {
+		return uuid.Nil, apperror.NewNotFound("resource not found")
 	}
 	return id, nil
 }

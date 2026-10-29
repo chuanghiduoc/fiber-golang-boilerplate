@@ -28,6 +28,9 @@ func NewTenantPurger(db featuressqlc.DBTX) *TenantPurger {
 func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	ctx = tenant.WithID(ctx, tenantID)
 	for {
+		if err := tenancycontracts.CheckPurgeBudget(ctx); err != nil {
+			return err
+		}
 		deleted, err := p.q.DeleteTenantFeatureFlagTargetsBatch(ctx, featuressqlc.DeleteTenantFeatureFlagTargetsBatchParams{
 			TenantID:  tenantID,
 			BatchSize: tenancycontracts.PurgeBatchSize,

@@ -86,7 +86,7 @@ func TestUpload_QuotaZeroIsUnlimited(t *testing.T) {
 }
 
 // TestUpload_QuotaLockedAndCheckedInTransaction proves the quota check is
-// inside the metadata transaction and takes the per-tenant lock first.
+// inside the metadata transaction and locks the enabled counter.
 func TestUpload_QuotaLockedAndCheckedInTransaction(t *testing.T) {
 	repo := newMockFileRepo()
 	store := newMockStorage()
@@ -95,8 +95,27 @@ func TestUpload_QuotaLockedAndCheckedInTransaction(t *testing.T) {
 	if _, err := svc.Upload(systemCtx(), testID(10), "ok.bin", strings.NewReader("data"), 4, "application/octet-stream"); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
-	if repo.quotaLocks != 1 {
-		t.Fatalf("quota locks = %d, want 1", repo.quotaLocks)
+	if len(repo.lockScopes) != 1 || !repo.lockScopes[0].Tenant || repo.lockScopes[0].User {
+		t.Fatal(len(repo.lockScopes))
+	}
+}
+
+// A user-only quota must not touch tenant-wide usage: doing so would serialize
+// every uploader in the tenant.
+func TestUpload_UserQuotaLocksOnlyUserCounter(t *testing.T) {
+	repo := newMockFileRepo()
+	store := newMockStorage()
+	svc := quotaService(repo, store, 0, 100)
+
+	if _, err := svc.Upload(systemCtx(), testID(10), "ok.bin", strings.NewReader("data"), 4, "application/octet-stream"); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	want := QuotaScope{User: true}
+	if len(repo.usageScopes) != 1 || repo.usageScopes[0] != want {
+		t.Fatalf("usage scopes = %+v, want user only", repo.usageScopes)
+	}
+	if len(repo.lockScopes) != 1 || repo.lockScopes[0] != want {
+		t.Fatalf("lock scopes = %+v, want user only", repo.lockScopes)
 	}
 }
 
@@ -122,7 +141,7 @@ func TestUpload_QuotaPrecheckSkipsPutAndScan(t *testing.T) {
 	if scanner.calls != 0 {
 		t.Fatalf("scanner calls = %d, want 0 before the quota pre-check", scanner.calls)
 	}
-	if repo.quotaLocks != 0 {
-		t.Fatalf("quota locks = %d, want the cheap pre-check to take no lock", repo.quotaLocks)
+	if len(repo.lockScopes) != 0 {
+		t.Fatalf("quota locks = %+v, want the cheap pre-check to take no lock", repo.lockScopes)
 	}
 }

@@ -10,10 +10,19 @@ metadata:
 data:
   APP_ENV: staging
   LOG_LEVEL: info
+  OTEL_RESOURCE_ATTRIBUTES: "service.namespace=fiber-boilerplate,deployment.environment.name=staging"
 
   # Public API origin vs. browser frontend origin.
   APP_FRONTEND_URL: "https://app.staging.example.com"
   CORS_ALLOW_ORIGINS: "https://app.staging.example.com"
+
+  # Replace with `kubectl get pods -n ingress-nginx -o wide`'s pod CIDR, or
+  # the node CIDR when the controller uses hostNetwork. Startup rejects this
+  # placeholder, /0, and the broad private aggregates (including 10.0.0.0/8),
+  # so a forgotten or over-broad override cannot trust client-supplied
+  # X-Forwarded-For headers.
+  APP_TRUST_PROXY: "true"
+  APP_TRUSTED_PROXIES: "REPLACE_WITH_INGRESS_NGINX_POD_CIDR"
 
   # Managed PostgreSQL/Redis/SMTP endpoints for staging.
   DB_HOST: "db.staging.example.com"
@@ -23,8 +32,3 @@ data:
 
   # Separate bucket and credentials (credentials stay in the Secret).
   STORAGE_S3_BUCKET: "REPLACE_WITH_STAGING_S3_BUCKET"
-
-  # Bootstrap admin identity for the one-shot seed Job. The password is in
-  # fiber-boilerplate-seed-secrets (ADMIN_PASSWORD).
-  ADMIN_EMAIL: "admin@staging.example.com"
-  ADMIN_NAME: "Admin"

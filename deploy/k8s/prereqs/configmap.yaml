@@ -39,11 +39,12 @@ data:
   # Supported embedded catalogs: en, vi. Unsupported values fail startup.
   I18N_DEFAULT_LOCALE: "en"
 
-  # The app runs behind ingress-nginx, so client IPs arrive in X-Forwarded-For.
-  # Trust only the cluster's pod/service CIDR that contains ingress-nginx;
-  # do not widen this to 0.0.0.0/0 or clients can spoof their source IP.
-  APP_TRUST_PROXY: "true"
-  APP_TRUSTED_PROXIES: "10.0.0.0/8"
+  # The shared base does not trust proxy headers. Each environment overlay
+  # must opt in with the exact ingress-nginx pod/service CIDR after inspecting
+  # the cluster; a broad RFC1918 aggregate lets any peer in that range spoof
+  # X-Forwarded-For if it can reach the API. If ingress-nginx uses hostNetwork,
+  # use the node CIDR instead of the pod CIDR.
+  APP_TRUST_PROXY: "false"
 
   # ---------------------------------------------------------------------------
   # CORS
@@ -51,7 +52,7 @@ data:
   # Explicit origins only; "*" is rejected when APP_ENV=production.
   CORS_ALLOW_ORIGINS: "https://app.example.com"
   CORS_ALLOW_METHODS: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Accept-Language,Authorization,Idempotency-Key,X-Tenant-Slug,X-CSRF-Token"
+  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Accept-Language,Authorization,Idempotency-Key,If-Match,If-None-Match,X-Tenant-Slug,X-CSRF-Token"
   CORS_EXPOSE_HEADERS: "Location,ETag,Idempotent-Replayed,Content-Language,RateLimit,RateLimit-Policy,Retry-After,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,X-Request-Id"
   CORS_ALLOW_CREDENTIALS: "false"
 
@@ -101,7 +102,8 @@ data:
   DB_CONNECT_TIMEOUT: "10s"
   # Per-pool limit. Each pod opens a normal and a bypass pool, so keep
   # DB_MAX_CONNS * 2 * HPA maxReplicas (10) below the managed database's
-  # connection limit. The defaults here allow at most 200 connections.
+  # connection limit. The defaults here allow at most 240 connections
+  # (10 API + 2 worker replicas, two pools each, 10 connections per pool).
   DB_MAX_CONNS: "10"
   DB_MIN_CONNS: "2"
   DB_MAX_CONN_LIFETIME: "1h"
@@ -175,15 +177,6 @@ data:
   # on a trusted network.
   SMTP_USERNAME: ""
   # SMTP_PASSWORD lives in the Secret.
-
-  # ---------------------------------------------------------------------------
-  # One-shot admin seed (cmd/seed Job only; the API ignores these)
-  # ---------------------------------------------------------------------------
-  # Replace with the bootstrap admin address. ADMIN_PASSWORD is mounted from
-  # fiber-boilerplate-seed-secrets; re-running the Job never re-promotes an
-  # existing account.
-  ADMIN_EMAIL: "admin@example.com"
-  ADMIN_NAME: "Admin"
 
   # ---------------------------------------------------------------------------
   # OpenTelemetry tracing and metrics (optional; tracing disabled by default)

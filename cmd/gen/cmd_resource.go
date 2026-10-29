@@ -106,7 +106,7 @@ func (g *generator) wireResource(p *plan, data templateData) error {
 		}},
 		{"build.go", func(src string) (string, error) {
 			out, err := insertAtMarker("build.go", src, markerBuild, fmt.Sprintf(
-				"%s: %shandler.New%sHandler(%sservice.New%sService(%srepository.New%sRepository(infra.DB))),",
+				"%s: %shandler.New%sHandler(%sservice.New%sService(%srepository.New%sRepository(infra.DB), authorizer)),",
 				r.PluralPascal, m.Ident, r.Pascal, m.Ident, r.Pascal, m.Ident, r.Pascal))
 			if err != nil {
 				return "", err
@@ -141,7 +141,7 @@ func (g *generator) wireResource(p *plan, data templateData) error {
 				return "", err
 			}
 			return insertAtMarker("catalog/errors.go", out, markerSpecs, fmt.Sprintf(
-				"%s: {\n\tStatus:  http.StatusNotFound,\n\tTitle:   %q,\n\tDocPath: %q,\n},",
+				"{\n\tCode:    %s,\n\tStatus:  http.StatusNotFound,\n\tTitle:   %q,\n\tDocPath: %q,\n},",
 				code, r.Title+" not found", "/errors/"+m.Route+"-"+r.Route+"-not-found"))
 		}},
 		{"catalog/locales/en.json", localeEdit("catalog/locales/en.json", notFoundCode(m, r), r.Title+" not found")},

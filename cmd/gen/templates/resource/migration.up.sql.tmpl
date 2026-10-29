@@ -1,17 +1,22 @@
 -- {{.R.Table}}: tenant-scoped {{.R.HumanPlural}} owned by the {{.M.Name}} module.
-CREATE TABLE IF NOT EXISTS {{.R.Table}} (
-    id UUID PRIMARY KEY DEFAULT uuidv7(),
+CREATE TABLE {{.R.Table}} (
+    id UUID NOT NULL DEFAULT uuidv7(),
     -- tenants is the only cross-module foreign key a module may declare
-    --. RESTRICT: a tenant with {{.R.HumanPlural}} cannot be deleted.
-    tenant_id UUID NOT NULL REFERENCES tenants (id) ON DELETE RESTRICT,
-    name VARCHAR(255) NOT NULL CHECK (btrim(name) <> ''),
+    -- RESTRICT: a tenant with {{.R.HumanPlural}} cannot be deleted.
+    tenant_id UUID NOT NULL,
+    name TEXT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT pk_{{.R.Table}} PRIMARY KEY (id),
+    CONSTRAINT fk_{{.R.Table}}_tenant FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id) ON DELETE RESTRICT,
+    CONSTRAINT chk_{{.R.Table}}_name
+        CHECK (btrim(name) <> '' AND length(name) <= 255)
 );
 
 -- Serves the tenant-scoped cursor list: WHERE tenant_id = $1 AND
 -- (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC.
-CREATE INDEX IF NOT EXISTS idx_{{.R.Table}}_tenant_created
+CREATE INDEX idx_{{.R.Table}}_tenant_created
     ON {{.R.Table}} (tenant_id, created_at DESC, id DESC);
 
 DROP TRIGGER IF EXISTS trigger_{{.R.Table}}_updated_at ON {{.R.Table}};

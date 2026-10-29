@@ -1,8 +1,10 @@
 # Production keeps at least three replicas and scales to 10. DB_MAX_CONNS in the
 # production ConfigMap is 10 and each pod opens two pools (normal + bypass), so
-# 10 replicas can hold up to 200 connections; keep that below the managed
-# database's connection limit. The HPA owns the replica count; the Deployment
-# intentionally has no spec.replicas.
+# 10 API replicas plus the two fixed worker replicas can hold up to 240
+# connections; keep that below the managed database's connection limit. Enabling
+# the optional KEDA worker scaler (up to 10 workers) raises the ceiling to 400.
+# The HPA owns the replica count; the Deployment intentionally has no
+# spec.replicas.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

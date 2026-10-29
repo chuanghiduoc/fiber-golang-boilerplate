@@ -118,6 +118,18 @@ func TestPasswordContainsEmailLocalPart(t *testing.T) {
 	}
 }
 
+// NFKC folding must happen before the email-local-part check too: otherwise a
+// full-width spelling of the same address slips past the policy even though
+// the stored password hash uses the normalized form.
+func TestPasswordContainsEmailLocalPartNormalizesUnicode(t *testing.T) {
+	if !PasswordContainsEmailLocalPart("\uFF21\uFF4C\uFF49\uFF43\uFF45-2026", "alice@example.com") {
+		t.Fatal("full-width email local part must be detected")
+	}
+	if !PasswordContainsEmailLocalPart("alice-2026", "\uFF41\uFF4C\uFF49\uFF43\uFF45@example.com") {
+		t.Fatal("full-width email local part must be normalized before comparison")
+	}
+}
+
 func TestValidateStruct_Required(t *testing.T) {
 	err := ValidateStruct(passwordReq{Password: ""})
 	if err == nil {

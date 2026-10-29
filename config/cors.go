@@ -12,7 +12,7 @@ const corsWildcardOrigin = "*"
 type CORSConfig struct {
 	AllowOrigins     []string `env:"CORS_ALLOW_ORIGINS" envSeparator:"," envDefault:"*"`
 	AllowMethods     []string `env:"CORS_ALLOW_METHODS" envSeparator:"," envDefault:"GET,POST,PUT,PATCH,DELETE,OPTIONS"`
-	AllowHeaders     []string `env:"CORS_ALLOW_HEADERS" envSeparator:"," envDefault:"Origin,Content-Type,Accept,Accept-Language,Authorization,Idempotency-Key,X-Tenant-Slug,X-CSRF-Token"`
+	AllowHeaders     []string `env:"CORS_ALLOW_HEADERS" envSeparator:"," envDefault:"Origin,Content-Type,Accept,Accept-Language,Authorization,Idempotency-Key,If-Match,If-None-Match,X-Tenant-Slug,X-CSRF-Token"`
 	ExposeHeaders    []string `env:"CORS_EXPOSE_HEADERS" envSeparator:"," envDefault:"Location,ETag,Idempotent-Replayed,Content-Language,RateLimit,RateLimit-Policy,Retry-After,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,X-Request-Id"`
 	AllowCredentials bool     `env:"CORS_ALLOW_CREDENTIALS" envDefault:"false"`
 }

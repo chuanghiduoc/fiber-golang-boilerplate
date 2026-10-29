@@ -114,6 +114,27 @@ func TestCatalogProblemResolvesSpec(t *testing.T) {
 	}
 }
 
+func TestCatalogDocsBaseURLIsInstanceScoped(t *testing.T) {
+	first := NewCatalog()
+	first.SetDocsBaseURL("https://docs.example.com/")
+	second := NewCatalog()
+	second.SetDocsBaseURL("  https://other.example.com///  ")
+
+	firstProblem := first.Problem(NewBadRequest("bad"), "", "")
+	if firstProblem.Type != "https://docs.example.com/errors/request-invalid" {
+		t.Fatalf("first type = %q", firstProblem.Type)
+	}
+	secondProblem := second.Problem(NewBadRequest("bad"), "", "")
+	if secondProblem.Type != "https://other.example.com/errors/request-invalid" {
+		t.Fatalf("second type = %q", secondProblem.Type)
+	}
+
+	relative := NewCatalog().Problem(NewBadRequest("bad"), "", "")
+	if relative.Type != "/errors/request-invalid" {
+		t.Fatalf("relative type = %q", relative.Type)
+	}
+}
+
 func TestCatalogProblemUnknownCodeFallsBack(t *testing.T) {
 	catalog := NewCatalog()
 	problem := catalog.Problem(NewCode("does.not.exist", "safe detail"), "req-1", "/api/v1/x")
@@ -133,6 +154,30 @@ func TestCatalogProblemUnknownCodeFallsBack(t *testing.T) {
 	}
 	if problem.Detail != "safe detail" {
 		t.Errorf("Detail = %q, want %q", problem.Detail, "safe detail")
+	}
+}
+
+func TestCatalogProblemNormalizesFieldPathsWithoutMutatingInput(t *testing.T) {
+	catalog := NewCatalog()
+	original := []FieldError{
+		{Path: "body.name", Code: "required"},
+		{Path: "query.limit", Code: "invalid"},
+		{Path: "body", Code: "invalid"},
+		{Path: "name", Code: "required"},
+	}
+	problem := catalog.Problem(NewValidation("bad fields", original), "req-1", "/api/v1/x")
+
+	want := []string{"name", "query.limit", "body", "name"}
+	if len(problem.Errors) != len(want) {
+		t.Fatalf("errors = %+v, want %d entries", problem.Errors, len(want))
+	}
+	for i, path := range want {
+		if problem.Errors[i].Path != path {
+			t.Errorf("errors[%d].path = %q, want %q", i, problem.Errors[i].Path, path)
+		}
+	}
+	if original[0].Path != "body.name" {
+		t.Errorf("rendering mutated the AppError: path = %q", original[0].Path)
 	}
 }
 

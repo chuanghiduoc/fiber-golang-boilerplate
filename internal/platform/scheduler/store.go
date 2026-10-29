@@ -19,6 +19,8 @@ var (
 	ErrNoPool = errors.New("scheduler: database pool is nil")
 	// ErrNoQueue is returned when a scheduler has no durable queue.
 	ErrNoQueue = errors.New("scheduler: job queue is nil")
+	// ErrNoTx is returned when a scheduler has no transaction manager.
+	ErrNoTx = errors.New("scheduler: transaction manager is nil")
 	// ErrInvalidRetention is returned when a retention window is not positive.
 	ErrInvalidRetention = errors.New("scheduler: retention must be positive")
 )
@@ -189,6 +191,9 @@ func (s *pgStore) EnqueueRun(ctx context.Context, queue Queue, run runRecord, jo
 	if queue == nil {
 		return false, ErrNoQueue
 	}
+	if s.tx == nil {
+		return false, ErrNoTx
+	}
 
 	ctx = database.WithRLSBypass(ctx) // Schedules enqueue global platform jobs, not a tenant's.
 	enqueued := false
@@ -221,6 +226,9 @@ func (s *pgStore) EnqueueRun(ctx context.Context, queue Queue, run runRecord, jo
 func (s *pgStore) SkipRun(ctx context.Context, run runRecord) (bool, error) {
 	if s == nil || s.pool == nil {
 		return false, ErrNoPool
+	}
+	if s.tx == nil {
+		return false, ErrNoTx
 	}
 	skipped := false
 	err := s.tx.WithTx(ctx, func(tx pgx.Tx) error {

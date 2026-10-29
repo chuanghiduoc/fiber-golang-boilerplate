@@ -9,7 +9,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/patch"
 	"github.com/google/uuid"
 )
 
@@ -47,7 +46,7 @@ type profileInput struct {
 }
 
 type updateProfileInput struct {
-	RawBody []byte `rawBody:"application/merge-patch+json" contentType:"application/merge-patch+json" required:"true"`
+	Body dto.ProfilePatch `contentType:"application/merge-patch+json" required:"true"`
 }
 
 type changePasswordInput struct {
@@ -65,10 +64,7 @@ func (h *UserHandler) GetMe(ctx context.Context, _ *profileInput) (*httpapi.Outp
 
 // UpdateMe applies an RFC 7396 merge patch to the caller's global profile.
 func (h *UserHandler) UpdateMe(ctx context.Context, input *updateProfileInput) (*httpapi.Output[dto.UserResponse], error) {
-	var req dto.ProfilePatch
-	if err := decodeMergePatch(input.RawBody, &req); err != nil {
-		return nil, err
-	}
+	req := input.Body
 	if req.Name.Present && req.Name.Null {
 		return nil, unprocessable("name cannot be cleared")
 	}
@@ -109,7 +105,7 @@ func (h *UserHandler) UpdateMe(ctx context.Context, input *updateProfileInput) (
 
 // requirePasswordForEmailChange forces re-authentication before a user can
 // move their account to a different address.
-func (h *UserHandler) requirePasswordForEmailChange(ctx context.Context, userID uuid.UUID, email *string, password patch.Field[string]) (bool, error) {
+func (h *UserHandler) requirePasswordForEmailChange(ctx context.Context, userID uuid.UUID, email *string, password dto.Optional[string]) (bool, error) {
 	if email == nil {
 		return false, nil
 	}

@@ -111,12 +111,12 @@ type intentRecorder struct {
 
 func (r *intentRecorder) Record(context.Context, audit.Event) error { return nil }
 
-func (r *intentRecorder) RecordID(_ context.Context, event audit.Event) (uuid.UUID, error) {
+func (r *intentRecorder) RecordID(_ context.Context, event audit.Event) (audit.IntentRef, error) {
 	r.intents = append(r.intents, event)
-	return testID(len(r.intents)), nil
+	return audit.IntentRef{ID: testID(len(r.intents))}, nil
 }
 
-func (r *intentRecorder) Complete(_ context.Context, _ uuid.UUID, completion audit.Completion) error {
+func (r *intentRecorder) Complete(_ context.Context, _ audit.IntentRef, completion audit.Completion) error {
 	r.completions = append(r.completions, completion)
 	return nil
 }
@@ -263,13 +263,13 @@ func TestModuleMutationRoutesAreIdempotent(t *testing.T) {
 	etag := `"1700000000000000000"`
 
 	for i := 0; i < 2; i++ {
-		resp, _ := doRequest(t, application, http.MethodPatch, "/api/v1/platform/feature-flags/file_uploads",
+		resp, payload := doRequest(t, application, http.MethodPatch, "/api/v1/platform/feature-flags/file_uploads",
 			bearerMFA(t, testID(2)), body, map[string]string{
 				"Idempotency-Key": "feature-flag-update-1",
 				"If-Match":        etag,
 				"Content-Type":    "application/merge-patch+json",
 			})
-		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+		require.Equalf(t, fiber.StatusOK, resp.StatusCode, "response body: %s", payload)
 		if i == 1 {
 			assert.Equal(t, "true", resp.Header.Get("Idempotent-Replayed"))
 		}

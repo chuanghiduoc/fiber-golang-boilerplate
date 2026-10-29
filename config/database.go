@@ -31,12 +31,24 @@ type DBConfig struct {
 	SSLMode        string `env:"DB_SSLMODE" envDefault:"disable"`
 	// SSLRootCert is an optional path to the CA bundle that verifies the server
 	// certificate. verify-full without it uses the system trust store.
-	SSLRootCert     string        `env:"DB_SSLROOTCERT"`
-	ConnectTimeout  time.Duration `env:"DB_CONNECT_TIMEOUT" envDefault:"10s"`
-	MaxConns        int32         `env:"DB_MAX_CONNS" envDefault:"25"`
-	MinConns        int32         `env:"DB_MIN_CONNS" envDefault:"5"`
-	MaxConnLifetime time.Duration `env:"DB_MAX_CONN_LIFETIME" envDefault:"1h"`
-	MaxConnIdleTime time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"5m"`
+	SSLRootCert    string        `env:"DB_SSLROOTCERT"`
+	ConnectTimeout time.Duration `env:"DB_CONNECT_TIMEOUT" envDefault:"10s"`
+	// StatementTimeout bounds one server-side statement. Application queries
+	// should also carry request contexts, but a database-side limit still
+	// protects the pool from a query that ignores cancellation or waits on a
+	// lock. It is applied to runtime pools, not to cmd/migrate.
+	StatementTimeout time.Duration `env:"DB_STATEMENT_TIMEOUT" envDefault:"30s"`
+	// LockTimeout bounds how long a statement waits for a table or row lock.
+	// Failing fast keeps a lock convoy from consuming every pooled connection.
+	LockTimeout time.Duration `env:"DB_LOCK_TIMEOUT" envDefault:"5s"`
+	// IdleInTransactionSessionTimeout closes a transaction left idle by a
+	// handler/job that forgot to commit or roll back, releasing its locks and
+	// snapshot. PostgreSQL's GUC name is intentionally used in the env name.
+	IdleInTransactionSessionTimeout time.Duration `env:"DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT" envDefault:"30s"`
+	MaxConns                        int32         `env:"DB_MAX_CONNS" envDefault:"25"`
+	MinConns                        int32         `env:"DB_MIN_CONNS" envDefault:"5"`
+	MaxConnLifetime                 time.Duration `env:"DB_MAX_CONN_LIFETIME" envDefault:"1h"`
+	MaxConnIdleTime                 time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"5m"`
 	// QueryExecMode is the pgx query execution mode. cache_statement (the
 	// pgx default) prepares named statements per connection, which a
 	// transaction-mode pooler must support (PgBouncer 1.21+ with
@@ -103,6 +115,15 @@ func (db DBConfig) Validate() error {
 	if db.ConnectTimeout < time.Second {
 		return fmt.Errorf("DB_CONNECT_TIMEOUT must be at least 1s")
 	}
+	if db.StatementTimeout <= 0 {
+		return fmt.Errorf("DB_STATEMENT_TIMEOUT must be positive")
+	}
+	if db.LockTimeout <= 0 {
+		return fmt.Errorf("DB_LOCK_TIMEOUT must be positive")
+	}
+	if db.IdleInTransactionSessionTimeout <= 0 {
+		return fmt.Errorf("DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT must be positive")
+	}
 	if db.MaxConnLifetime < 0 {
 		return fmt.Errorf("DB_MAX_CONN_LIFETIME must not be negative")
 	}
@@ -122,7 +143,7 @@ func (db DBConfig) Validate() error {
 		return fmt.Errorf("DB_QUERY_EXEC_MODE must be one of: %s (got %q)", strings.Join(dbQueryExecModes, ", "), db.QueryExecMode)
 	}
 	if db.MigratePort < 0 || db.MigratePort > maxTCPPort {
-		return fmt.Errorf("DB_MIGRATE_PORT must be between 1 and %d", maxTCPPort)
+		return fmt.Errorf("DB_MIGRATE_PORT must be 0 (unset) or between 1 and %d", maxTCPPort)
 	}
 	return nil
 }
