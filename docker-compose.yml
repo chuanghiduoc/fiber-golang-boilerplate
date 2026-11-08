@@ -236,7 +236,7 @@ services:
   # the collector: an outage only drops spans.
   otel-collector:
     profiles: ["otel"]
-    image: otel/opentelemetry-collector:0.163.2@sha256:63e5e8eccf4268be02388ba9f2dc36b80b5e47721291293411c0e83152d75bda
+    image: otel/opentelemetry-collector:0.163.2-386@sha256:6af85116b470638e039d957f130990f0de7aaa46e51863e8c133e83590758992
     restart: unless-stopped
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
