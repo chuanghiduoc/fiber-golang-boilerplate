@@ -43,7 +43,7 @@ Production-minded REST API boilerplate built with Go, huma (OpenAPI 3.1), Postgr
 
 | Concern | Choice |
 |---------|--------|
-| Framework | [Fiber v3](https://docs.gofiber.io/) (Go 1.27.3+) |
+| Framework | [Fiber v3](https://docs.gofiber.io/) (Go 1.27.4+) |
 | Database | PostgreSQL 18 with [pgxpool](https://github.com/jackc/pgx) |
 | Queries | [sqlc](https://sqlc.dev/) (type-safe SQL code generation) |
 | Migrations | [golang-migrate](https://github.com/golang-migrate/migrate) through one `cmd/migrate` entrypoint (single init schema) |
@@ -97,7 +97,7 @@ flowchart TD
     B --> C["go mod tidy<br/>make env"]
     C --> D{Docker?}
     D -->|yes| E["make docker-run"]
-    D -->|no| F["make run<br/>(Go 1.27.3+, PostgreSQL)"]
+    D -->|no| F["make run<br/>(Go 1.27.4+, PostgreSQL)"]
     E --> G["Compose migrate service<br/>applies the schema"]
     F --> H["cmd/migrate<br/>applies the schema"]
     G --> I["Optional seed profile<br/>creates the bootstrap admin"]
@@ -138,7 +138,7 @@ make docker-run
 | SeaweedFS S3 gateway | `:8333` | Optional: `STORAGE_DRIVER=seaweedfs docker compose --profile s3 up` |
 | OTel collector | `:4317` | Optional `otel` profile; see [docs/tracing.md](docs/tracing.md) |
 
-**Without Docker** (requires Go 1.27.3+ and PostgreSQL):
+**Without Docker** (requires Go 1.27.4+ and PostgreSQL):
 
 ```bash
 make env          # writes .env with generated local secrets (chmod 600)

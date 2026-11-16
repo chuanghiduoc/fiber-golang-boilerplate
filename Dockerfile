@@ -4,7 +4,7 @@
 # built CGO_ENABLED=0 with -tags timetzdata, so the image needs no tzdata
 # package either.
 # ---- Build stage ----
-FROM golang:1.27.3-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS build
+FROM golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
 
 # VERSION is the release tag or commit SHA. It is embedded in cmd/api and
 # logged at startup; the image tag itself is not trusted at runtime.
