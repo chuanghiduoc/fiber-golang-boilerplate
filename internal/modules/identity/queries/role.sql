@@ -28,6 +28,14 @@ FROM roles r
 WHERE r.id = @id
   AND (r.tenant_id IS NULL OR r.tenant_id = @tenant_id::uuid);
 
+-- name: LockTenantRole :one
+-- Locks a tenant role definition for the rest of the transaction, so a rank
+-- check on its permissions cannot race a concurrent permission edit. System
+-- roles (tenant_id IS NULL) match no row; they are never edited.
+SELECT id FROM roles
+WHERE id = @id AND tenant_id = @tenant_id::uuid
+FOR UPDATE;
+
 -- name: GetRoleByKey :one
 SELECT r.id, r.tenant_id, r.scope, r.key, r.name, r.created_at, r.updated_at,
        ARRAY(

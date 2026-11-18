@@ -368,8 +368,12 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
   `otp`, `rc`, `hwk`, or `swk`. `RequireMFA` accepts `otp|rc|hwk|swk` with
   `sessions.mfa_verified_at` within `MFA_MAX_AGE` (default 12h);
   `POST /me/mfa/step-up` refreshes it with a TOTP/recovery code or a passkey
-  assertion. `CreateSession` refuses, in SQL, a session without a second
-  factor for a user with one. Lost factors: `DELETE /platform/users/{userId}/mfa`.
+  assertion. The session row is the source of the request's `amr` (the token
+  claim is a snapshot), and a step-up keeps only the passkey method it
+  proved: a code step-up removes `hwk`/`swk`, so a passkey method always
+  means `mfa_verified_at` came from a passkey. `CreateSession` refuses, in
+  SQL, a session without a second factor for a user with one. Lost factors:
+  `DELETE /platform/users/{userId}/mfa` (TOTP, recovery codes, and passkeys).
 - **Passkeys (WebAuthn, `go-webauthn`):** `webauthn_credentials` per global
   user; `WEBAUTHN_RP_ID`/`WEBAUTHN_RP_NAME`/`WEBAUTHN_RP_ORIGINS` (required in
   production, https origins in the RP domain; unset locally disables passkeys
@@ -382,8 +386,14 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
   the sign counter advances with a conditional UPDATE and a regression is 401
   `auth.passkey_sign_count_invalid`. A device-bound credential records `hwk`,
   a synced one `swk`. Every operation with a `platform:*` permission requires
-  a passkey-verified session (TOTP is not enough). Register/delete/login are
-  Tier 1 and send security emails.
+  a passkey-verified session (TOTP is not enough). Adding or deleting a
+  passkey needs a fresh proof (`MFA_MAX_AGE`) of the strongest factor the
+  user has, checked again in the write transaction: a passkey when one
+  exists, any second factor when only TOTP exists, and only the
+  re-authenticated session when there is none (the first passkey), else 403
+  `auth.mfa_required`. A user who lost the only passkey recovers through the
+  platform MFA reset. Register/delete/login are Tier 1 and send security
+  emails.
 - **Google sign-in:** PKCE (S256), no offline access, signed tenant-bound
   state keyed by `OAUTH_STATE_KEY` (independent of the JWT key); the callback
   redirects with a 256-bit, 60s, single-use `#code=` redeemed at
@@ -407,7 +417,9 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
   listed grants. Rank (owner 3 > admin 2 > member/tenant roles 1; a tenant
   role with any `admin:users:*` permission ranks as admin) gates member
   management in the mutation transaction with the target membership locked
-  (403 `role.insufficient_rank`). Platform permissions go to
+  (403 `role.insufficient_rank`). The same rule gates `PATCH /roles/{roleId}`
+  on a tenant role that has the admin rank: only a caller who outranks it may
+  change it, with the role row locked. Platform permissions go to
   `platform_admin` only and are the only cross-tenant access. Service-level
   checks use `authz.Authorize` (subject ⇒ permission + policies; no subject
   but `authz.SystemContext` ⇒ allowed; neither ⇒ 403). Job, event, and seed
@@ -424,7 +436,8 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
 - **API keys:** `fgb_<base62 random><base62 CRC32>` (bad checksum rejected
   before lookup), SHA-256 at rest, scopes intersected with the owner's
   current permissions, every key expires (default `APIKEYS_MAX_LIFETIME`).
-  Self-service under `/me/api-keys` (`api_keys:*`); only the owner creates,
+  Self-service under `/me/api-keys` (`api_keys:*`); creation is JWT-only (a
+  key never mints keys; a rotated key keeps the old expiry); only the owner creates,
   rotates, or widens; admins list/revoke tenant keys when they outrank the
   owner (`MemberRankChecker` contract). Creation locks the membership through
   `PrincipalLocker.LockPrincipalTx`.
@@ -491,8 +504,11 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
   tenant/user kept 7 days (passkeys listed without key material). Self
   erasure suspends the memberships under the owner lock, fans out one erase
   job per membership plus a finalizer that anonymizes the global user and
-  deletes factors, recovery codes, and passkeys. Admin erasure is
-  tenant-scoped and respects the rank rules.
+  deletes factors, recovery codes, and passkeys. The finalizer retries
+  while a membership remains, and each account-scoped erase job queues a
+  new finalizer after it removes its membership, so a slow erase job cannot
+  outlive the retries. Admin erasure is
+  tenant-scoped, never queues the finalizer, and respects the rank rules.
 - **Notifications:** in-app feed and per-type `in_app`/`email` preferences
   (`PUT /me/notification-preferences/{type}/{channel}`); identity's recipient
   lookup admits only active members of the context tenant; the row and its

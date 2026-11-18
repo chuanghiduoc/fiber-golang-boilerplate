@@ -26,6 +26,27 @@ git show origin/main:docs/openapi.yaml > /tmp/base-openapi.yaml
 
 ## Entries
 
+### 2026-11-18 — Security review fixes
+
+- `POST /api/v1/me/api-keys` accepts a session access token only
+  (`bearerAuth`). A request that authenticates with an API key gets `401`.
+  A key that created keys kept access after its own expiry and revocation.
+  Clients that created keys with a key must create them from a signed-in
+  session. To replace a key from automation, use
+  `POST /api/v1/me/api-keys/{keyId}/rotate`, which still accepts the key.
+- `POST /api/v1/me/mfa/passkeys/options`, `POST /api/v1/me/mfa/passkeys`, and
+  `DELETE /api/v1/me/mfa/passkeys/{passkeyId}` answer `403 auth.mfa_required`
+  when the session does not prove the strongest factor the user has within
+  `MFA_MAX_AGE`: a passkey when one exists, any second factor when only TOTP
+  exists. Clients must call `POST /api/v1/me/mfa/step-up` first. An account
+  with no factor is not affected. The document does not change; `oasdiff`
+  reports nothing for these operations.
+- `POST /api/v1/me/mfa/step-up` with a TOTP or recovery code removes `hwk` and
+  `swk` from the session. After it, an operation with a `platform:*`
+  permission answers `403 auth.mfa_required` until a passkey step-up.
+- `DELETE /api/v1/platform/users/{userId}/mfa` also deletes every passkey of
+  the user. The user must register a passkey again after the reset.
+
 ### 2026-10-29 — Contract corrections found by the repository audit
 
 - `POST /api/v1/me/mfa/recovery-codes` returns `200` with

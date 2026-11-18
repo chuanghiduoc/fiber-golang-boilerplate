@@ -5003,7 +5003,7 @@ paths:
       tags:
         - api-keys
     post:
-      description: Creates a key owned by the authenticated caller. The plaintext key is returned once and never stored. Scopes must be held by the caller.
+      description: "Creates a key owned by the authenticated caller. The plaintext key is returned once and never stored. Scopes must be held by the caller. An API key cannot create keys: the caller must use a session token."
       operationId: createAPIKey
       requestBody:
         content:
@@ -5091,7 +5091,6 @@ paths:
           description: Gateway Timeout
       security:
         - bearerAuth: []
-        - apiKeyAuth: []
       summary: Create an API key
       tags:
         - api-keys
@@ -6348,7 +6347,7 @@ paths:
         - me
   /api/v1/me/mfa/passkeys/options:
     post:
-      description: Returns WebAuthn creation options for the signed-in user. The ceremony expires after five minutes and is single-use.
+      description: Returns WebAuthn creation options for the signed-in user. The ceremony expires after five minutes and is single-use. The session must prove the strongest factor the user has within MFA_MAX_AGE (a passkey when one exists, any second factor when only TOTP exists); otherwise the answer is 403 auth.mfa_required.
       operationId: startPasskeyRegistration
       requestBody:
         content:
@@ -6428,7 +6427,7 @@ paths:
         - me
   /api/v1/me/mfa/passkeys/{passkeyId}:
     delete:
-      description: Removes one of the caller's passkeys. Another user's id behaves as not found.
+      description: Removes one of the caller's passkeys. Another user's id behaves as not found. The session must prove a passkey within MFA_MAX_AGE; otherwise the answer is 403 auth.mfa_required. A user who lost the only passkey recovers through the platform MFA reset.
       operationId: deletePasskey
       parameters:
         - description: Passkey id.
@@ -6694,7 +6693,7 @@ paths:
         - me
   /api/v1/me/mfa/step-up:
     post:
-      description: Verifies a TOTP/recovery code or a passkey assertion and stamps the caller's session as freshly second-factor authenticated. A passkey step-up also adds hwk/swk to the session's amr.
+      description: "Verifies a TOTP/recovery code or a passkey assertion and stamps the caller's session as freshly second-factor authenticated. The session's amr gains the proved method and keeps only that passkey method: a code step-up removes hwk/swk."
       operationId: stepUpMFA
       requestBody:
         content:

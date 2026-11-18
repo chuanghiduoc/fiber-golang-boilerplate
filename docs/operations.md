@@ -491,8 +491,9 @@ another reset email) instead of updating dead rows back to `queued`.
   never extend a session indefinitely.
 - `sessions.mfa_verified_at` is the AAL2 clock: an `otp`/`rc`/`hwk`/`swk`
   sign-in sets it at session creation, `POST /me/mfa/step-up` refreshes it, and
-  a first-factor session leaves it `NULL`. A passkey step-up also adds
-  `hwk`/`swk` to the session's `amr`. MFA-gated routes require it to be at
+  a first-factor session leaves it `NULL`. A step-up adds the method it
+  proved to the session's `amr` and keeps only that passkey method, so a
+  TOTP or recovery-code step-up removes `hwk`/`swk`. MFA-gated routes require it to be at
   most `MFA_MAX_AGE` (default `12h`) old and return `403 auth.mfa_required`
   otherwise; the session cache is invalidated on step-up, so the next request
   sees the new value. Platform permissions use the stricter passkey-only
@@ -590,13 +591,13 @@ is `ready`; a failed module export marks the row `failed` and the job retries.
 | --- | --- |
 | Two export requests for one membership | The partial unique index `idx_data_exports_active` makes the second insert fail; the service returns `409 data_export.in_progress` (the request idempotency key additionally collapses retries). The request also holds the active membership `FOR SHARE` so it cannot slip past an erasure. |
 | Erasure while an export is building | The erasure request updates the tenant's active/ready exports to `expired`; the export job's `running → ready` update is conditional, so a late writer cannot revive it and deletes its own document. The identity eraser deletes every export document (including already-expired ones), and the finalizer sweeps an export that committed just before the last membership was removed. |
-| Retried export/erase jobs | Each job re-reads state and is idempotent: export stops on `ready`/`expired`, a failed/timed-out/panicking export is marked `failed` on a detached context (and stale active rows are purged after a day), erase deletes by `(tenant, user)`, and finalization only anonymizes after every membership is `removed`. |
+| Retried export/erase jobs | Each job re-reads state and is idempotent: export stops on `ready`/`expired`, a failed/timed-out/panicking export is marked `failed` on a detached context (and stale active rows are purged after a day), erase deletes by `(tenant, user)`, and finalization only anonymizes after every membership is `removed`. A finalizer that runs earlier fails and retries with backoff. Each account-scoped erase job also queues a new finalizer after it removes its membership, so the account is anonymized when the retries of an earlier finalizer have ended. |
 | Already-deleted account | A finalizer still queued from an earlier self-erasure request upgrades an account deleted before it ran: it still anonymizes the email/name and deletes credentials, identities, sessions, and tokens. A plain `DELETE /api/v1/members/{memberId}` leaves no finalizer behind, so it does not trigger this upgrade. |
 | Last-admin erasure | The request transaction takes the per-tenant owner lock and returns `409 user.last_admin` before it reserves anything; the per-tenant job re-checks under the same lock if a reserved membership was reactivated, and a refusal there is permanent. |
 | Two owners erase at once | Each self-erasure request suspends (reserves) the caller's membership under the same per-tenant owner advisory lock, so the transactions serialize and the second one counts the first owner already gone and returns `409 user.last_admin` up front. Sequentially the same is true: the second request sees one active owner. The reservation also revokes the member's sessions in that tenant, so neither an upload nor an invitation acceptance can happen while erasure is pending. |
 | Unrequested erase job | A `privacy.erase` job only proceeds for a membership marked by a request (`erasure_requested_at`); a live membership without it is a `jobs.Permanent` refusal, logged at Error with the tenant and user ids, so it dead-letters immediately instead of retrying. |
 | Failed module eraser | In a tenant erase job identity's own eraser runs last; it removes the membership only after every other registered eraser succeeded, so a files/storage outage leaves the membership (and the global user) in place and the job retries. |
-| Missing identity eraser | The job fails instead of reporting a partial erase: without identity's eraser the membership cannot be removed, so the finalizer keeps retrying. |
+| Missing identity eraser | The job fails instead of reporting a partial erase: without identity's eraser the membership cannot be removed, so the erase job retries and the finalizer keeps retrying. If both dead-letter, queue the erase job again; it queues a finalizer when it completes. |
 | Ban vs self-erasure | A suspended membership keeps `banned_at`, `banned_email_hash`, and `banned_email_hash_kid` when removal/erasure removes it; registration, invitation acceptance/sign-up, Google sign-up, the admin seed, and email changes compute the keyed marker under the active and every previous data-encryption key and match any of them, so the anonymized user's old address cannot rejoin the tenant (GDPR Art.17(3)(e)). An erasure reservation is not a ban: it sets `erasure_requested_at`, never a ban column, and `UnbanMembership` refuses a reserved membership. Unban clears all three ban columns while the membership is still suspended; a removed membership keeps them and needs an audited operator action to release the address. |
 
 Erasure has two paths:

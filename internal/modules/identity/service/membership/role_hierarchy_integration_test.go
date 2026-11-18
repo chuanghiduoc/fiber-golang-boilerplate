@@ -289,3 +289,62 @@ func TestInvitations_BanOrRemovalRevokesPendingInvitations(t *testing.T) {
 		`SELECT count(*) FROM invitations WHERE tenant_id = '0192c9b0-7e4a-7000-8000-000000000001' AND invited_by = $1 AND accepted_at IS NULL`, removed.UserID),
 		"a removal revokes the inviter's pending invitations")
 }
+
+// Editing a role definition changes the rank of every member who holds it, so
+// a role with the admin rank follows the member-management rank rule: only a
+// caller who outranks it (an owner) may change it. Without the rule, stripping
+// admin:users:* from a peer's role demotes that peer through the role
+// definition instead of through /members.
+func TestRoleHierarchy_RoleUpdateFollowsRankRule(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
+	owner := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "roleedit-owner@example.com",
+		testutil.MemberOptions{Role: core.RoleOwner})
+	admin := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "roleedit-admin@example.com",
+		testutil.MemberOptions{Role: core.RoleAdmin})
+	roleManager := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "roleedit-manager@example.com",
+		testutil.MemberOptions{})
+	delegated := testutil.CreateMember(t, ctx, e.Pool, tenant.DefaultID, "roleedit-delegated@example.com",
+		testutil.MemberOptions{})
+
+	helper, err := e.Stores.Roles.Create(ctx, core.NewRole{
+		Key: "helper", Name: "Helper",
+		Permissions: []string{string(authz.PermissionAdminUsersRole), string(authz.PermissionAdminUsersBan)},
+	})
+	require.NoError(t, err)
+	require.NoError(t, e.Stores.Roles.ReplaceMemberRoles(ctx, delegated.UserID, []string{"helper"}))
+	_, err = e.Stores.Roles.Create(ctx, core.NewRole{
+		Key: "role_manager", Name: "Role Manager", Permissions: []string{string(identitycatalog.PermissionAdminRolesWrite)},
+	})
+	require.NoError(t, err)
+	require.NoError(t, e.Stores.Roles.ReplaceMemberRoles(ctx, roleManager.UserID, []string{"role_manager"}))
+	viewer, err := e.Stores.Roles.Create(ctx, core.NewRole{Key: "viewer", Name: "Viewer"})
+	require.NoError(t, err)
+
+	noPermissions := []string{}
+	strip := core.RoleUpdate{Permissions: &noPermissions}
+
+	managerCtx := memberContextWithPermissions(roleManager.UserID, core.RoleMember, identitycatalog.PermissionAdminRolesWrite)
+	_, err = e.Roles.Update(managerCtx, helper.ID, strip)
+	assert.Equal(t, string(identitycatalog.CodeRoleInsufficientRank), pgfixtures.AppCode(err),
+		"a member-rank role editor cannot change an admin-rank role")
+	assert.Equal(t, http.StatusForbidden, pgfixtures.AppStatus(err))
+
+	_, err = e.Roles.Update(memberContext(admin.UserID, core.RoleAdmin), helper.ID, strip)
+	assert.Equal(t, string(identitycatalog.CodeRoleInsufficientRank), pgfixtures.AppCode(err),
+		"an admin cannot change a role held by its peers")
+
+	unchanged, err := e.Stores.Roles.Get(ctx, helper.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t,
+		[]string{string(authz.PermissionAdminUsersRole), string(authz.PermissionAdminUsersBan)},
+		unchanged.Permissions, "a refused edit changes nothing")
+
+	renamed := "Read only"
+	_, err = e.Roles.Update(managerCtx, viewer.ID, core.RoleUpdate{Name: &renamed})
+	require.NoError(t, err, "a member-rank role stays editable with admin:roles:write")
+
+	updated, err := e.Roles.Update(memberContext(owner.UserID, core.RoleOwner), helper.ID, strip)
+	require.NoError(t, err, "an owner outranks an admin-rank role")
+	assert.Empty(t, updated.Permissions)
+}

@@ -240,6 +240,19 @@ func (q *Queries) ListPasskeysByUserLimited(ctx context.Context, arg ListPasskey
 	return items, nil
 }
 
+const lockUserPasskeyChanges = `-- name: LockUserPasskeyChanges :exec
+SELECT pg_advisory_xact_lock(hashtextextended('identity.passkey_changes:' || $1::uuid, 0))
+`
+
+// Serializes passkey changes of one user for the rest of the transaction.
+// Passkeys are global to the user, so the key has no tenant. Without it, two
+// registrations can both read "no passkey" and both pass the first-passkey
+// rule, although the second one would need a passkey proof.
+func (q *Queries) LockUserPasskeyChanges(ctx context.Context, userID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, lockUserPasskeyChanges, userID)
+	return err
+}
+
 const updatePasskeyAfterAssertion = `-- name: UpdatePasskeyAfterAssertion :execrows
 UPDATE webauthn_credentials
 SET sign_count = $1,

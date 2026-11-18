@@ -85,6 +85,17 @@ func (r *RoleRepository) Get(ctx context.Context, id uuid.UUID) (*core.Role, err
 	return &role, nil
 }
 
+func (r *RoleRepository) Lock(ctx context.Context, id uuid.UUID) error {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := r.q.LockTenantRole(ctx, identitysqlc.LockTenantRoleParams{ID: id, TenantID: tenantID}); err != nil {
+		return wrapErr(err)
+	}
+	return nil
+}
+
 func (r *RoleRepository) GetByKey(ctx context.Context, key string) (*core.Role, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {

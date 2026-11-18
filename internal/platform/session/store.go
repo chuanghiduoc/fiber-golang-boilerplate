@@ -52,9 +52,10 @@ type State struct {
 	// login or step-up); the zero time means never. AAL2-gated routes compare
 	// it with MFA_MAX_AGE.
 	MFAVerifiedAt time.Time
-	// AMR is the session's current authentication-method set. It is
-	// authoritative for step-up: a passkey step-up adds hwk/swk to the live
-	// session, and the validator unions it with the token snapshot.
+	// AMR is the session's current authentication-method set. It is the
+	// source of the request's amr: a step-up changes the live session (a code
+	// step-up removes hwk/swk, a passkey step-up adds the method it proved),
+	// and the access token's amr claim is only an older snapshot.
 	AMR []string
 	// Active is true when the session is not revoked, the membership is
 	// active, and the user is active.

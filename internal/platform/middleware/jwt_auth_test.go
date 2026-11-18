@@ -1,10 +1,15 @@
 package middleware
 
 import (
+	"slices"
 	"testing"
 )
 
-func TestUnionAMR(t *testing.T) {
+// The live session is the source of the request's amr. A step-up changes the
+// session at once, and the access token is an older snapshot: a method the
+// session dropped (a passkey method after a TOTP step-up) must not come back
+// from the token.
+func TestEffectiveAMR(t *testing.T) {
 	cases := []struct {
 		name    string
 		token   []string
@@ -12,20 +17,14 @@ func TestUnionAMR(t *testing.T) {
 		want    []string
 	}{
 		{name: "session adds a method", token: []string{"pwd"}, session: []string{"pwd", "hwk"}, want: []string{"pwd", "hwk"}},
-		{name: "no session state keeps token", token: []string{"otp"}, session: nil, want: []string{"otp"}},
-		{name: "no duplicate", token: []string{"pwd", "hwk"}, session: []string{"hwk", "swk"}, want: []string{"pwd", "hwk", "swk"}},
+		{name: "session dropped a method", token: []string{"pwd", "hwk"}, session: []string{"pwd", "otp"}, want: []string{"pwd", "otp"}},
+		{name: "store without session methods keeps the token", token: []string{"otp"}, session: nil, want: []string{"otp"}},
 		{name: "both empty", token: nil, session: nil, want: nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := unionAMR(tc.token, tc.session)
-			if len(got) != len(tc.want) {
-				t.Fatalf("unionAMR() = %v, want %v", got, tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("unionAMR() = %v, want %v", got, tc.want)
-				}
+			if got := effectiveAMR(tc.token, tc.session); !slices.Equal(got, tc.want) {
+				t.Fatalf("effectiveAMR() = %v, want %v", got, tc.want)
 			}
 		})
 	}

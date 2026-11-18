@@ -63,6 +63,7 @@ func newPasskeyHarness(t *testing.T) *passkeyHarness {
 	h.svc = NewPasskeyService(PasskeyDeps{
 		Stores: db.Stores(), Tx: fakes.Tx{DB: db}, Cache: h.cache, Sealer: reversibleSealer{},
 		Sessions: h.sessions, WebAuthn: relyingParty, Now: h.clock.now,
+		MFAMaxAge: assuranceTestMaxAge,
 	})
 	h.seedUser(t, fakes.TestID(200), "passkey@example.com")
 	return h
@@ -260,7 +261,8 @@ func TestPasskeyDeleteIsOwnerScoped(t *testing.T) {
 	if err := h.svc.Delete(fakes.TenantCtx(), other, passkey.ID, ReauthProof{SessionID: h.issueSession(t, other), CurrentPassword: ""}); !codeIs(err, identitycatalog.CodeAuthPasskeyNotFound) {
 		t.Fatalf("foreign delete error = %v, want %s", err, identitycatalog.CodeAuthPasskeyNotFound)
 	}
-	if err := h.svc.Delete(fakes.TenantCtx(), fakes.TestID(200), passkey.ID, ReauthProof{SessionID: h.issueSession(t, fakes.TestID(200)), CurrentPassword: ""}); err != nil {
+	ownerSession := h.issueProvenSession(t, fakes.TestID(200), core.PasskeyMethodHardware, h.clock.at)
+	if err := h.svc.Delete(fakes.TenantCtx(), fakes.TestID(200), passkey.ID, ReauthProof{SessionID: ownerSession}); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if _, err := h.svc.List(fakes.TenantCtx(), fakes.TestID(200)); err != nil {
@@ -322,7 +324,9 @@ func TestPasskeyBeginRegistrationExcludesExistingCredential(t *testing.T) {
 	authenticator := softauthenticator.New(t, passkeyTestRPID, passkeyTestOrigin)
 	passkey := h.register(t, authenticator)
 
-	creation, err := h.svc.BeginRegistration(fakes.TenantCtx(), fakes.TestID(200), ReauthProof{SessionID: h.issueSession(t, fakes.TestID(200)), CurrentPassword: ""})
+	creation, err := h.svc.BeginRegistration(fakes.TenantCtx(), fakes.TestID(200), ReauthProof{
+		SessionID: h.issueProvenSession(t, fakes.TestID(200), core.PasskeyMethodHardware, h.clock.at),
+	})
 	if err != nil {
 		t.Fatalf("BeginRegistration: %v", err)
 	}

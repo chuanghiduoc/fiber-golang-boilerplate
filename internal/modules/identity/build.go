@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -67,6 +68,9 @@ type Settings struct {
 	// WebAuthn configures the passkey relying party. An empty RP ID disables
 	// passkey ceremonies (they fail closed with 503).
 	WebAuthn config.WebAuthnConfig
+	// MFAMaxAge is MFA_MAX_AGE: how long a second-factor verification proves a
+	// session for a passkey change. It is the bound the route MFA gate uses.
+	MFAMaxAge time.Duration
 }
 
 // Build constructs identity's repositories, services, and handlers from infra.
@@ -167,6 +171,7 @@ func Build(infra app.Infra, settings Settings, deps Deps) (*Module, error) {
 		passkeySvc = identitymfa.NewPasskeyService(identitymfa.PasskeyDeps{
 			Stores: stores, Tx: transactor, Cache: infra.Cache, Sealer: sealer,
 			Sessions: sessionSvc, WebAuthn: relyingParty, Security: securityNotifier,
+			MFAMaxAge: settings.MFAMaxAge,
 		})
 	}
 

@@ -534,6 +534,8 @@ func TestRequestAdminErasureStaysInTheRequestTenant(t *testing.T) {
 	assert.Equal(t, core.MembershipStatusActive, db.Memberships[[2]uuid.UUID{acme, fakes.TestID(10)}].Status,
 		"the other tenant's membership must stay intact")
 	assert.Empty(t, repo.anonymized, "admin erasure must not anonymize the global user")
+	assert.Empty(t, jobsOfKind(jobsQueue, JobKindEraseFinalize),
+		"a tenant-scoped erase job must never queue account finalization")
 	require.Len(t, tx.audits, 1)
 	assert.Equal(t, "admin.user.erasure_requested", tx.audits[0].Action)
 }
@@ -829,8 +831,69 @@ func TestFinalizeWaitsUntilEveryMembershipIsRemoved(t *testing.T) {
 	tx := &fakePrivateTx{stores: stores}
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx})
 	err := svc.HandleFinalizeJob(fakes.TenantCtx(), mustJSON(FinalizeJob{UserID: fakes.TestID(10)}))
-	assert.ErrorIs(t, err, ErrErasurePending)
+	assert.ErrorIs(t, err, ErrErasurePending, "a finalizer that runs early must retry")
 	assert.Empty(t, repo.anonymized)
+}
+
+// The retries of one finalizer end after some hours, and a slow erase job can
+// outlive them. Each account-scoped erase job therefore queues a finalizer
+// after it removes its membership, so the last one to finish always starts a
+// finalizer that sees every membership removed.
+func TestAccountEraseJobQueuesTheFinalizerAfterItsMembershipIsRemoved(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	db.Users[fakes.TestID(10)] = &core.User{ID: fakes.TestID(10), Email: "privacy@example.com", Name: "Privacy", Status: core.UserStatusActive}
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	registry := privacycontracts.NewRegistry()
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Registry: registry})
+	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: svc, Eraser: svc})
+
+	require.NoError(t, svc.RequestErasure(fakes.TenantCtx(), fakes.TestID(10), "user.erasure_requested"))
+	eraseJobs := jobsOfKind(jobsQueue, JobKindErase)
+	require.Len(t, eraseJobs, 1)
+	queuedBefore := len(jobsOfKind(jobsQueue, JobKindEraseFinalize))
+
+	ctx := tenant.WithID(context.Background(), eraseJobs[0].TenantID)
+	require.NoError(t, svc.HandleEraseJob(ctx, eraseJobs[0].Payload))
+
+	assert.Equal(t, core.MembershipStatusRemoved, db.Memberships[[2]uuid.UUID{tenant.DefaultID, fakes.TestID(10)}].Status)
+	finalizers := jobsOfKind(jobsQueue, JobKindEraseFinalize)
+	require.Len(t, finalizers, queuedBefore+1, "the erase job must queue a finalizer once its membership is gone")
+	require.NoError(t, svc.HandleFinalizeJob(ctx, finalizers[len(finalizers)-1].Payload))
+	assert.Equal(t, []uuid.UUID{fakes.TestID(10)}, repo.anonymized)
+}
+
+// A membership an administrator already reserved has a tenant-scoped erase job
+// that never finalizes the account. A later self-erasure must add an
+// account-scoped job for it, or nothing would run the finalizer after it.
+func TestSelfErasureQueuesAnAccountJobForAMembershipAnAdminReserved(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	db.Users[fakes.TestID(10)] = &core.User{ID: fakes.TestID(10), Email: "privacy@example.com", Name: "Privacy", Status: core.UserStatusActive}
+	markReserved(db.Memberships[[2]uuid.UUID{tenant.DefaultID, fakes.TestID(10)}])
+	jobsQueue := &fakeJobs{}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: &fakePrivateTx{stores: stores, jobs: jobsQueue}})
+
+	require.NoError(t, svc.RequestErasure(fakes.TenantCtx(), fakes.TestID(10), "user.erasure_requested"))
+
+	eraseJobs := jobsOfKind(jobsQueue, JobKindErase)
+	require.Len(t, eraseJobs, 1)
+	var payload EraseJob
+	require.NoError(t, json.Unmarshal(eraseJobs[0].Payload, &payload))
+	assert.Equal(t, EraseScopeAccount, payload.Scope)
+}
+
+func jobsOfKind(queue *fakeJobs, kind string) []jobs.Job {
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	var matched []jobs.Job
+	for _, job := range queue.jobs {
+		if job.Kind == kind {
+			matched = append(matched, job)
+		}
+	}
+	return matched
 }
 
 func TestFinalizeAnonymizesWhenAllMembershipsAreRemoved(t *testing.T) {

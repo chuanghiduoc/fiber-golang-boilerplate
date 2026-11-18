@@ -298,11 +298,11 @@ ceremonies live under `/auth`.
 | `DELETE /me/mfa/{factorId}` | Require a current TOTP/recovery code; delete the factor and codes, revoke other sessions. |
 | `POST /me/mfa/recovery-codes` | Require a code; return ten new codes and invalidate the old set. |
 | `GET /me/mfa/passkeys[/{passkeyId}]` | List the caller's passkeys or read one by id without credential/public-key material; another owner is `404`. |
-| `POST /me/mfa/step-up` | Refresh `sessions.mfa_verified_at` with a current TOTP/recovery code or a passkey assertion; used when an MFA-gated route returns `403 auth.mfa_required` for staleness. A passkey step-up also adds `hwk`/`swk` to the session's `amr`. |
-| `POST /me/mfa/passkeys/options`, `POST /me/mfa/passkeys`, `DELETE /me/mfa/passkeys/{passkeyId}` | WebAuthn registration ceremony and factor lifecycle. Options are JWT-only and `No-store`; the attestation is verified with user verification required and stored by credential id (global to the user). |
+| `POST /me/mfa/step-up` | Refresh `sessions.mfa_verified_at` with a current TOTP/recovery code or a passkey assertion; used when an MFA-gated route returns `403 auth.mfa_required` for staleness. The step-up adds the method it proved to the session's `amr` and keeps only that passkey method: a code step-up removes `hwk`/`swk`, so it cannot refresh the passkey-only gate. |
+| `POST /me/mfa/passkeys/options`, `POST /me/mfa/passkeys`, `DELETE /me/mfa/passkeys/{passkeyId}` | WebAuthn registration ceremony and factor lifecycle. Options are JWT-only and `No-store`; the attestation is verified with user verification required and stored by credential id (global to the user). Adding or deleting a passkey needs a session that proves the strongest factor the user has, no older than `MFA_MAX_AGE`: a passkey when one exists, any second factor when only TOTP exists, and only the re-authentication when the user has no factor. Otherwise the answer is `403 auth.mfa_required`. |
 | `POST /auth/mfa/verifications` | Public: single-use, tenant-bound, five-minute challenge plus TOTP/recovery code → normal tokens. |
 | `POST /auth/passkeys/options`, `POST /auth/passkeys/verifications` | Public WebAuthn login ceremony. Options are discoverable and never reveal whether an email hint exists; a verified assertion issues the normal token pair with `hwk`/`swk` and a fresh `mfa_verified_at`. |
-| `DELETE /platform/users/{userId}/mfa` | Platform recovery: delete factors and recovery codes, revoke every session, bump `token_version`, Tier 1 audit. |
+| `DELETE /platform/users/{userId}/mfa` | Platform recovery: delete the TOTP factor, the recovery codes, and every passkey, revoke every session, bump `token_version`, Tier 1 audit. It is the recovery path for a user who lost the only passkey. |
 
 A confirmed TOTP factor makes password and Google login return `200` with
 `mfaRequired: true` and `mfaChallengeToken` instead of tokens. Passkeys are a
@@ -317,7 +317,10 @@ a reason class only. `authzhttp.RequireMFA(maxAge)` requires `otp`/`rc`/`hwk`/
 `hwk`/`swk` satisfy it, so a TOTP or recovery code cannot reach a cross-tenant
 platform operation. A passkey login or step-up records `hwk` (device-bound) or
 `swk` (backup-eligible) per RFC 8176 and sets `mfa_verified_at`; a signature
-counter regression is treated as a cloned authenticator and rejected.
+counter regression is treated as a cloned authenticator and rejected. The
+session row is the source of the request's `amr`, and a TOTP or recovery-code
+step-up removes `hwk`/`swk` from it. A passkey method on a session therefore
+proves that `mfa_verified_at` came from a passkey.
 
 ## Tenants and members
 

@@ -72,6 +72,9 @@ type PasskeyDeps struct {
 	Sessions *SessionService
 	WebAuthn *webauthn.WebAuthn
 	Security *SecurityNotifier
+	// MFAMaxAge is how long a second-factor verification proves the session
+	// for a passkey change (MFA_MAX_AGE, the bound the route MFA gate uses).
+	MFAMaxAge time.Duration
 	// Now is a test seam; nil uses time.Now.
 	Now func() time.Time
 }
@@ -262,6 +265,11 @@ func (s *passkeyService) BeginRegistration(ctx context.Context, userID uuid.UUID
 	if err != nil {
 		return nil, apperror.NewInternal("tenant context is required")
 	}
+	// Refuse before the ceremony starts, so the client learns at once that it
+	// must step up. FinishRegistration checks again in its transaction.
+	if err := s.ensureFactorChangeAllowed(ctx, s.Stores, userID, tenantID, proof.SessionID); err != nil {
+		return nil, err
+	}
 	user, err := s.Stores.Users.GetByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -388,26 +396,53 @@ func (s *passkeyService) ensureRegistrationAuthorized(ctx context.Context, tx Tx
 		}
 		return apperror.NewInternal("failed to verify membership")
 	}
-	if ceremony.SessionID == uuid.Nil {
+	return s.ensureFactorChangeAllowedTx(ctx, tx, userID, ceremony.TenantID, ceremony.SessionID)
+}
+
+// ensureFactorChangeAllowedTx is ensureFactorChangeAllowed for the transaction
+// that writes the change. It takes the per-user passkey lock first, so the
+// factor state it reads cannot change before the write: two concurrent first
+// registrations would otherwise both read "no passkey".
+func (s *passkeyService) ensureFactorChangeAllowedTx(ctx context.Context, tx TxRepos, userID, tenantID, sessionID uuid.UUID) error {
+	if err := tx.Passkeys.LockChanges(ctx, userID); err != nil {
+		return apperror.NewInternal("failed to lock passkey changes")
+	}
+	return s.ensureFactorChangeAllowed(ctx, tx.Stores, userID, tenantID, sessionID)
+}
+
+// ensureFactorChangeAllowed checks that sessionID is the caller's live session
+// in tenantID and that it proves the strongest factor the user has enrolled
+// (see ensureFactorChangeAssurance). A transaction that writes the change
+// calls ensureFactorChangeAllowedTx instead.
+func (s *passkeyService) ensureFactorChangeAllowed(ctx context.Context, stores Stores, userID, tenantID, sessionID uuid.UUID) error {
+	if sessionID == uuid.Nil {
 		return apperror.NewUnauthorized("session is required")
 	}
-	session, err := tx.Sessions.Get(ctx, ceremony.SessionID)
+	session, err := stores.Sessions.Get(ctx, sessionID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return mfaReauthRequired()
 		}
 		return apperror.NewInternal("failed to verify session")
 	}
-	if session.UserID != userID || session.TenantID != ceremony.TenantID ||
+	if session.UserID != userID || session.TenantID != tenantID ||
 		session.RevokedAt != nil || !session.ExpiresAt.After(s.now()) {
 		return mfaReauthRequired()
 	}
-	return nil
+	enrolled, err := strongestEnrolledFactor(ctx, stores, userID)
+	if err != nil {
+		return err
+	}
+	return ensureFactorChangeAssurance(enrolled, session, s.now(), s.MFAMaxAge)
 }
 
 func (s *passkeyService) Delete(ctx context.Context, userID, passkeyID uuid.UUID, proof ReauthProof) error {
 	if err := s.reauthenticate(ctx, userID, proof); err != nil {
 		return err
+	}
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return apperror.NewInternal("tenant context is required")
 	}
 	user, err := s.Stores.Users.GetByID(ctx, userID)
 	if err != nil {
@@ -417,6 +452,11 @@ func (s *passkeyService) Delete(ctx context.Context, userID, passkeyID uuid.UUID
 		return apperror.NewInternal("failed to load user")
 	}
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		// Deleting the passkeys would leave an account that a weaker proof
+		// can enroll a new passkey on, so deletion needs the same proof.
+		if err := s.ensureFactorChangeAllowedTx(ctx, tx, userID, tenantID, proof.SessionID); err != nil {
+			return err
+		}
 		passkey, err := tx.Passkeys.Get(ctx, userID, passkeyID)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
@@ -648,7 +688,7 @@ func (s *passkeyService) StepUpPasskey(ctx context.Context, userID, sessionID uu
 		if !advanced {
 			return passkeySignCountInvalid()
 		}
-		ts, err := tx.Sessions.MarkMFAVerifiedWithMethod(ctx, userID, sessionID, method)
+		ts, err := tx.Sessions.MarkMFAVerified(ctx, userID, sessionID, method)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewUnauthorized("session is no longer valid")

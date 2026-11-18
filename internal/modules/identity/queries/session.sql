@@ -83,13 +83,18 @@ WHERE s.user_id = @user_id AND u.id = s.user_id
 
 -- name: RestampSession :one
 -- Re-issues the session that performed an MFA change under the user's new
--- token version and adds the second factor to its amr. Tenant-scoped: only a
+-- token version and adds the second factor to its amr. The method is merged
+-- in this statement, from the row as it is now: a value computed from an
+-- earlier read could put back a passkey method that a concurrent code step-up
+-- removed. Tenant-scoped: only a
 -- live session of the request tenant can be restamped. The caller's previous
 -- access token still carries the old version and stops verifying; the re-issue
 -- replaces the session's refresh-token family (DeleteSessionRefreshTokens) and
 -- mints a new pair.
 UPDATE sessions
-SET token_version = @token_version, amr = @amr, last_used_at = NOW()
+SET token_version = @token_version,
+    amr = ARRAY(SELECT DISTINCT unnest(amr || @method::text)),
+    last_used_at = NOW()
 WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
   AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING *;
@@ -129,20 +134,17 @@ WHERE tenant_id = @tenant_id AND id = @id
 -- Step-up: record a fresh second-factor proof on the session that performed
 -- it. A revoked or foreign session matches no row, so the step-up fails closed
 -- instead of refreshing a session the caller does not hold.
-UPDATE sessions
-SET mfa_verified_at = NOW(), updated_at = NOW()
-WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
-  AND revoked_at IS NULL AND expires_at > NOW()
-RETURNING mfa_verified_at;
-
--- name: MarkSessionMFAVerifiedWithMethod :one
--- Passkey step-up: record the fresh proof and add the phishing-resistant amr
--- method to the session, so later RequireMFA checks accept the session without
--- re-issuing its tokens. Tenant-scoped and fail-closed on a foreign/revoked
--- session.
+-- The session's amr keeps its other methods but only the passkey method this
+-- step-up proved: a TOTP or recovery-code step-up removes hwk/swk. With that,
+-- a passkey method on a session always means that mfa_verified_at came from a
+-- passkey, which is what the passkey-only gate of platform:* relies on.
 UPDATE sessions
 SET mfa_verified_at = NOW(), updated_at = NOW(),
-    amr = ARRAY(SELECT DISTINCT unnest(amr || @method::text))
+    amr = ARRAY(
+        SELECT DISTINCT proven.method
+        FROM unnest(amr || @method::text) AS proven(method)
+        WHERE proven.method = @method::text OR proven.method NOT IN ('hwk', 'swk')
+    )
 WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
   AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING mfa_verified_at;

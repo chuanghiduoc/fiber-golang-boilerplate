@@ -607,6 +607,10 @@ type PasskeyRepository interface {
 	ListByUserLimited(ctx context.Context, userID uuid.UUID, limit int32) ([]Passkey, bool, error)
 	GetByCredentialID(ctx context.Context, credentialID []byte) (*Passkey, error)
 	Get(ctx context.Context, userID, id uuid.UUID) (*Passkey, error)
+	// LockChanges serializes passkey changes of one user until the
+	// transaction ends, in every tenant. A check of the user's factors and
+	// the write that follows it must run under this lock.
+	LockChanges(ctx context.Context, userID uuid.UUID) error
 	// Delete reports whether a credential of userID was deleted.
 	Delete(ctx context.Context, userID, id uuid.UUID) (bool, error)
 	DeleteByUser(ctx context.Context, userID uuid.UUID) error
@@ -719,9 +723,11 @@ type SessionRepository interface {
 	// except keepID (an MFA change keeps the session that performed it).
 	RevokeOtherUserSessions(ctx context.Context, userID, keepID uuid.UUID, reason RevokeReason) error
 	// Restamp re-issues one live session of the request tenant under
-	// tokenVersion with amr, keeping the same session row. It returns
-	// apperror.ErrNotFound when the session is not live in the request tenant.
-	Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, amr []string) (*Session, error)
+	// tokenVersion and adds method to its amr, keeping the same session row.
+	// The store merges method into the amr the row has at write time. It
+	// returns apperror.ErrNotFound when the session is not live in the request
+	// tenant.
+	Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, method string) (*Session, error)
 	// DeleteRefreshTokens removes every refresh token of the session. A
 	// re-issued session replaces its family: a token minted before the MFA
 	// change must not refresh into the stronger amr.
@@ -732,13 +738,12 @@ type SessionRepository interface {
 	RevokeByRefreshToken(ctx context.Context, tokenHash []byte, reason RevokeReason) (userID uuid.UUID, revoked bool, err error)
 	Touch(ctx context.Context, id uuid.UUID, userAgent, ip string) error
 	// MarkMFAVerified records a fresh second-factor proof on the caller's own
-	// live session and returns the new timestamp. A revoked or foreign session
-	// returns apperror.ErrNotFound.
-	MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID) (time.Time, error)
-	// MarkMFAVerifiedWithMethod records a fresh second-factor proof and adds
-	// method to the session's amr set, so a passkey step-up makes later
-	// RequireMFA checks accept the session without re-issuing its tokens.
-	MarkMFAVerifiedWithMethod(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error)
+	// live session and returns its time. method is the amr value the step-up
+	// proved. The session keeps its other methods, but a passkey method (hwk,
+	// swk) stays only when method is that passkey method, so a code step-up
+	// never leaves a passkey proof behind. An unknown, foreign, revoked, or
+	// expired session is apperror.ErrNotFound.
+	MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error)
 	// State loads the validator view of a session of userID in tenantID. The
 	// tenant predicate is defense in depth; the validator also compares the
 	// returned TenantID with the token's tenant.
@@ -864,6 +869,9 @@ type RoleRepository interface {
 	ListCursor(ctx context.Context, cur pagination.DBCursor) ([]Role, error)
 	// Get returns a system role or a role of the request tenant.
 	Get(ctx context.Context, id uuid.UUID) (*Role, error)
+	// Lock takes a row lock on a tenant role until the transaction ends. It
+	// returns apperror.ErrNotFound for a system role or another tenant's role.
+	Lock(ctx context.Context, id uuid.UUID) error
 	// GetByKey returns a system role or a role of the request tenant.
 	GetByKey(ctx context.Context, key string) (*Role, error)
 	Create(ctx context.Context, in NewRole) (*Role, error)

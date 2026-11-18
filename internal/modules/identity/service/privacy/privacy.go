@@ -78,8 +78,20 @@ type ExportJob struct {
 	UserID   uuid.UUID `json:"userId"`
 }
 
+// EraseScope says how far an erase job reaches. A tenant-scoped job (an
+// administrator erasing a member) ends with the membership; an account-scoped
+// job (the user erasing their account) also queues the account finalizer.
+type EraseScope string
+
+const (
+	EraseScopeTenant  EraseScope = ""
+	EraseScopeAccount EraseScope = "account"
+)
+
 type EraseJob struct {
 	UserID uuid.UUID `json:"userId"`
+	// Scope is empty for a tenant-scoped erasure.
+	Scope EraseScope `json:"scope,omitempty"`
 }
 
 type FinalizeJob struct {
@@ -654,17 +666,21 @@ func (s *PrivacyService) RequestErasure(ctx context.Context, userID uuid.UUID, a
 		}
 		sort.Slice(memberships, func(i, j int) bool { return memberships[i].TenantID.String() < memberships[j].TenantID.String() })
 
-		erasePayload, _ := json.Marshal(EraseJob{UserID: userID})
+		erasePayload, _ := json.Marshal(EraseJob{UserID: userID, Scope: EraseScopeAccount})
 		for i := range memberships {
 			m := &memberships[i]
 			tctx := tenant.WithID(ctx, m.TenantID)
-			queue, err := reserveMembershipForErasure(tctx, tx, userID)
+			hasMembership, err := reserveMembershipForErasure(tctx, tx, userID)
 			if err != nil {
 				return err
 			}
-			if !queue {
+			if !hasMembership {
 				continue
 			}
+			// A membership reserved earlier (by an administrator, or by a
+			// replay of this request) still gets an account-scoped job: only
+			// that scope queues the finalizer, and a second erase job for one
+			// membership is a no-op because every eraser is idempotent.
 			if err := tx.Privacy.ExpireForUser(tctx, userID); err != nil {
 				return apperror.NewInternal("failed to expire data exports")
 			}
@@ -689,12 +705,12 @@ func (s *PrivacyService) RequestErasure(ctx context.Context, userID uuid.UUID, a
 
 // reserveMembershipForErasure suspends one membership inside the request
 // transaction, without ban markers, and revokes its sessions. It reports
-// queue=false when the membership is already reserved by an earlier request
-// (its job exists) and true when the caller must enqueue one. An already
-// removed membership has no row to reserve but still needs its erasers run.
+// whether the user has a membership row in the tenant. A membership that an
+// earlier request reserved, or that is already removed, is left as it is; the
+// caller still queues an erase job for it.
 // Lock order matches every membership mutation: the target row first, then the
 // per-tenant owner-change lock inside ensureNotLastOwner.
-func reserveMembershipForErasure(ctx context.Context, tx TxRepos, userID uuid.UUID) (bool, error) {
+func reserveMembershipForErasure(ctx context.Context, tx TxRepos, userID uuid.UUID) (hasMembership bool, err error) {
 	if err := tx.Memberships.LockMembership(ctx, userID); err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return false, nil
@@ -712,7 +728,7 @@ func reserveMembershipForErasure(ctx context.Context, tx TxRepos, userID uuid.UU
 		return true, nil
 	}
 	if current.Membership.ErasureRequestedAt != nil {
-		return false, nil
+		return true, nil
 	}
 	if current.Membership.Status == MembershipStatusActive && current.Membership.Role == RoleOwner {
 		if err := ensureNotLastOwner(ctx, tx.Memberships, "cannot erase the last active owner"); err != nil {
@@ -1269,7 +1285,38 @@ func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMes
 		}
 		return err
 	}
-	return s.EraseUserInTenant(ctx, tenantID, in.UserID)
+	if err := s.EraseUserInTenant(ctx, tenantID, in.UserID); err != nil {
+		return err
+	}
+	if in.Scope != EraseScopeAccount {
+		return nil
+	}
+	return s.enqueueFinalizer(ctx, in.UserID)
+}
+
+// enqueueFinalizer queues the account finalizer after an account-scoped erase
+// job removed its membership. Every such job queues one, so the job that
+// finishes last starts a finalizer that sees every membership removed, also
+// when the finalizer of the request has used all its attempts. If this
+// enqueue fails, the erase job retries, and the finalizers queued earlier
+// still retry. A retry of the erase job queues another finalizer; the
+// finalizer is idempotent.
+func (s *PrivacyService) enqueueFinalizer(ctx context.Context, userID uuid.UUID) error {
+	payload, err := json.Marshal(FinalizeJob{UserID: userID})
+	if err != nil {
+		return jobs.Permanent(fmt.Errorf("encode privacy.erase.finalize payload: %w", err))
+	}
+	return s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if tx.Jobs == nil {
+			return errors.New("privacy.erase: the job queue is not configured")
+		}
+		if _, err := tx.Jobs.Enqueue(ctx, jobs.Job{
+			Kind: JobKindEraseFinalize, Payload: payload, MaxAttempts: 20,
+		}); err != nil {
+			return fmt.Errorf("queue erasure finalization: %w", err)
+		}
+		return nil
+	})
 }
 
 // eraseUserInTenant runs every registered tenant eraser for one user, identity
@@ -1339,7 +1386,12 @@ func (s *PrivacyService) checkErasureRequest(ctx context.Context, userID uuid.UU
 }
 
 // HandleFinalizeJob anonymizes the global user only after every membership has
-// been removed. Until then it fails so the job retries with backoff.
+// been removed. Until then it fails, so the job retries with backoff. The
+// retries alone are not enough: a slow erase job can outlive them. Each
+// account-scoped erase job therefore also queues a new finalizer when its
+// membership is gone. The two paths cover each other: a retry runs the
+// finalizer when a successor could not be queued, and a successor runs it
+// when the retries ended.
 func (s *PrivacyService) HandleFinalizeJob(ctx context.Context, payload json.RawMessage) error {
 	var in FinalizeJob
 	if err := json.Unmarshal(payload, &in); err != nil || in.UserID == uuid.Nil {

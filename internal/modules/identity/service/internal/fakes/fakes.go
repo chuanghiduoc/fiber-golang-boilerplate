@@ -670,7 +670,7 @@ func (r Sessions) RevokeOtherUserSessions(_ context.Context, userID, keepID uuid
 	return nil
 }
 
-func (r Sessions) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, amr []string) (*Session, error) {
+func (r Sessions) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, method string) (*Session, error) {
 	r.DB.Mu.Lock()
 	defer r.DB.Mu.Unlock()
 	s, ok := r.DB.Sessions[id]
@@ -678,7 +678,10 @@ func (r Sessions) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersio
 		s.RevokedAt != nil || !s.ExpiresAt.After(time.Now()) {
 		return nil, apperror.ErrNotFound
 	}
-	s.TokenVersion, s.AMR, s.LastUsedAt = tokenVersion, amr, time.Now()
+	if !containsString(s.AMR, method) {
+		s.AMR = append(append([]string(nil), s.AMR...), method)
+	}
+	s.TokenVersion, s.LastUsedAt = tokenVersion, time.Now()
 	c := *s
 	return &c, nil
 }
@@ -717,7 +720,7 @@ func (r Sessions) Touch(ctx context.Context, id uuid.UUID, userAgent, ip string)
 	return nil
 }
 
-func (r Sessions) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID) (time.Time, error) {
+func (r Sessions) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error) {
 	r.DB.Mu.Lock()
 	defer r.DB.Mu.Unlock()
 	s, ok := r.DB.Sessions[sessionID]
@@ -727,20 +730,15 @@ func (r Sessions) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UU
 	}
 	now := time.Now()
 	s.MFAVerifiedAt = &now
-	return now, nil
-}
-
-func (r Sessions) MarkMFAVerifiedWithMethod(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error) {
-	r.DB.Mu.Lock()
-	defer r.DB.Mu.Unlock()
-	s, ok := r.DB.Sessions[sessionID]
-	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) ||
-		s.RevokedAt != nil || !s.ExpiresAt.After(time.Now()) {
-		return time.Time{}, apperror.ErrNotFound
+	kept := make([]string, 0, len(s.AMR)+1)
+	for _, existing := range s.AMR {
+		if existing == method || existing == PasskeyMethodHardware || existing == PasskeyMethodSoftware {
+			continue
+		}
+		kept = append(kept, existing)
 	}
-	now := time.Now()
-	s.MFAVerifiedAt = &now
-	s.AMR = withAMR(s.AMR, method)
+	kept = append(kept, method)
+	s.AMR = kept
 	return now, nil
 }
 
@@ -1271,6 +1269,8 @@ func (r Passkeys) Delete(_ context.Context, userID, id uuid.UUID) (bool, error) 
 	return true, nil
 }
 
+func (r Passkeys) LockChanges(context.Context, uuid.UUID) error { return nil }
+
 func (r Passkeys) DeleteByUser(_ context.Context, userID uuid.UUID) error {
 	r.DB.Mu.Lock()
 	defer r.DB.Mu.Unlock()
@@ -1317,6 +1317,7 @@ func (r Roles) ListCursor(context.Context, pagination.DBCursor) ([]Role, error) 
 func (r Roles) Get(context.Context, uuid.UUID) (*Role, error) {
 	return nil, errFakeNotImplemented
 }
+func (r Roles) Lock(context.Context, uuid.UUID) error { return nil }
 func (r Roles) Create(context.Context, NewRole) (*Role, error) {
 	return nil, errFakeNotImplemented
 }
@@ -1334,14 +1335,4 @@ func (r Roles) ReplaceMemberRoles(context.Context, uuid.UUID, []string) error {
 }
 func (r Roles) AssignPlatformRole(context.Context, uuid.UUID, string) error {
 	return errFakeNotImplemented
-}
-
-// withAMR appends method to amr unless it is already present.
-func withAMR(amr []string, method string) []string {
-	for _, value := range amr {
-		if value == method {
-			return append([]string(nil), amr...)
-		}
-	}
-	return append(append([]string(nil), amr...), method)
 }
