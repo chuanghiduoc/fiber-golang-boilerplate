@@ -115,7 +115,7 @@ Policy shorthand in the tables: `Public` / `Permission` / `AnyOf` / `JWT-only`
 | `GET /api/v1/me/mfa/passkeys/{passkeyId}` | `getPasskey` | `mfa:read`, JWT-only, relaxed, No-store | → `200 PasskeyResponse`; another owner is `404` | new (passkey status) |
 | `DELETE /api/v1/me/mfa/passkeys/{passkeyId}` | `deletePasskey` | `mfa:write`, JWT-only, normal, Tier1(`auth.passkey_deleted`) | → `204` | new (passkey enrollment) |
 | `GET /api/v1/me/api-keys` | `listMyAPIKeys` | `api_keys:read`, relaxed | → `200 pagination.List[APIKeyResponse]` | `GET /admin/api-keys` |
-| `POST /api/v1/me/api-keys` | `createAPIKey` | `api_keys:create`, normal, No-store, Tier1(`api_key.created`) | `{name,scopes,expiresAt?}` → `201 Location`, `{key,...}` | `POST /admin/api-keys` |
+| `POST /api/v1/me/api-keys` | `createAPIKey` | `api_keys:create`, JWT-only, normal, No-store, Tier1(`api_key.created`) | `{name,scopes,expiresAt?}` → `201 Location`, `{key,...}` | `POST /admin/api-keys` |
 | `GET /api/v1/me/api-keys/{keyId}` | `getMyAPIKey` | `api_keys:read`, relaxed | → `200 APIKeyResponse` | `GET /admin/api-keys/{id}` |
 | `PATCH /api/v1/me/api-keys/{keyId}` | `updateMyAPIKey` | `api_keys:update`, normal, Idempotent, merge-patch, Tier1(`api_key.updated`) | `{name?,scopes?}` → `200 APIKeyResponse` | `PUT /admin/api-keys/{id}` |
 | `DELETE /api/v1/me/api-keys/{keyId}` | `deleteMyAPIKey` | `api_keys:revoke`, normal, Idempotent, Tier1(`api_key.revoked`) | → `204` | `DELETE /admin/api-keys/{id}` and `POST /admin/api-keys/{id}/revoke` |

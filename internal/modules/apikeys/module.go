@@ -78,12 +78,15 @@ func (m *Module) RegisterRoutes(api *httpapi.API, _ app.Deps) {
 		OperationID: "createAPIKey",
 		Tags:        tags,
 		Summary:     "Create an API key",
-		Description: "Creates a key owned by the authenticated caller. The plaintext key is returned once and never stored. Scopes must be held by the caller.",
+		Description: "Creates a key owned by the authenticated caller. The plaintext key is returned once and never stored. Scopes must be held by the caller. An API key cannot create keys: the caller must use a session token.",
 	}, httpapi.Policy{
 		Permission: apikeyscatalog.PermissionAPIKeysCreate,
-		RateLimit:  httpapi.RateLimitNormal,
-		NoStore:    true,
-		Audit:      httpapi.AuditPolicy{Tier1Action: "api_key.created"},
+		// A key that mints keys would outlive its own expiry and revocation
+		// through its children, so only the owner's session creates one.
+		JWTOnly:   true,
+		RateLimit: httpapi.RateLimitNormal,
+		NoStore:   true,
+		Audit:     httpapi.AuditPolicy{Tier1Action: "api_key.created"},
 	}, m.handler.CreateMine)
 
 	httpapi.Register(api, httpapi.Op{

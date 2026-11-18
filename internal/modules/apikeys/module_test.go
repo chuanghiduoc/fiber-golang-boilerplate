@@ -516,3 +516,21 @@ func TestModule_OperationsMatchRouteMap(t *testing.T) {
 		t.Fatalf("registered %d operations, want %d", len(seen), len(expected))
 	}
 }
+
+// Minting a key is reserved for the owner's own session. A key that could
+// create keys would outlive its own expiry and revocation through its
+// children. Rotation stays available to a key: a successor never outlives the
+// key it replaces.
+func TestModule_OnlyASessionCreatesAPIKeys(t *testing.T) {
+	application := newModuleTestApp(t, &fakeService{})
+	jwtOnly := map[string]bool{}
+	for _, op := range application.HTTP().Operations() {
+		jwtOnly[op.Op.OperationID] = op.Policy.JWTOnly
+	}
+	if !jwtOnly["createAPIKey"] {
+		t.Fatal("createAPIKey must be JWT-only")
+	}
+	if jwtOnly["rotateMyAPIKey"] {
+		t.Fatal("rotateMyAPIKey must stay available to API-key callers")
+	}
+}

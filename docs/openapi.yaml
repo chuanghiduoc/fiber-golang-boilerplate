@@ -5003,7 +5003,7 @@ paths:
       tags:
         - api-keys
     post:
-      description: Creates a key owned by the authenticated caller. The plaintext key is returned once and never stored. Scopes must be held by the caller.
+      description: "Creates a key owned by the authenticated caller. The plaintext key is returned once and never stored. Scopes must be held by the caller. An API key cannot create keys: the caller must use a session token."
       operationId: createAPIKey
       requestBody:
         content:
@@ -5091,7 +5091,6 @@ paths:
           description: Gateway Timeout
       security:
         - bearerAuth: []
-        - apiKeyAuth: []
       summary: Create an API key
       tags:
         - api-keys

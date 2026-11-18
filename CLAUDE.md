@@ -426,7 +426,8 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
 - **API keys:** `fgb_<base62 random><base62 CRC32>` (bad checksum rejected
   before lookup), SHA-256 at rest, scopes intersected with the owner's
   current permissions, every key expires (default `APIKEYS_MAX_LIFETIME`).
-  Self-service under `/me/api-keys` (`api_keys:*`); only the owner creates,
+  Self-service under `/me/api-keys` (`api_keys:*`); creation is JWT-only (a
+  key never mints keys; a rotated key keeps the old expiry); only the owner creates,
   rotates, or widens; admins list/revoke tenant keys when they outrank the
   owner (`MemberRankChecker` contract). Creation locks the membership through
   `PrincipalLocker.LockPrincipalTx`.

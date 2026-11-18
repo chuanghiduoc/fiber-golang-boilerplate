@@ -26,6 +26,15 @@ git show origin/main:docs/openapi.yaml > /tmp/base-openapi.yaml
 
 ## Entries
 
+### 2026-11-18 — Security review fixes
+
+- `POST /api/v1/me/api-keys` accepts a session access token only
+  (`bearerAuth`). A request that authenticates with an API key gets `401`.
+  A key that created keys kept access after its own expiry and revocation.
+  Clients that created keys with a key must create them from a signed-in
+  session. To replace a key from automation, use
+  `POST /api/v1/me/api-keys/{keyId}/rotate`, which still accepts the key.
+
 ### 2026-10-29 — Contract corrections found by the repository audit
 
 - `POST /api/v1/me/mfa/recovery-codes` returns `200` with
