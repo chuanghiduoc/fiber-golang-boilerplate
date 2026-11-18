@@ -153,7 +153,7 @@ func (r *SessionRepository) RevokeStaleForUser(ctx context.Context, userID uuid.
 	return nil
 }
 
-func (r *SessionRepository) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, amr []string) (*core.Session, error) {
+func (r *SessionRepository) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, method string) (*core.Session, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return nil, err
@@ -163,7 +163,7 @@ func (r *SessionRepository) Restamp(ctx context.Context, userID, id uuid.UUID, t
 		UserID:       userID,
 		ID:           id,
 		TokenVersion: tokenVersion,
-		Amr:          amr,
+		Method:       method,
 	})
 	if err != nil {
 		return nil, wrapErr(err)

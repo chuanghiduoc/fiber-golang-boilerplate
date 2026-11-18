@@ -1296,8 +1296,11 @@ func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMes
 
 // enqueueFinalizer queues the account finalizer after an account-scoped erase
 // job removed its membership. Every such job queues one, so the job that
-// finishes last runs a finalizer that sees every membership removed. A retry
-// of the erase job queues another; the finalizer is idempotent.
+// finishes last starts a finalizer that sees every membership removed, also
+// when the finalizer of the request has used all its attempts. If this
+// enqueue fails, the erase job retries, and the finalizers queued earlier
+// still retry. A retry of the erase job queues another finalizer; the
+// finalizer is idempotent.
 func (s *PrivacyService) enqueueFinalizer(ctx context.Context, userID uuid.UUID) error {
 	payload, err := json.Marshal(FinalizeJob{UserID: userID})
 	if err != nil {
@@ -1383,21 +1386,18 @@ func (s *PrivacyService) checkErasureRequest(ctx context.Context, userID uuid.UU
 }
 
 // HandleFinalizeJob anonymizes the global user only after every membership has
-// been removed. A finalizer that runs earlier completes without a change: each
-// account-scoped erase job queues a new one when its membership is gone, so
-// the wait must not spend the attempts of this job. A slow erase job would
-// otherwise outlive the finalizer and leave the account not anonymized.
+// been removed. Until then it fails, so the job retries with backoff. The
+// retries alone are not enough: a slow erase job can outlive them. Each
+// account-scoped erase job therefore also queues a new finalizer when its
+// membership is gone. The two paths cover each other: a retry runs the
+// finalizer when a successor could not be queued, and a successor runs it
+// when the retries ended.
 func (s *PrivacyService) HandleFinalizeJob(ctx context.Context, payload json.RawMessage) error {
 	var in FinalizeJob
 	if err := json.Unmarshal(payload, &in); err != nil || in.UserID == uuid.Nil {
 		return jobs.Permanent(fmt.Errorf("invalid privacy.erase.finalize payload"))
 	}
 	anonymized, err := s.finalizeUser(ctx, in.UserID)
-	if errors.Is(err, ErrErasurePending) {
-		slog.InfoContext(ctx, "erasure finalization is waiting for tenant erase jobs",
-			slog.String("user_id", in.UserID.String()))
-		return nil
-	}
 	if err != nil {
 		return err
 	}

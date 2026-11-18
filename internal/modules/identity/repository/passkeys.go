@@ -121,6 +121,10 @@ func (r *PasskeyRepository) Delete(ctx context.Context, userID, id uuid.UUID) (b
 	return n > 0, nil
 }
 
+func (r *PasskeyRepository) LockChanges(ctx context.Context, userID uuid.UUID) error {
+	return wrapErr(r.q.LockUserPasskeyChanges(ctx, userID))
+}
+
 func (r *PasskeyRepository) DeleteByUser(ctx context.Context, userID uuid.UUID) error {
 	return wrapErr(r.q.DeletePasskeysByUser(ctx, userID))
 }

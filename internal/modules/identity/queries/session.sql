@@ -83,13 +83,18 @@ WHERE s.user_id = @user_id AND u.id = s.user_id
 
 -- name: RestampSession :one
 -- Re-issues the session that performed an MFA change under the user's new
--- token version and adds the second factor to its amr. Tenant-scoped: only a
+-- token version and adds the second factor to its amr. The method is merged
+-- in this statement, from the row as it is now: a value computed from an
+-- earlier read could put back a passkey method that a concurrent code step-up
+-- removed. Tenant-scoped: only a
 -- live session of the request tenant can be restamped. The caller's previous
 -- access token still carries the old version and stops verifying; the re-issue
 -- replaces the session's refresh-token family (DeleteSessionRefreshTokens) and
 -- mints a new pair.
 UPDATE sessions
-SET token_version = @token_version, amr = @amr, last_used_at = NOW()
+SET token_version = @token_version,
+    amr = ARRAY(SELECT DISTINCT unnest(amr || @method::text)),
+    last_used_at = NOW()
 WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
   AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING *;

@@ -50,3 +50,10 @@ SET sign_count = @sign_count,
     updated_at = NOW()
 WHERE id = @id AND user_id = @user_id
   AND (sign_count < @sign_count OR (@sign_count = 0 AND sign_count = 0));
+
+-- name: LockUserPasskeyChanges :exec
+-- Serializes passkey changes of one user for the rest of the transaction.
+-- Passkeys are global to the user, so the key has no tenant. Without it, two
+-- registrations can both read "no passkey" and both pass the first-passkey
+-- rule, although the second one would need a passkey proof.
+SELECT pg_advisory_xact_lock(hashtextextended('identity.passkey_changes:' || @user_id::uuid, 0));

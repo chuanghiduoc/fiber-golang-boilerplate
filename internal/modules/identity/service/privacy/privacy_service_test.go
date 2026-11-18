@@ -659,8 +659,8 @@ func TestEraseJobRunsIdentityLastSoAFailureKeepsTheMembership(t *testing.T) {
 	assert.Equal(t, core.MembershipStatusSuspended, db.Memberships[[2]uuid.UUID{tenant.DefaultID, fakes.TestID(10)}].Status,
 		"identity must not remove the membership when another module failed")
 
-	require.NoError(t, svc.HandleFinalizeJob(fakes.TenantCtx(), mustJSON(FinalizeJob{UserID: fakes.TestID(10)})),
-		"a pending finalizer completes without spending retries; the erase job queues the next one")
+	err = svc.HandleFinalizeJob(fakes.TenantCtx(), mustJSON(FinalizeJob{UserID: fakes.TestID(10)}))
+	assert.ErrorIs(t, err, ErrErasurePending)
 	assert.Empty(t, repo.anonymized)
 }
 
@@ -830,14 +830,15 @@ func TestFinalizeWaitsUntilEveryMembershipIsRemoved(t *testing.T) {
 	db.Memberships[[2]uuid.UUID{acme, fakes.TestID(10)}] = &core.Membership{ID: fakes.TestID(101), TenantID: acme, UserID: fakes.TestID(10), Role: core.RoleMember, Status: core.MembershipStatusRemoved}
 	tx := &fakePrivateTx{stores: stores}
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx})
-	require.NoError(t, svc.HandleFinalizeJob(fakes.TenantCtx(), mustJSON(FinalizeJob{UserID: fakes.TestID(10)})),
-		"waiting must not fail the job: a failed attempt would exhaust the finalizer before a slow erase job ends")
+	err := svc.HandleFinalizeJob(fakes.TenantCtx(), mustJSON(FinalizeJob{UserID: fakes.TestID(10)}))
+	assert.ErrorIs(t, err, ErrErasurePending, "a finalizer that runs early must retry")
 	assert.Empty(t, repo.anonymized)
 }
 
-// The finalizer is driven by the erase jobs, not by its own retries: each
-// account-scoped erase job queues a finalizer after it removes its membership,
-// so the last one to finish always sees every membership removed.
+// The retries of one finalizer end after some hours, and a slow erase job can
+// outlive them. Each account-scoped erase job therefore queues a finalizer
+// after it removes its membership, so the last one to finish always starts a
+// finalizer that sees every membership removed.
 func TestAccountEraseJobQueuesTheFinalizerAfterItsMembershipIsRemoved(t *testing.T) {
 	repo := newFakePrivacyRepo()
 	stores, db := privacyTestStores(repo)

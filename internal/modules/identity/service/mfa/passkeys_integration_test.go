@@ -235,9 +235,9 @@ func TestPasskeyChangeNeedsAPasskeySessionAndResetDeletesPasskeys(t *testing.T) 
 	assert.Zero(t, remaining, "the platform reset removes every passkey")
 }
 
-// The account finalizer is driven by the erase jobs: a finalizer that runs
-// while a membership remains completes without a change, and the
-// account-scoped erase job queues a new one after it removes its membership.
+// A finalizer that runs while a membership remains fails and retries. The
+// account-scoped erase job also queues a new finalizer after it removes its
+// membership, so the account is anonymized when the retries have ended.
 func TestSelfErasureEraseJobQueuesTheFinalizerInDatabase(t *testing.T) {
 	e := pgfixtures.NewEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
@@ -262,8 +262,8 @@ func TestSelfErasureEraseJobQueuesTheFinalizerInDatabase(t *testing.T) {
 	require.Equal(t, int64(1), queued(privacy.JobKindErase))
 	require.Equal(t, int64(1), queued(privacy.JobKindEraseFinalize))
 
-	require.NoError(t, svc.HandleFinalizeJob(ctx, finalizePayload),
-		"a finalizer that runs before the erase job must not fail")
+	require.ErrorIs(t, svc.HandleFinalizeJob(ctx, finalizePayload), privacy.ErrErasurePending,
+		"a finalizer that runs before the erase job must retry")
 	assert.Equal(t, "erasure-finalizer@example.com",
 		scalar[string](t, e.Pool, `SELECT email FROM users WHERE id = $1`, member.User.ID),
 		"the account is untouched while a membership remains")
@@ -277,4 +277,65 @@ func TestSelfErasureEraseJobQueuesTheFinalizerInDatabase(t *testing.T) {
 	assert.NotEqual(t, "erasure-finalizer@example.com",
 		scalar[string](t, e.Pool, `SELECT email FROM users WHERE id = $1`, member.User.ID),
 		"the finalizer anonymizes the account once every membership is removed")
+}
+
+// The re-issue after an MFA change merges the new method into the amr the
+// session row has at write time. It must not write back a value read earlier:
+// that could restore a passkey method a concurrent code step-up removed.
+func TestRestampMergesTheMethodIntoTheCurrentAMR(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	member := registerPasskeyUser(t, e, "passkey-restamp@example.com")
+	pair, err := e.Sessions.Issue(ctx, member.User.ID, member.User.TokenVersion,
+		[]string{core.AMRPassword, core.PasskeyMethodHardware})
+	require.NoError(t, err)
+	// A code step-up commits after the caller read the session.
+	_, err = e.Stores.Sessions.MarkMFAVerified(ctx, member.User.ID, pair.SessionID, core.AMRRecoveryCode)
+	require.NoError(t, err)
+
+	restamped, err := e.Stores.Sessions.Restamp(ctx, member.User.ID, pair.SessionID, member.User.TokenVersion, core.AMROTP)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{core.AMRPassword, core.AMRRecoveryCode, core.AMROTP}, restamped.AMR,
+		"the restamp adds its method and does not restore the removed passkey method")
+}
+
+// The factor check and the insert of a registration run under the per-user
+// passkey lock. Without it, two registrations that start while the account has
+// no passkey both read "no passkey" and both pass the first-passkey rule. The
+// test holds the lock on another connection and checks that the registration
+// waits for it.
+func TestPasskeyRegistrationWaitsForThePerUserLock(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	member := registerPasskeyUser(t, e, "passkey-lock@example.com")
+	authenticator := softauthenticator.New(t, integrationPasskeyRPID, integrationPasskeyOrigin)
+	creation, err := e.Passkeys.BeginRegistration(ctx, member.User.ID, passkeyReauthProof(t, e, ctx, member.User))
+	require.NoError(t, err)
+	attestation := authenticator.Attestation(t, creation.Response.Challenge.String())
+
+	holder, err := e.Pool.Begin(context.Background())
+	require.NoError(t, err)
+	defer func() { _ = holder.Rollback(context.Background()) }()
+	_, err = holder.Exec(context.Background(),
+		`SELECT pg_advisory_xact_lock(hashtextextended('identity.passkey_changes:' || $1::uuid, 0))`, member.User.ID)
+	require.NoError(t, err)
+
+	finished := make(chan error, 1)
+	go func() {
+		_, err := e.Passkeys.FinishRegistration(ctx, member.User.ID, "Waiting key", attestation)
+		finished <- err
+	}()
+	select {
+	case err := <-finished:
+		t.Fatalf("registration finished while the passkey lock was held (err = %v)", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	require.NoError(t, holder.Rollback(context.Background()))
+	select {
+	case err := <-finished:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("registration did not finish after the lock was released")
+	}
 }

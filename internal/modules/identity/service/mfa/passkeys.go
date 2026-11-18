@@ -396,13 +396,24 @@ func (s *passkeyService) ensureRegistrationAuthorized(ctx context.Context, tx Tx
 		}
 		return apperror.NewInternal("failed to verify membership")
 	}
-	return s.ensureFactorChangeAllowed(ctx, tx.Stores, userID, ceremony.TenantID, ceremony.SessionID)
+	return s.ensureFactorChangeAllowedTx(ctx, tx, userID, ceremony.TenantID, ceremony.SessionID)
+}
+
+// ensureFactorChangeAllowedTx is ensureFactorChangeAllowed for the transaction
+// that writes the change. It takes the per-user passkey lock first, so the
+// factor state it reads cannot change before the write: two concurrent first
+// registrations would otherwise both read "no passkey".
+func (s *passkeyService) ensureFactorChangeAllowedTx(ctx context.Context, tx TxRepos, userID, tenantID, sessionID uuid.UUID) error {
+	if err := tx.Passkeys.LockChanges(ctx, userID); err != nil {
+		return apperror.NewInternal("failed to lock passkey changes")
+	}
+	return s.ensureFactorChangeAllowed(ctx, tx.Stores, userID, tenantID, sessionID)
 }
 
 // ensureFactorChangeAllowed checks that sessionID is the caller's live session
 // in tenantID and that it proves the strongest factor the user has enrolled
-// (see ensureFactorChangeAssurance). stores are the caller's transaction
-// stores when the check guards a write.
+// (see ensureFactorChangeAssurance). A transaction that writes the change
+// calls ensureFactorChangeAllowedTx instead.
 func (s *passkeyService) ensureFactorChangeAllowed(ctx context.Context, stores Stores, userID, tenantID, sessionID uuid.UUID) error {
 	if sessionID == uuid.Nil {
 		return apperror.NewUnauthorized("session is required")
@@ -443,7 +454,7 @@ func (s *passkeyService) Delete(ctx context.Context, userID, passkeyID uuid.UUID
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		// Deleting the passkeys would leave an account that a weaker proof
 		// can enroll a new passkey on, so deletion needs the same proof.
-		if err := s.ensureFactorChangeAllowed(ctx, tx.Stores, userID, tenantID, proof.SessionID); err != nil {
+		if err := s.ensureFactorChangeAllowedTx(ctx, tx, userID, tenantID, proof.SessionID); err != nil {
 			return err
 		}
 		passkey, err := tx.Passkeys.Get(ctx, userID, passkeyID)

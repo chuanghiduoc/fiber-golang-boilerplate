@@ -607,6 +607,10 @@ type PasskeyRepository interface {
 	ListByUserLimited(ctx context.Context, userID uuid.UUID, limit int32) ([]Passkey, bool, error)
 	GetByCredentialID(ctx context.Context, credentialID []byte) (*Passkey, error)
 	Get(ctx context.Context, userID, id uuid.UUID) (*Passkey, error)
+	// LockChanges serializes passkey changes of one user until the
+	// transaction ends, in every tenant. A check of the user's factors and
+	// the write that follows it must run under this lock.
+	LockChanges(ctx context.Context, userID uuid.UUID) error
 	// Delete reports whether a credential of userID was deleted.
 	Delete(ctx context.Context, userID, id uuid.UUID) (bool, error)
 	DeleteByUser(ctx context.Context, userID uuid.UUID) error
@@ -719,9 +723,11 @@ type SessionRepository interface {
 	// except keepID (an MFA change keeps the session that performed it).
 	RevokeOtherUserSessions(ctx context.Context, userID, keepID uuid.UUID, reason RevokeReason) error
 	// Restamp re-issues one live session of the request tenant under
-	// tokenVersion with amr, keeping the same session row. It returns
-	// apperror.ErrNotFound when the session is not live in the request tenant.
-	Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, amr []string) (*Session, error)
+	// tokenVersion and adds method to its amr, keeping the same session row.
+	// The store merges method into the amr the row has at write time. It
+	// returns apperror.ErrNotFound when the session is not live in the request
+	// tenant.
+	Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, method string) (*Session, error)
 	// DeleteRefreshTokens removes every refresh token of the session. A
 	// re-issued session replaces its family: a token minted before the MFA
 	// change must not refresh into the stronger amr.

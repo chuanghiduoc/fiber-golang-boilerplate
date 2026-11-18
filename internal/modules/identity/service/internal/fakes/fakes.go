@@ -670,7 +670,7 @@ func (r Sessions) RevokeOtherUserSessions(_ context.Context, userID, keepID uuid
 	return nil
 }
 
-func (r Sessions) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, amr []string) (*Session, error) {
+func (r Sessions) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, method string) (*Session, error) {
 	r.DB.Mu.Lock()
 	defer r.DB.Mu.Unlock()
 	s, ok := r.DB.Sessions[id]
@@ -678,7 +678,10 @@ func (r Sessions) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersio
 		s.RevokedAt != nil || !s.ExpiresAt.After(time.Now()) {
 		return nil, apperror.ErrNotFound
 	}
-	s.TokenVersion, s.AMR, s.LastUsedAt = tokenVersion, amr, time.Now()
+	if !containsString(s.AMR, method) {
+		s.AMR = append(append([]string(nil), s.AMR...), method)
+	}
+	s.TokenVersion, s.LastUsedAt = tokenVersion, time.Now()
 	c := *s
 	return &c, nil
 }
@@ -1265,6 +1268,8 @@ func (r Passkeys) Delete(_ context.Context, userID, id uuid.UUID) (bool, error) 
 	delete(r.DB.Passkeys, id)
 	return true, nil
 }
+
+func (r Passkeys) LockChanges(context.Context, uuid.UUID) error { return nil }
 
 func (r Passkeys) DeleteByUser(_ context.Context, userID uuid.UUID) error {
 	r.DB.Mu.Lock()

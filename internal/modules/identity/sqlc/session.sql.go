@@ -406,7 +406,9 @@ func (q *Queries) PurgeStaleSessions(ctx context.Context, arg PurgeStaleSessions
 
 const restampSession = `-- name: RestampSession :one
 UPDATE sessions
-SET token_version = $1, amr = $2, last_used_at = NOW()
+SET token_version = $1,
+    amr = ARRAY(SELECT DISTINCT unnest(amr || $2::text)),
+    last_used_at = NOW()
 WHERE tenant_id = $3 AND user_id = $4 AND id = $5
   AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at, last_used_at, revoked_at, revoked_reason, created_at, updated_at
@@ -414,14 +416,17 @@ RETURNING id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr
 
 type RestampSessionParams struct {
 	TokenVersion int32     `json:"token_version"`
-	Amr          []string  `json:"amr"`
+	Method       string    `json:"method"`
 	TenantID     uuid.UUID `json:"tenant_id"`
 	UserID       uuid.UUID `json:"user_id"`
 	ID           uuid.UUID `json:"id"`
 }
 
 // Re-issues the session that performed an MFA change under the user's new
-// token version and adds the second factor to its amr. Tenant-scoped: only a
+// token version and adds the second factor to its amr. The method is merged
+// in this statement, from the row as it is now: a value computed from an
+// earlier read could put back a passkey method that a concurrent code step-up
+// removed. Tenant-scoped: only a
 // live session of the request tenant can be restamped. The caller's previous
 // access token still carries the old version and stops verifying; the re-issue
 // replaces the session's refresh-token family (DeleteSessionRefreshTokens) and
@@ -429,7 +434,7 @@ type RestampSessionParams struct {
 func (q *Queries) RestampSession(ctx context.Context, arg RestampSessionParams) (Session, error) {
 	row := q.db.QueryRow(ctx, restampSession,
 		arg.TokenVersion,
-		arg.Amr,
+		arg.Method,
 		arg.TenantID,
 		arg.UserID,
 		arg.ID,

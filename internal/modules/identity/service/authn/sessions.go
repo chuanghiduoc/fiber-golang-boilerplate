@@ -202,7 +202,7 @@ func (s *SessionService) reissueTx(ctx context.Context, st Stores, userID, sessi
 		}
 		return TokenPair{}, apperror.NewInternal("failed to load membership")
 	}
-	restamped, err := st.Sessions.Restamp(ctx, userID, sessionID, member.User.TokenVersion, withAMR(current.AMR, method))
+	restamped, err := st.Sessions.Restamp(ctx, userID, sessionID, member.User.TokenVersion, method)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return TokenPair{}, nil
@@ -221,16 +221,6 @@ func (s *SessionService) reissueTx(ctx context.Context, st Stores, userID, sessi
 		return TokenPair{}, err
 	}
 	return TokenPair{AccessToken: access, RefreshToken: refresh, SessionID: restamped.ID}, nil
-}
-
-// withAMR returns amr plus method, without duplicating one already present.
-func withAMR(amr []string, method string) []string {
-	for _, value := range amr {
-		if value == method {
-			return append([]string(nil), amr...)
-		}
-	}
-	return append(append([]string(nil), amr...), method)
 }
 
 // Refresh rotates a refresh token. The token must belong to the request
