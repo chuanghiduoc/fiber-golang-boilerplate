@@ -30,6 +30,12 @@ until the first release, and legacy access tokens must be re-issued.
 - The Kubernetes seed Job owns `ADMIN_EMAIL`/`ADMIN_NAME` in a seed-only
   ConfigMap. The shared app ConfigMap no longer carries `ADMIN_*`, because the
   API has no `ADMIN_PASSWORD` and would refuse to start.
+- `POST /me/api-keys` accepts a session token only; an API key can no longer
+  create keys (#157).
+- Adding or deleting a passkey needs a fresh proof of the strongest factor
+  the user has (`403 auth.mfa_required` otherwise), a TOTP or recovery-code
+  step-up removes `hwk`/`swk` from the session, and
+  `DELETE /platform/users/{userId}/mfa` also deletes passkeys (#157).
 
 ### Added
 - Tenant-scoped RBAC with role management and platform tenant administration
@@ -55,6 +61,14 @@ until the first release, and legacy access tokens must be re-issued.
 - Storage driver `minio` is replaced by `seaweedfs` (#106); PostgreSQL 18
   (#107) and Redis 8 (#108) are the supported versions.
 - Dependabot waits 14 days before proposing a release (#119).
+
+### Fixed
+- The passkey-only gate of `platform:*` operations could be reached with a
+  password or a TOTP code (#157).
+- `PATCH /roles/{roleId}` skipped the rank rule, so a role editor could
+  demote a peer or a higher-ranked member through the role definition (#157).
+- The self-erasure finalizer could run out of attempts before the erase jobs
+  ended and leave the account not anonymized (#157).
 
 ## [1.0.1] - 2026-02-28
 
