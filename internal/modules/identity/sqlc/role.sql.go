@@ -385,6 +385,27 @@ func (q *Queries) LockPermissionSync(ctx context.Context) error {
 	return err
 }
 
+const lockTenantRole = `-- name: LockTenantRole :one
+SELECT id FROM roles
+WHERE id = $1 AND tenant_id = $2::uuid
+FOR UPDATE
+`
+
+type LockTenantRoleParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Locks a tenant role definition for the rest of the transaction, so a rank
+// check on its permissions cannot race a concurrent permission edit. System
+// roles (tenant_id IS NULL) match no row; they are never edited.
+func (q *Queries) LockTenantRole(ctx context.Context, arg LockTenantRoleParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockTenantRole, arg.ID, arg.TenantID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const prunePermissions = `-- name: PrunePermissions :exec
 DELETE FROM permissions
 WHERE key <> ALL($1::text[])

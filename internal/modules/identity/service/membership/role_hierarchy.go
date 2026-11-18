@@ -121,6 +121,63 @@ func canGrantRank(callerRank, roleRank int) bool {
 	return callerRank >= roleRank
 }
 
+// callerAuthority is the request caller's standing in the tenant hierarchy.
+// system is true for a context without a subject that carries the authz
+// system marker (jobs, seeding); rank is meaningless then.
+type callerAuthority struct {
+	rank   int
+	system bool
+}
+
+// resolveCallerRank reads the caller's highest effective rank from its active
+// membership in the request tenant. A context with neither a subject nor the
+// system marker, or a caller without an active membership, is denied.
+func resolveCallerRank(ctx context.Context, stores Stores) (callerAuthority, error) {
+	subject, ok := authz.SubjectFromContext(ctx)
+	if !ok {
+		if authz.IsSystemContext(ctx) {
+			return callerAuthority{system: true}, nil
+		}
+		return callerAuthority{}, permissionDenied()
+	}
+	caller, err := stores.Memberships.GetActive(ctx, subject.UserID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return callerAuthority{}, permissionDenied()
+		}
+		return callerAuthority{}, apperror.NewInternal("failed to load caller membership")
+	}
+	rank, err := highestEffectiveRank(ctx, stores.Roles, caller.Membership.Roles)
+	if err != nil {
+		return callerAuthority{}, err
+	}
+	return callerAuthority{rank: rank}, nil
+}
+
+// ensureCanManageRole applies the member-management rank rule to a role
+// definition. Changing a role's permissions changes the rank of every member
+// who holds it, so a role with the admin rank may only be changed by a caller
+// who could manage those members directly. Member-rank roles carry no
+// authority over other members and stay editable with admin:roles:write. It
+// must run inside the mutation transaction, after the role row is locked.
+func ensureCanManageRole(ctx context.Context, stores Stores, role *Role) error {
+	rank := effectiveRoleRank(role)
+	if rank == roleRankMember {
+		return nil
+	}
+	caller, err := resolveCallerRank(ctx, stores)
+	if err != nil {
+		return err
+	}
+	if caller.system {
+		return nil
+	}
+	if !canManageRank(caller.rank, rank) {
+		return insufficientRank("cannot change a role with an equal or higher rank")
+	}
+	return nil
+}
+
 // EnsureCanManageMember checks that the caller may change the target
 // membership (role change, demotion, ban, unban, removal) in the request
 // tenant. It must run inside the mutation transaction: it locks the target
@@ -130,24 +187,14 @@ func canGrantRank(callerRank, roleRank int) bool {
 // lock order. A caller without a subject is allowed only under
 // authz.SystemContext.
 func EnsureCanManageMember(ctx context.Context, stores Stores, targetUserID uuid.UUID) error {
-	subject, ok := authz.SubjectFromContext(ctx)
-	if !ok {
-		if authz.IsSystemContext(ctx) {
-			return nil
-		}
-		return permissionDenied()
-	}
-	caller, err := stores.Memberships.GetActive(ctx, subject.UserID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return permissionDenied()
-		}
-		return apperror.NewInternal("failed to load caller membership")
-	}
-	callerRank, err := highestEffectiveRank(ctx, stores.Roles, caller.Membership.Roles)
+	caller, err := resolveCallerRank(ctx, stores)
 	if err != nil {
 		return err
 	}
+	if caller.system {
+		return nil
+	}
+	callerRank := caller.rank
 	if err := stores.Memberships.LockMembership(ctx, targetUserID); err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewNotFound("user not found")
@@ -176,24 +223,14 @@ func EnsureCanManageMember(ctx context.Context, stores Stores, targetUserID uuid
 // the caller must hold every permission the roles grant. A caller without a
 // subject is allowed only under authz.SystemContext.
 func EnsureCanGrantRoles(ctx context.Context, stores Stores, roleKeys []string) error {
-	subject, ok := authz.SubjectFromContext(ctx)
-	if !ok {
-		if authz.IsSystemContext(ctx) {
-			return nil
-		}
-		return permissionDenied()
-	}
-	caller, err := stores.Memberships.GetActive(ctx, subject.UserID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return permissionDenied()
-		}
-		return apperror.NewInternal("failed to load caller membership")
-	}
-	callerRank, err := highestEffectiveRank(ctx, stores.Roles, caller.Membership.Roles)
+	caller, err := resolveCallerRank(ctx, stores)
 	if err != nil {
 		return err
 	}
+	if caller.system {
+		return nil
+	}
+	callerRank := caller.rank
 	for _, key := range roleKeys {
 		role, err := stores.Roles.GetByKey(ctx, key)
 		if err != nil {

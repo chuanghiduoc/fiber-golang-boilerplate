@@ -1317,6 +1317,7 @@ func (r Roles) ListCursor(context.Context, pagination.DBCursor) ([]Role, error) 
 func (r Roles) Get(context.Context, uuid.UUID) (*Role, error) {
 	return nil, errFakeNotImplemented
 }
+func (r Roles) Lock(context.Context, uuid.UUID) error { return nil }
 func (r Roles) Create(context.Context, NewRole) (*Role, error) {
 	return nil, errFakeNotImplemented
 }

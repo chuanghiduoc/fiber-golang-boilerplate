@@ -119,6 +119,12 @@ func (s *roleService) Update(ctx context.Context, id uuid.UUID, in RoleUpdate) (
 	in.ID = id
 	var updated *Role
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		// The lock makes the rank check below read the permissions this
+		// transaction will replace. A system role has no lockable row; the
+		// read that follows reports it.
+		if err := tx.Roles.Lock(ctx, id); err != nil && !errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewInternal("failed to lock role")
+		}
 		existing, err := tx.Roles.Get(ctx, id)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
@@ -128,6 +134,9 @@ func (s *roleService) Update(ctx context.Context, id uuid.UUID, in RoleUpdate) (
 		}
 		if existing.System() {
 			return apperror.NewBadRequest("system roles cannot be modified")
+		}
+		if err := ensureCanManageRole(ctx, tx.Stores, existing); err != nil {
+			return err
 		}
 		name := existing.Name
 		if in.Name != nil {

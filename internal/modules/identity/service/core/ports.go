@@ -864,6 +864,9 @@ type RoleRepository interface {
 	ListCursor(ctx context.Context, cur pagination.DBCursor) ([]Role, error)
 	// Get returns a system role or a role of the request tenant.
 	Get(ctx context.Context, id uuid.UUID) (*Role, error)
+	// Lock takes a row lock on a tenant role until the transaction ends. It
+	// returns apperror.ErrNotFound for a system role or another tenant's role.
+	Lock(ctx context.Context, id uuid.UUID) error
 	// GetByKey returns a system role or a role of the request tenant.
 	GetByKey(ctx context.Context, key string) (*Role, error)
 	Create(ctx context.Context, in NewRole) (*Role, error)

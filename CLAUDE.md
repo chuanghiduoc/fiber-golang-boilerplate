@@ -407,7 +407,9 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
   listed grants. Rank (owner 3 > admin 2 > member/tenant roles 1; a tenant
   role with any `admin:users:*` permission ranks as admin) gates member
   management in the mutation transaction with the target membership locked
-  (403 `role.insufficient_rank`). Platform permissions go to
+  (403 `role.insufficient_rank`). The same rule gates `PATCH /roles/{roleId}`
+  on a tenant role that has the admin rank: only a caller who outranks it may
+  change it, with the role row locked. Platform permissions go to
   `platform_admin` only and are the only cross-tenant access. Service-level
   checks use `authz.Authorize` (subject ⇒ permission + policies; no subject
   but `authz.SystemContext` ⇒ allowed; neither ⇒ 403). Job, event, and seed
