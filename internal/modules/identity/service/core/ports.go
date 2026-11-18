@@ -732,13 +732,12 @@ type SessionRepository interface {
 	RevokeByRefreshToken(ctx context.Context, tokenHash []byte, reason RevokeReason) (userID uuid.UUID, revoked bool, err error)
 	Touch(ctx context.Context, id uuid.UUID, userAgent, ip string) error
 	// MarkMFAVerified records a fresh second-factor proof on the caller's own
-	// live session and returns the new timestamp. A revoked or foreign session
-	// returns apperror.ErrNotFound.
-	MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID) (time.Time, error)
-	// MarkMFAVerifiedWithMethod records a fresh second-factor proof and adds
-	// method to the session's amr set, so a passkey step-up makes later
-	// RequireMFA checks accept the session without re-issuing its tokens.
-	MarkMFAVerifiedWithMethod(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error)
+	// live session and returns its time. method is the amr value the step-up
+	// proved. The session keeps its other methods, but a passkey method (hwk,
+	// swk) stays only when method is that passkey method, so a code step-up
+	// never leaves a passkey proof behind. An unknown, foreign, revoked, or
+	// expired session is apperror.ErrNotFound.
+	MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error)
 	// State loads the validator view of a session of userID in tenantID. The
 	// tenant predicate is defense in depth; the validator also compares the
 	// returned TenantID with the token's tenant.

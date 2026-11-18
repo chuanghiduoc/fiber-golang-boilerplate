@@ -23,7 +23,7 @@ func (m *Module) registerPasskeyRoutes(api *httpapi.API, deps app.Deps) {
 		OperationID: "startPasskeyRegistration",
 		Tags:        []string{meTag},
 		Summary:     "Start passkey registration",
-		Description: "Returns WebAuthn creation options for the signed-in user. The ceremony expires after five minutes and is single-use.",
+		Description: "Returns WebAuthn creation options for the signed-in user. The ceremony expires after five minutes and is single-use. The session must prove the strongest factor the user has within MFA_MAX_AGE (a passkey when one exists, any second factor when only TOTP exists); otherwise the answer is 403 auth.mfa_required.",
 	}, httpapi.Policy{
 		Permission: identitycatalog.PermissionMFAWrite,
 		JWTOnly:    true,
@@ -80,7 +80,7 @@ func (m *Module) registerPasskeyRoutes(api *httpapi.API, deps app.Deps) {
 		OperationID: "deletePasskey",
 		Tags:        []string{meTag},
 		Summary:     "Delete a passkey",
-		Description: "Removes one of the caller's passkeys. Another user's id behaves as not found.",
+		Description: "Removes one of the caller's passkeys. Another user's id behaves as not found. The session must prove a passkey within MFA_MAX_AGE; otherwise the answer is 403 auth.mfa_required. A user who lost the only passkey recovers through the platform MFA reset.",
 	}, httpapi.Policy{
 		Permission: identitycatalog.PermissionMFAWrite,
 		JWTOnly:    true,
@@ -121,7 +121,7 @@ func (m *Module) registerPasskeyRoutes(api *httpapi.API, deps app.Deps) {
 		OperationID: "stepUpMFA",
 		Tags:        []string{meTag},
 		Summary:     "Refresh MFA freshness",
-		Description: "Verifies a TOTP/recovery code or a passkey assertion and stamps the caller's session as freshly second-factor authenticated. A passkey step-up also adds hwk/swk to the session's amr.",
+		Description: "Verifies a TOTP/recovery code or a passkey assertion and stamps the caller's session as freshly second-factor authenticated. The session's amr gains the proved method and keeps only that passkey method: a code step-up removes hwk/swk.",
 	}, httpapi.Policy{
 		Permission: identitycatalog.PermissionMFAWrite,
 		JWTOnly:    true,

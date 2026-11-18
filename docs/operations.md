@@ -491,8 +491,9 @@ another reset email) instead of updating dead rows back to `queued`.
   never extend a session indefinitely.
 - `sessions.mfa_verified_at` is the AAL2 clock: an `otp`/`rc`/`hwk`/`swk`
   sign-in sets it at session creation, `POST /me/mfa/step-up` refreshes it, and
-  a first-factor session leaves it `NULL`. A passkey step-up also adds
-  `hwk`/`swk` to the session's `amr`. MFA-gated routes require it to be at
+  a first-factor session leaves it `NULL`. A step-up adds the method it
+  proved to the session's `amr` and keeps only that passkey method, so a
+  TOTP or recovery-code step-up removes `hwk`/`swk`. MFA-gated routes require it to be at
   most `MFA_MAX_AGE` (default `12h`) old and return `403 auth.mfa_required`
   otherwise; the session cache is invalidated on step-up, so the next request
   sees the new value. Platform permissions use the stricter passkey-only

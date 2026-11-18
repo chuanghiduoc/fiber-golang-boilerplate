@@ -368,8 +368,12 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
   `otp`, `rc`, `hwk`, or `swk`. `RequireMFA` accepts `otp|rc|hwk|swk` with
   `sessions.mfa_verified_at` within `MFA_MAX_AGE` (default 12h);
   `POST /me/mfa/step-up` refreshes it with a TOTP/recovery code or a passkey
-  assertion. `CreateSession` refuses, in SQL, a session without a second
-  factor for a user with one. Lost factors: `DELETE /platform/users/{userId}/mfa`.
+  assertion. The session row is the source of the request's `amr` (the token
+  claim is a snapshot), and a step-up keeps only the passkey method it
+  proved: a code step-up removes `hwk`/`swk`, so a passkey method always
+  means `mfa_verified_at` came from a passkey. `CreateSession` refuses, in
+  SQL, a session without a second factor for a user with one. Lost factors:
+  `DELETE /platform/users/{userId}/mfa` (TOTP, recovery codes, and passkeys).
 - **Passkeys (WebAuthn, `go-webauthn`):** `webauthn_credentials` per global
   user; `WEBAUTHN_RP_ID`/`WEBAUTHN_RP_NAME`/`WEBAUTHN_RP_ORIGINS` (required in
   production, https origins in the RP domain; unset locally disables passkeys
@@ -382,8 +386,14 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
   the sign counter advances with a conditional UPDATE and a regression is 401
   `auth.passkey_sign_count_invalid`. A device-bound credential records `hwk`,
   a synced one `swk`. Every operation with a `platform:*` permission requires
-  a passkey-verified session (TOTP is not enough). Register/delete/login are
-  Tier 1 and send security emails.
+  a passkey-verified session (TOTP is not enough). Adding or deleting a
+  passkey needs a fresh proof (`MFA_MAX_AGE`) of the strongest factor the
+  user has, checked again in the write transaction: a passkey when one
+  exists, any second factor when only TOTP exists, and only the
+  re-authenticated session when there is none (the first passkey), else 403
+  `auth.mfa_required`. A user who lost the only passkey recovers through the
+  platform MFA reset. Register/delete/login are Tier 1 and send security
+  emails.
 - **Google sign-in:** PKCE (S256), no offline access, signed tenant-bound
   state keyed by `OAUTH_STATE_KEY` (independent of the JWT key); the callback
   redirects with a 256-bit, 60s, single-use `#code=` redeemed at

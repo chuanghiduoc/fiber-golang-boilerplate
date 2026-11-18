@@ -332,13 +332,19 @@ func (q *Queries) ListLiveSessionsCursor(ctx context.Context, arg ListLiveSessio
 
 const markSessionMFAVerified = `-- name: MarkSessionMFAVerified :one
 UPDATE sessions
-SET mfa_verified_at = NOW(), updated_at = NOW()
-WHERE tenant_id = $1 AND user_id = $2 AND id = $3
+SET mfa_verified_at = NOW(), updated_at = NOW(),
+    amr = ARRAY(
+        SELECT DISTINCT proven.method
+        FROM unnest(amr || $1::text) AS proven(method)
+        WHERE proven.method = $1::text OR proven.method NOT IN ('hwk', 'swk')
+    )
+WHERE tenant_id = $2 AND user_id = $3 AND id = $4
   AND revoked_at IS NULL AND expires_at > NOW()
 RETURNING mfa_verified_at
 `
 
 type MarkSessionMFAVerifiedParams struct {
+	Method   string    `json:"method"`
 	TenantID uuid.UUID `json:"tenant_id"`
 	UserID   uuid.UUID `json:"user_id"`
 	ID       uuid.UUID `json:"id"`
@@ -347,35 +353,12 @@ type MarkSessionMFAVerifiedParams struct {
 // Step-up: record a fresh second-factor proof on the session that performed
 // it. A revoked or foreign session matches no row, so the step-up fails closed
 // instead of refreshing a session the caller does not hold.
+// The session's amr keeps its other methods but only the passkey method this
+// step-up proved: a TOTP or recovery-code step-up removes hwk/swk. With that,
+// a passkey method on a session always means that mfa_verified_at came from a
+// passkey, which is what the passkey-only gate of platform:* relies on.
 func (q *Queries) MarkSessionMFAVerified(ctx context.Context, arg MarkSessionMFAVerifiedParams) (pgtype.Timestamptz, error) {
-	row := q.db.QueryRow(ctx, markSessionMFAVerified, arg.TenantID, arg.UserID, arg.ID)
-	var mfa_verified_at pgtype.Timestamptz
-	err := row.Scan(&mfa_verified_at)
-	return mfa_verified_at, err
-}
-
-const markSessionMFAVerifiedWithMethod = `-- name: MarkSessionMFAVerifiedWithMethod :one
-UPDATE sessions
-SET mfa_verified_at = NOW(), updated_at = NOW(),
-    amr = ARRAY(SELECT DISTINCT unnest(amr || $1::text))
-WHERE tenant_id = $2 AND user_id = $3 AND id = $4
-  AND revoked_at IS NULL AND expires_at > NOW()
-RETURNING mfa_verified_at
-`
-
-type MarkSessionMFAVerifiedWithMethodParams struct {
-	Method   string    `json:"method"`
-	TenantID uuid.UUID `json:"tenant_id"`
-	UserID   uuid.UUID `json:"user_id"`
-	ID       uuid.UUID `json:"id"`
-}
-
-// Passkey step-up: record the fresh proof and add the phishing-resistant amr
-// method to the session, so later RequireMFA checks accept the session without
-// re-issuing its tokens. Tenant-scoped and fail-closed on a foreign/revoked
-// session.
-func (q *Queries) MarkSessionMFAVerifiedWithMethod(ctx context.Context, arg MarkSessionMFAVerifiedWithMethodParams) (pgtype.Timestamptz, error) {
-	row := q.db.QueryRow(ctx, markSessionMFAVerifiedWithMethod,
+	row := q.db.QueryRow(ctx, markSessionMFAVerified,
 		arg.Method,
 		arg.TenantID,
 		arg.UserID,

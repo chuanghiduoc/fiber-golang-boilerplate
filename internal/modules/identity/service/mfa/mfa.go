@@ -355,9 +355,11 @@ func (s *mfaService) reauthenticate(ctx context.Context, userID uuid.UUID, proof
 	return (reauthVerifier{stores: s.Stores, attempts: s.Cache, now: s.now}).verify(ctx, userID, proof)
 }
 
-// ResetTOTP removes every second factor of a global user and ends all their
-// sessions. The platform route calls it when a user lost both the
-// authenticator and the recovery codes.
+// ResetTOTP removes every second factor of a global user (the TOTP factor, the
+// recovery codes, and every passkey) and ends all their sessions. The platform
+// route calls it when a user lost the factors. It is also the only way back
+// for a user who lost the only passkey, because a passkey change needs a
+// passkey session.
 func (s *mfaService) ResetTOTP(ctx context.Context, userID uuid.UUID) error {
 	// The factor, recovery codes, and token version are global rows, so this is
 	// a normal tenant-scoped transaction; the version bump ends the target
@@ -377,6 +379,9 @@ func (s *mfaService) ResetTOTP(ctx context.Context, userID uuid.UUID) error {
 		}
 		if err := tx.MFA.DeleteRecoveryCodes(ctx, userID); err != nil {
 			return apperror.NewInternal("failed to delete recovery codes")
+		}
+		if err := tx.Passkeys.DeleteByUser(ctx, userID); err != nil {
+			return apperror.NewInternal("failed to delete passkeys")
 		}
 		if _, err := tx.Users.RevokeTokens(ctx, userID); err != nil {
 			return apperror.NewInternal("failed to bump token version")

@@ -64,6 +64,7 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 		OAuth:          cfg.OAuth,
 		DataEncryption: cfg.DataEncryption,
 		WebAuthn:       cfg.WebAuthn,
+		MFAMaxAge:      cfg.MFA.EffectiveMaxAge(),
 	}, identity.Deps{Privacy: privacyRegistry, Tenancy: tenancyRegistry})
 	if err != nil {
 		return nil, err

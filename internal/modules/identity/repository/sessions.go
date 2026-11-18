@@ -233,28 +233,12 @@ func (r *SessionRepository) Touch(ctx context.Context, id uuid.UUID, userAgent, 
 	return nil
 }
 
-func (r *SessionRepository) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID) (time.Time, error) {
+func (r *SessionRepository) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error) {
 	tenantID, err := tenant.Require(ctx)
 	if err != nil {
 		return time.Time{}, err
 	}
 	verifiedAt, err := r.q.MarkSessionMFAVerified(ctx, identitysqlc.MarkSessionMFAVerifiedParams{
-		TenantID: tenantID,
-		UserID:   userID,
-		ID:       sessionID,
-	})
-	if err != nil {
-		return time.Time{}, wrapErr(err)
-	}
-	return verifiedAt.Time, nil
-}
-
-func (r *SessionRepository) MarkMFAVerifiedWithMethod(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error) {
-	tenantID, err := tenant.Require(ctx)
-	if err != nil {
-		return time.Time{}, err
-	}
-	verifiedAt, err := r.q.MarkSessionMFAVerifiedWithMethod(ctx, identitysqlc.MarkSessionMFAVerifiedWithMethodParams{
 		Method:   method,
 		TenantID: tenantID,
 		UserID:   userID,

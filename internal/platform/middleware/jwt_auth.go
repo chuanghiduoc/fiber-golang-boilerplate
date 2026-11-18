@@ -17,24 +17,18 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
-// unionAMR returns the de-duplicated union of the token's amr and the session's
-// current amr, preserving the token's order first.
-func unionAMR(tokenAMR, sessionAMR []string) []string {
+// effectiveAMR returns the authentication methods of the request. The live
+// session is the source: a step-up changes it at once, while the access token
+// is a snapshot from the last refresh. A method the session no longer records
+// (a passkey method after a TOTP step-up) must not come back from the token,
+// or a phishable step-up would refresh the passkey-only gate. A session row
+// always records at least one method; the token's methods are used only when
+// the session store supplies none.
+func effectiveAMR(tokenAMR, sessionAMR []string) []string {
 	if len(sessionAMR) == 0 {
 		return tokenAMR
 	}
-	out := make([]string, 0, len(tokenAMR)+len(sessionAMR))
-	seen := make(map[string]struct{}, len(tokenAMR)+len(sessionAMR))
-	for _, list := range [][]string{tokenAMR, sessionAMR} {
-		for _, method := range list {
-			if _, ok := seen[method]; ok {
-				continue
-			}
-			seen[method] = struct{}{}
-			out = append(out, method)
-		}
-	}
-	return out
+	return sessionAMR
 }
 
 // JWTAuth validates the bearer token against a live session: the session must
@@ -122,14 +116,11 @@ func JWTAuthKeys(keys *token.Keyring, store session.Store) fiber.Handler {
 			CrossTenant:   state.Platform,
 			MFAVerifiedAt: state.MFAVerifiedAt,
 		}
-		// A step-up updates the live session's amr. The access token is a
-		// snapshot minted earlier, so the current session's methods count too (a
-		// refreshed token repeats them anyway).
-		effectiveAMR := unionAMR(claims.AMR, state.AMR)
+		requestAMR := effectiveAMR(claims.AMR, state.AMR)
 
 		c.SetContext(requestctx.WithSessionID(c.Context(), claims.SessionID))
 		c.SetContext(apikey.WithAuthMethod(c.Context(), apikey.AuthMethodJWT))
-		authzhttp.SetSubject(c, subject.WithAMR(effectiveAMR))
+		authzhttp.SetSubject(c, subject.WithAMR(requestAMR))
 
 		// Services publish events with the request context, so the actor must
 		// be available there too.

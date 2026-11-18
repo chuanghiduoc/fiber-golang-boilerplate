@@ -19,6 +19,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/privacy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/softauthenticator"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 	"github.com/google/uuid"
 )
@@ -162,4 +163,70 @@ func TestPasskeyExportListsMetadataOnlyAndErasureDeletes(t *testing.T) {
 	require.NoError(t, privacy.HandleFinalizeJob(ctx, payload))
 	assert.Zero(t, scalar[int64](t, e.Pool,
 		`SELECT count(*) FROM webauthn_credentials WHERE user_id = $1`, member.User.ID))
+}
+
+// The step-up statement keeps the session's other methods but only the
+// passkey method it proved. A TOTP or recovery-code step-up therefore removes
+// hwk/swk, so a passkey method on a session always means that
+// mfa_verified_at came from a passkey.
+func TestStepUpKeepsOnlyTheProvenPasskeyMethod(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	member := registerPasskeyUser(t, e, "passkey-stepup-amr@example.com")
+	pair, err := e.Sessions.Issue(ctx, member.User.ID, member.User.TokenVersion,
+		[]string{core.AMRPassword, core.PasskeyMethodHardware, core.PasskeyMethodSoftware})
+	require.NoError(t, err)
+	sessionAMR := func() []string {
+		var amr []string
+		require.NoError(t, e.Pool.QueryRow(context.Background(),
+			`SELECT amr FROM sessions WHERE id = $1`, pair.SessionID).Scan(&amr))
+		return amr
+	}
+
+	_, err = e.Stores.Sessions.MarkMFAVerified(ctx, member.User.ID, pair.SessionID, core.AMROTP)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{core.AMRPassword, core.AMROTP}, sessionAMR(),
+		"a code step-up removes every passkey method")
+
+	_, err = e.Stores.Sessions.MarkMFAVerified(ctx, member.User.ID, pair.SessionID, core.PasskeyMethodHardware)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{core.AMRPassword, core.AMROTP, core.PasskeyMethodHardware}, sessionAMR(),
+		"a passkey step-up adds the method it proved")
+
+	_, err = e.Stores.Sessions.MarkMFAVerified(ctx, member.User.ID, pair.SessionID, core.PasskeyMethodSoftware)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{core.AMRPassword, core.AMROTP, core.PasskeyMethodSoftware}, sessionAMR(),
+		"only the passkey method of the latest step-up stays")
+}
+
+// Once a passkey exists, a session that proved only the password cannot add
+// another one, and the platform MFA reset (the recovery path for a lost
+// passkey) removes every passkey.
+func TestPasskeyChangeNeedsAPasskeySessionAndResetDeletesPasskeys(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	member := registerPasskeyUser(t, e, "passkey-assurance@example.com")
+	authenticator := softauthenticator.New(t, integrationPasskeyRPID, integrationPasskeyOrigin)
+	creation, err := e.Passkeys.BeginRegistration(ctx, member.User.ID, passkeyReauthProof(t, e, ctx, member.User))
+	require.NoError(t, err, "the first passkey needs only the re-authenticated session")
+	_, err = e.Passkeys.FinishRegistration(ctx, member.User.ID, "First",
+		authenticator.Attestation(t, creation.Response.Challenge.String()))
+	require.NoError(t, err)
+
+	_, err = e.Passkeys.BeginRegistration(ctx, member.User.ID, passkeyReauthProof(t, e, ctx, member.User))
+	assert.Equal(t, string(apperror.CodeMFARequired), pgfixtures.AppCode(err),
+		"a first-factor session cannot add a passkey to an account that has one")
+
+	proven, err := e.Sessions.Issue(ctx, member.User.ID, member.User.TokenVersion,
+		[]string{core.AMRPassword, core.PasskeyMethodHardware})
+	require.NoError(t, err)
+	_, err = e.Passkeys.BeginRegistration(ctx, member.User.ID,
+		core.ReauthProof{SessionID: proven.SessionID, CurrentPassword: testPassphrase})
+	require.NoError(t, err, "a fresh passkey session can add one")
+
+	require.NoError(t, e.MFA.ResetTOTP(ctx, member.User.ID))
+	var remaining int64
+	require.NoError(t, e.Pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM webauthn_credentials WHERE user_id = $1`, member.User.ID).Scan(&remaining))
+	assert.Zero(t, remaining, "the platform reset removes every passkey")
 }

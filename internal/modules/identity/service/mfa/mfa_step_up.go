@@ -41,7 +41,7 @@ func (s *mfaService) StepUp(ctx context.Context, userID, sessionID uuid.UUID, co
 		if err := s.consumeCode(ctx, tx.Stores, userID, matched); err != nil {
 			return err
 		}
-		ts, err := tx.Sessions.MarkMFAVerified(ctx, userID, sessionID)
+		ts, err := tx.Sessions.MarkMFAVerified(ctx, userID, sessionID, mfaMethodAMR(matched.auditMethod()))
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewUnauthorized("session is no longer valid")

@@ -717,7 +717,7 @@ func (r Sessions) Touch(ctx context.Context, id uuid.UUID, userAgent, ip string)
 	return nil
 }
 
-func (r Sessions) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID) (time.Time, error) {
+func (r Sessions) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error) {
 	r.DB.Mu.Lock()
 	defer r.DB.Mu.Unlock()
 	s, ok := r.DB.Sessions[sessionID]
@@ -727,20 +727,15 @@ func (r Sessions) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UU
 	}
 	now := time.Now()
 	s.MFAVerifiedAt = &now
-	return now, nil
-}
-
-func (r Sessions) MarkMFAVerifiedWithMethod(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error) {
-	r.DB.Mu.Lock()
-	defer r.DB.Mu.Unlock()
-	s, ok := r.DB.Sessions[sessionID]
-	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) ||
-		s.RevokedAt != nil || !s.ExpiresAt.After(time.Now()) {
-		return time.Time{}, apperror.ErrNotFound
+	kept := make([]string, 0, len(s.AMR)+1)
+	for _, existing := range s.AMR {
+		if existing == method || existing == PasskeyMethodHardware || existing == PasskeyMethodSoftware {
+			continue
+		}
+		kept = append(kept, existing)
 	}
-	now := time.Now()
-	s.MFAVerifiedAt = &now
-	s.AMR = withAMR(s.AMR, method)
+	kept = append(kept, method)
+	s.AMR = kept
 	return now, nil
 }
 
@@ -1335,14 +1330,4 @@ func (r Roles) ReplaceMemberRoles(context.Context, uuid.UUID, []string) error {
 }
 func (r Roles) AssignPlatformRole(context.Context, uuid.UUID, string) error {
 	return errFakeNotImplemented
-}
-
-// withAMR appends method to amr unless it is already present.
-func withAMR(amr []string, method string) []string {
-	for _, value := range amr {
-		if value == method {
-			return append([]string(nil), amr...)
-		}
-	}
-	return append(append([]string(nil), amr...), method)
 }
