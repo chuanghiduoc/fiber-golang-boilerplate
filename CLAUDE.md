@@ -493,8 +493,10 @@ included); the compatibility tenant is the seeded tenant with slug `default`.
   tenant/user kept 7 days (passkeys listed without key material). Self
   erasure suspends the memberships under the owner lock, fans out one erase
   job per membership plus a finalizer that anonymizes the global user and
-  deletes factors, recovery codes, and passkeys. Admin erasure is
-  tenant-scoped and respects the rank rules.
+  deletes factors, recovery codes, and passkeys. The finalizer does not
+  retry while a membership remains: each account-scoped erase job queues a
+  new finalizer after it removes its membership. Admin erasure is
+  tenant-scoped, never queues the finalizer, and respects the rank rules.
 - **Notifications:** in-app feed and per-type `in_app`/`email` preferences
   (`PUT /me/notification-preferences/{type}/{channel}`); identity's recipient
   lookup admits only active members of the context tenant; the row and its
