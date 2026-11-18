@@ -119,23 +119,8 @@ func (s *roleService) Update(ctx context.Context, id uuid.UUID, in RoleUpdate) (
 	in.ID = id
 	var updated *Role
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		// The lock makes the rank check below read the permissions this
-		// transaction will replace. A system role has no lockable row; the
-		// read that follows reports it.
-		if err := tx.Roles.Lock(ctx, id); err != nil && !errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewInternal("failed to lock role")
-		}
-		existing, err := tx.Roles.Get(ctx, id)
+		existing, err := loadEditableRole(ctx, tx, id)
 		if err != nil {
-			if errors.Is(err, apperror.ErrNotFound) {
-				return apperror.NewNotFound("role not found")
-			}
-			return apperror.NewInternal("failed to load role")
-		}
-		if existing.System() {
-			return apperror.NewBadRequest("system roles cannot be modified")
-		}
-		if err := ensureCanManageRole(ctx, tx.Stores, existing); err != nil {
 			return err
 		}
 		name := existing.Name
@@ -173,6 +158,29 @@ func (s *roleService) Update(ctx context.Context, id uuid.UUID, in RoleUpdate) (
 	}
 	s.invalidatePermissions(ctx)
 	return updated, nil
+}
+
+// loadEditableRole locks and returns a tenant role the caller may change. The
+// lock makes the rank check read the permissions that the transaction will
+// replace. A system role has no lockable row; the read that follows reports it.
+func loadEditableRole(ctx context.Context, tx TxRepos, id uuid.UUID) (*Role, error) {
+	if err := tx.Roles.Lock(ctx, id); err != nil && !errors.Is(err, apperror.ErrNotFound) {
+		return nil, apperror.NewInternal("failed to lock role")
+	}
+	existing, err := tx.Roles.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewNotFound("role not found")
+		}
+		return nil, apperror.NewInternal("failed to load role")
+	}
+	if existing.System() {
+		return nil, apperror.NewBadRequest("system roles cannot be modified")
+	}
+	if err := ensureCanManageRole(ctx, tx.Stores, existing); err != nil {
+		return nil, err
+	}
+	return existing, nil
 }
 
 func (s *roleService) Delete(ctx context.Context, id uuid.UUID) error {
