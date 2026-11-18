@@ -12,12 +12,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/internal/pgfixtures"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/authn"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/core"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service/privacy"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/softauthenticator"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
@@ -229,4 +233,48 @@ func TestPasskeyChangeNeedsAPasskeySessionAndResetDeletesPasskeys(t *testing.T) 
 	require.NoError(t, e.Pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM webauthn_credentials WHERE user_id = $1`, member.User.ID).Scan(&remaining))
 	assert.Zero(t, remaining, "the platform reset removes every passkey")
+}
+
+// The account finalizer is driven by the erase jobs: a finalizer that runs
+// while a membership remains completes without a change, and the
+// account-scoped erase job queues a new one after it removes its membership.
+func TestSelfErasureEraseJobQueuesTheFinalizerInDatabase(t *testing.T) {
+	e := pgfixtures.NewEnv(t, nil)
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	member := registerPasskeyUser(t, e, "erasure-finalizer@example.com")
+	store, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+	tx := identityrepo.NewTransactorWithQueue(e.Fx.Tx(), audit.NewPostgresRecorder(e.Fx.Scoped()), e.Mail, nil,
+		jobs.NewQueue(e.Fx.Scoped()), testutil.BanHasher(t))
+	registry := privacycontracts.NewRegistry()
+	svc := privacy.NewPrivacyService(privacy.PrivacyDeps{
+		Stores: e.Stores, Tx: tx, Storage: store, Registry: registry,
+		ExportStore: identityrepo.NewPrivacyExportRepository(e.Fx.Scoped()),
+	})
+	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: svc, Eraser: svc})
+	queued := func(kind string) int64 {
+		return scalar[int64](t, e.Pool, `SELECT count(*) FROM jobs WHERE kind = $1`, kind)
+	}
+	finalizePayload, err := json.Marshal(privacy.FinalizeJob{UserID: member.User.ID})
+	require.NoError(t, err)
+
+	require.NoError(t, svc.RequestErasure(ctx, member.User.ID, "user.erasure_requested"))
+	require.Equal(t, int64(1), queued(privacy.JobKindErase))
+	require.Equal(t, int64(1), queued(privacy.JobKindEraseFinalize))
+
+	require.NoError(t, svc.HandleFinalizeJob(ctx, finalizePayload),
+		"a finalizer that runs before the erase job must not fail")
+	assert.Equal(t, "erasure-finalizer@example.com",
+		scalar[string](t, e.Pool, `SELECT email FROM users WHERE id = $1`, member.User.ID),
+		"the account is untouched while a membership remains")
+
+	erasePayload := scalar[[]byte](t, e.Pool, `SELECT payload FROM jobs WHERE kind = $1`, privacy.JobKindErase)
+	require.NoError(t, svc.HandleEraseJob(ctx, erasePayload))
+	assert.Equal(t, int64(2), queued(privacy.JobKindEraseFinalize),
+		"the erase job queues a finalizer after it removes the membership")
+
+	require.NoError(t, svc.HandleFinalizeJob(ctx, finalizePayload))
+	assert.NotEqual(t, "erasure-finalizer@example.com",
+		scalar[string](t, e.Pool, `SELECT email FROM users WHERE id = $1`, member.User.ID),
+		"the finalizer anonymizes the account once every membership is removed")
 }
